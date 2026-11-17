@@ -50,10 +50,15 @@ export async function POST(req: NextRequest) {
 
   const overview = await getOverview(supabase, result.book.slug).catch(() => null);
 
-  // A retried create (same client_key): the first request made the session and its Notion entry.
+  // A retried create (same client_key): the first request made the session, and its transaction stored the Notion
+  // work it owes (pds.create_reading_session: the entry's claim and the progress obligation; Codex review of PR 376,
+  // round 2 of T01-R14). When that request's answer was lost before its own Notion step ran, the sweep finishes it:
+  // the claim's entry once no entry with its marker exists an hour on, the line once its obligation is due. The replay
+  // writes nothing itself, so it never races the first request's callback.
   if (!result.replayed) after(async () => {
     const id = result.session.session_id;
-    const rewriteProgress = () => rewriteProgressNow(supabase, result.book.book_id);
+    // Under the obligation the create stored (keyed creates); a keyless create stores its own first.
+    const rewriteProgress = () => rewriteProgressNow(supabase, result.book.book_id, result.progressOwedId);
     // Set when a removal ran meanwhile: trashLateBlock then owns the progress rewrite too, and closes the removal's
     // cleanup row only once the trash AND the rewrite succeeded (Codex T01-R9).
     let progressHandled = false;
@@ -63,7 +68,8 @@ export async function POST(req: NextRequest) {
     // is still found by its marker and settled by the sweep. No claim stored, no entry.
     // An edit that ran while the entry was written is caught up inside placeEntry, under the entry's claim (the claim
     // goes only once that rewrite is confirmed, Codex T01-R11 round 2).
-    const placed = await placeEntry(supabase, result.book, result.session, null);
+    // A keyed create's entry is written under the claim its transaction stored (result.mirrorClaimId).
+    const placed = await placeEntry(supabase, result.book, result.session, null, result.mirrorClaimId);
     if (placed.kind === "gone") {
       // A removal that ran meanwhile found no block id in its cleanup row: record this one there first (so a retried
       // removal owes it), then trash it and rewrite the progress line. The claim goes only once the entry is trashed.

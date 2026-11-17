@@ -97,12 +97,16 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
         // is still on that book with its old entry (or none), then the old entry is trashed (placeEntry). An edit
         // that ran while the entry was written is caught up under the same claim, which goes only once that rewrite
         // is confirmed (Codex T01-R11, round 2). A failed write keeps the claim: the sweep writes the entry.
-        const placed = await placeEntry(supabase, r.book, r.session, old, r.mirrorClaimId);
+        // The old entry is the one the move's transaction read under the session's lock (r.mirrorReplaces), the same
+        // value its stored claim carries, never this request's earlier read: a create's callback may have attached
+        // the entry in between (Codex review of PR 376, round 2 of T01-R14).
+        const replaced = r.mirrorReplaces;
+        const placed = await placeEntry(supabase, r.book, r.session, replaced, r.mirrorClaimId);
         // Removed meanwhile: its removal's cleanup row holds the old entry; the new one is trashed here (or by its claim).
         if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
         // The new book has no page: no entry is owed there, and the old one comes off the old book's page.
         else if (placed.kind === "none" && !r.book.notion_page_id && notionMirrorEnabled()) {
-          await retireUnderClaim(supabase, id, r.book.book_id, old, r.mirrorClaimId);
+          await retireUnderClaim(supabase, id, r.book.book_id, replaced, r.mirrorClaimId);
         }
       } else if (!movedBook && r.mirrorClaimId && r.session.notion_block_id) {
         // Under the claim the edit stored until the rewrite is confirmed (refreshEntry; Codex T01-R11, round 2).

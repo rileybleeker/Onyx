@@ -602,6 +602,13 @@ export interface LogSessionResult {
   habitCreated: boolean | null;
   /** A retry of an earlier create (same client_key): the stored session, nothing written. */
   replayed: boolean;
+  /**
+   * The Notion work a keyed create stored in its own transaction (pds.create_reading_session; Codex review of PR 376,
+   * round 2 of T01-R14): the claim that owes the session's entry and the progress obligation of its book (null = none
+   * stored: no Notion page, a keyless create, or a replay, whose first create stored them and the sweep finishes).
+   */
+  mirrorClaimId: string | null;
+  progressOwedId: string | null;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -772,7 +779,14 @@ async function createKeyedSession(
     source: string;
   },
 ): Promise<
-  | { kind: "created"; session: ReadingSession; finished: boolean; habit: { marked: boolean; created: boolean } }
+  | {
+      kind: "created";
+      session: ReadingSession;
+      finished: boolean;
+      habit: { marked: boolean; created: boolean };
+      mirrorClaimId: string | null;
+      progressOwedId: string | null;
+    }
   | { kind: "error"; error: { code?: string; message?: string } }
   | { kind: "unavailable" }
 > {
@@ -789,10 +803,25 @@ async function createKeyedSession(
     p_source: row.source,
   });
   if (error) return ["PGRST202", "42883"].includes(String(error.code)) ? { kind: "unavailable" } : { kind: "error", error };
-  const out = (data ?? {}) as { session?: Record<string, unknown>; finished?: boolean; habit_marked?: boolean; habit_created?: boolean };
+  const out = (data ?? {}) as {
+    session?: Record<string, unknown>;
+    finished?: boolean;
+    habit_marked?: boolean;
+    habit_created?: boolean;
+    mirror_claim_id?: unknown;
+    progress_owed_id?: unknown;
+  };
   if (!out.session || typeof out.session !== "object") return { kind: "error", error: { message: "The session was not returned." } };
   const session = Object.fromEntries(SESSION_KEYS.map((k) => [k, out.session?.[k] ?? null])) as unknown as ReadingSession;
-  return { kind: "created", session, finished: out.finished === true, habit: { marked: out.habit_marked === true, created: out.habit_created === true } };
+  const uuidOrNull = (v: unknown): string | null => (typeof v === "string" && UUID_RE.test(v) ? v : null);
+  return {
+    kind: "created",
+    session,
+    finished: out.finished === true,
+    habit: { marked: out.habit_marked === true, created: out.habit_created === true },
+    mirrorClaimId: uuidOrNull(out.mirror_claim_id),
+    progressOwedId: uuidOrNull(out.progress_owed_id),
+  };
 }
 
 const MOVE_UNAVAILABLE = "Moving a session to another day or book isn't available until sql/reading_session_discards.sql is applied.";
@@ -852,6 +881,7 @@ async function moveSessionTx(
     habit_marked?: unknown;
     habit_created?: unknown;
     mirror_claim_id?: unknown;
+    replaces_block_id?: unknown;
     entry_pending?: unknown;
     progress_owed?: unknown;
   } | null;
@@ -887,15 +917,22 @@ export interface EditMirrorWork {
   mirrorStored: boolean;
   /** The claim the route's entry work runs under: a move's new entry (owes it), or the rewrite of the session's entry. */
   mirrorClaimId: string | null;
+  /**
+   * A move to another book: the entry its claim replaces, as the edit's transaction read it under the session's lock.
+   * The route uses this, never its own earlier read (Codex review of PR 376, round 2 of T01-R14): a create's callback
+   * can attach the entry between that read and the move, and a stale "no entry" made the new entry's conditional attach
+   * fail and dropped the move's claim, leaving the old entry on the old page and none on the new one.
+   */
+  mirrorReplaces: string | null;
   /** A move's claim still owes the session's entry: nothing is rewritten now, that claim writes it from the session. */
   entryPending: boolean;
   /** One stored progress obligation per book whose page line this edit changed. */
   progressOwed: { bookId: number; owedId: string }[];
 }
 
-const NO_MIRROR_WORK: EditMirrorWork = { mirrorStored: false, mirrorClaimId: null, entryPending: false, progressOwed: [] };
+const NO_MIRROR_WORK: EditMirrorWork = { mirrorStored: false, mirrorClaimId: null, mirrorReplaces: null, entryPending: false, progressOwed: [] };
 
-function editMirrorWork(out: { mirror_claim_id?: unknown; entry_pending?: unknown; progress_owed?: unknown }): EditMirrorWork {
+function editMirrorWork(out: { mirror_claim_id?: unknown; replaces_block_id?: unknown; entry_pending?: unknown; progress_owed?: unknown }): EditMirrorWork {
   const claim = typeof out.mirror_claim_id === "string" && UUID_RE.test(out.mirror_claim_id) ? out.mirror_claim_id : null;
   const owed: { bookId: number; owedId: string }[] = [];
   if (Array.isArray(out.progress_owed)) {
@@ -906,7 +943,8 @@ function editMirrorWork(out: { mirror_claim_id?: unknown; entry_pending?: unknow
       if (Number.isFinite(bookId) && typeof owedId === "string" && UUID_RE.test(owedId)) owed.push({ bookId, owedId });
     }
   }
-  return { mirrorStored: true, mirrorClaimId: claim, entryPending: out.entry_pending === true, progressOwed: owed };
+  const replaces = typeof out.replaces_block_id === "string" && out.replaces_block_id ? out.replaces_block_id : null;
+  return { mirrorStored: true, mirrorClaimId: claim, mirrorReplaces: replaces, entryPending: out.entry_pending === true, progressOwed: owed };
 }
 
 /** A database error that proves nothing was stored: a data / constraint violation or an error the function raised. */
@@ -1009,6 +1047,8 @@ export async function logSession(
       habitMarked: false,
       habitCreated: null,
       replayed: true,
+      mirrorClaimId: null,
+      progressOwedId: null,
     };
   };
   // A retried create answers its stored session BEFORE the book is resolved: the session it made may have finished
@@ -1056,7 +1096,7 @@ export async function logSession(
   if (key) {
     const atomic = await createKeyedSession(supabase, key, row);
     if (atomic.kind === "created") {
-      const { session, finished, habit } = atomic;
+      const { session, finished, habit, mirrorClaimId, progressOwedId } = atomic;
       return {
         ok: true,
         book: { ...book, status: finished ? "finished" : book.status, finished_on: finished ? date : book.finished_on },
@@ -1066,6 +1106,8 @@ export async function logSession(
         habitMarked: habit.marked,
         habitCreated: habit.created,
         replayed: false,
+        mirrorClaimId,
+        progressOwedId,
       };
     }
     if (atomic.kind === "error") {
@@ -1118,6 +1160,8 @@ export async function logSession(
     habitMarked: habit.marked,
     habitCreated: habit.created,
     replayed: false,
+    mirrorClaimId: null,
+    progressOwedId: null,
   };
 }
 
@@ -1307,7 +1351,13 @@ export async function updateSession(supabase: Supa, sessionId: number, input: Se
   const tx = await moveSessionTx(supabase, sessionId, patch, input.habit_created_on);
   if (tx.ok) {
     session = tx.session;
-    mirrorWork = { mirrorStored: tx.mirrorStored, mirrorClaimId: tx.mirrorClaimId, entryPending: tx.entryPending, progressOwed: tx.progressOwed };
+    mirrorWork = {
+      mirrorStored: tx.mirrorStored,
+      mirrorClaimId: tx.mirrorClaimId,
+      mirrorReplaces: tx.mirrorReplaces,
+      entryPending: tx.entryPending,
+      progressOwed: tx.progressOwed,
+    };
     habitMarked = tx.marked;
     finished = tx.finished;
     unfinished = tx.unfinished;

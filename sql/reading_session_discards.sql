@@ -556,6 +556,14 @@ $$;
 -- lib/reading.ts then answers the stored session. A failed habit stamp does not
 -- stop the create (as in lib/reading.ts stampHabit): habit_marked is false, and
 -- the stamp's record (pds.reading_habit_provenance) rolls back with it.
+-- The Notion work the create owes is stored in the same transaction (Codex
+-- review of PR 376, round 2 of T01-R14): for a book with a Notion page, a claim
+-- that owes the session's entry (`mirror_claim_id`, owes_entry, nothing
+-- replaced) and one progress obligation (`progress_owed_id`). The route writes
+-- the entry and the line under them; when the create's answer is lost and the
+-- route never runs its Notion step (a replay mirrors nothing), the sweep writes
+-- the entry once no entry with the claim's marker exists an hour on, and the
+-- line once the obligation is due.
 CREATE OR REPLACE FUNCTION pds.create_reading_session(
     p_client_key      uuid,
     p_book_id         bigint,
@@ -582,6 +590,9 @@ DECLARE
     v_marked   boolean := false;
     v_created  boolean := false;
     v_stamp    jsonb;
+    v_page     text;
+    v_claim    uuid;
+    v_owed_id  uuid;
 BEGIN
     IF p_client_key IS NULL THEN
         RAISE EXCEPTION 'client_key is required' USING ERRCODE = '22023';
@@ -596,7 +607,8 @@ BEGIN
          p_source, p_client_key)
     RETURNING * INTO v_row;
 
-    SELECT b.total_chapters, b.habit_name INTO v_total, v_habit FROM pds.books AS b WHERE b.book_id = p_book_id;
+    SELECT b.total_chapters, b.habit_name, b.notion_page_id INTO v_total, v_habit, v_page
+      FROM pds.books AS b WHERE b.book_id = p_book_id;
 
     IF v_total IS NOT NULL AND v_total > 0 AND p_chapter_through >= v_total THEN
         UPDATE pds.books AS b SET status = 'finished', finished_on = p_session_date
@@ -616,11 +628,22 @@ BEGIN
         END;
     END IF;
 
+    -- The Notion work this create owes, committed with it (see the comment above).
+    IF v_page IS NOT NULL THEN
+        v_claim := pg_catalog.gen_random_uuid();
+        INSERT INTO pds.reading_mirror_claims (claim_id, session_id, book_id, block_id, replaces_block_id, owes_entry)
+        VALUES (v_claim, v_row.session_id, p_book_id, NULL, NULL, true);
+        v_owed_id := pg_catalog.gen_random_uuid();
+        INSERT INTO pds.reading_progress_owed (owed_id, book_id) VALUES (v_owed_id, p_book_id);
+    END IF;
+
     RETURN pg_catalog.jsonb_build_object(
         'session', pg_catalog.to_jsonb(v_row),
         'finished', v_finished,
         'habit_marked', v_marked,
-        'habit_created', v_created);
+        'habit_created', v_created,
+        'mirror_claim_id', v_claim,
+        'progress_owed_id', v_owed_id);
 END;
 $$;
 
@@ -644,7 +667,9 @@ $$;
 --  * The Notion work the edit owes is stored in the same transaction (Codex T01-R12, T01-R14), so it is owed even when
 --    the route's own Notion step never runs (the RPC's answer lost) or a separate insert would fail:
 --      a move to another book: a claim on the new book with `owes_entry` and the session's old entry as the entry it
---        replaces (`mirror_claim_id`): the route writes the new entry under it, else the sweep does;
+--        replaces (`mirror_claim_id`, and `replaces_block_id` = that entry as read under the session's lock, which
+--        the route uses rather than its own earlier read: a create's callback may have attached the entry in between,
+--        Codex review of PR 376, round 2 of T01-R14): the route writes the new entry under it, else the sweep does;
 --      an edit that keeps the book, of a session with an entry: a claim on that entry (`mirror_claim_id`), under which
 --        the route rewrites it; none while a move's claim still owes the session's new entry (`entry_pending`): that
 --        claim's entry is written from the session as it is then, and the old book's page entry is never rewritten
@@ -653,7 +678,7 @@ $$;
 --        for books with a Notion page).
 -- Answers {moved: false} when the session no longer exists, else {moved: true, session, book (the session's book
 -- after the edit), finished, unfinished, habit_marked, habit_created, habit_removed, habit_restored, mirror_claim_id,
--- entry_pending, progress_owed: [{book_id, owed_id}]}. Raises OXR02 for a Kindle session and OXR03 when the target
+-- replaces_block_id, entry_pending, progress_owed: [{book_id, owed_id}]}. Raises OXR02 for a Kindle session and OXR03 when the target
 -- book does not exist.
 CREATE OR REPLACE FUNCTION pds.move_reading_session(
     p_session_id       bigint,
@@ -817,7 +842,7 @@ BEGIN
         END IF;
     ELSIF v_row.notion_block_id IS NOT NULL THEN
         IF EXISTS (SELECT 1 FROM pds.reading_mirror_claims AS c
-                    WHERE c.session_id = p_session_id AND c.owes_entry
+                    WHERE c.session_id = p_session_id AND c.book_id = p_book_id AND c.owes_entry
                       AND c.replaces_block_id = v_row.notion_block_id) THEN
             v_pending := true;
         ELSE
@@ -848,6 +873,7 @@ BEGIN
         'habit_removed', v_removed,
         'habit_restored', v_restored,
         'mirror_claim_id', v_claim,
+        'replaces_block_id', CASE WHEN v_same_book THEN NULL ELSE v_prev.notion_block_id END,
         'entry_pending', v_pending,
         'progress_owed', v_owed);
 END;

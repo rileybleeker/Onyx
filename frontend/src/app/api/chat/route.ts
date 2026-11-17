@@ -12,6 +12,7 @@ import { fallbackBehavioralToday, nightLabel, SLEEP_QUESTIONS, sleepAnswerDate, 
 import { behavioralToday, currentTimeZone, intakeEventReplay, logSupplementIntake } from "@/lib/supplement-intake";
 import { BOOK_COLS, HIGHLIGHT_COLS, HIGHLIGHT_EXISTS, addHighlight, getBook, getOverview, logSession, recordQuiz, summarizeForChat, type Book, type Highlight, type HighlightSource, type Medium, type ReadingSession } from "@/lib/reading";
 import { mirrorHighlight, mirrorProgress, mirrorSession } from "@/lib/reading-notion";
+import { createEntryClaimOf, discardEntry, placeEntry, rewriteProgressNow } from "@/lib/reading-removal";
 import { failureMayHaveWritten } from "@/lib/reading-practice";
 import { REMOVED_SINCE_ERROR, ambiguousDbError } from "@/lib/write-outcome";
 
@@ -1365,12 +1366,31 @@ async function executeTool(name: string, input: Record<string, unknown>, op?: Op
     // Mirror inline (the chat loop has no after() boundary worth protecting). An earlier call's session with no block
     // id stored may still have its Notion entry (the call can stop between the append and storing the id), so none is
     // made for it now: inspectReplayedSession names it for Riley to check instead.
-    const blockId = result.session.notion_block_id ?? (inspected ? null : await mirrorSession(book, result.session));
-    if (blockId && !result.session.notion_block_id) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    // A keyed create stored the claim that owes this entry in its own transaction (pds.create_reading_session; Codex
+    // review of PR 376, round 2 of T01-R14): the entry is written under it and attached conditionally, so a write whose
+    // block id is lost is still found by its marker, and an entry this call never writes is written by the sweep. For
+    // this call's own insert replayed (its answer lost) the claim is looked up; none found = written as before.
+    const entryClaim =
+      result.session.notion_block_id || inspected
+        ? null
+        : (result.mirrorClaimId ?? (ownInsert ? await createEntryClaimOf(supabase, result.session.session_id, result.session.book_id) : null));
+    let blockId: string | null = result.session.notion_block_id ?? null;
+    if (!blockId && !inspected && entryClaim) {
+      const placed = await placeEntry(supabase, book, result.session, null, entryClaim);
+      if (placed.kind === "attached") blockId = placed.blockId;
+      else if (placed.kind === "gone") await discardEntry(supabase, placed.blockId, placed.claimId);
+    } else if (!blockId && !inspected) {
+      blockId = await mirrorSession(book, result.session);
+      if (blockId) await supabase.from("reading_sessions").update({ notion_block_id: blockId }).eq("session_id", result.session.session_id);
+    }
     const o = await getOverview(supabase, book.slug).catch(() => null);
     // Rewrites one progress line in Notion: the same text when it is already up to date. Not for an earlier call's
-    // session (read only): its date could put an older "last session" over a newer one written since.
-    if (!inspected) await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    // session (read only): its date could put an older "last session" over a newer one written since. Under the
+    // obligation a keyed create stored, written from the database and checked (rewriteProgressNow).
+    if (!inspected) {
+      if (result.progressOwedId) await rewriteProgressNow(supabase, book.book_id, result.progressOwedId);
+      else await mirrorProgress(book, o?.chaptersDone ?? result.session.chapter_through ?? 0, result.session.session_date);
+    }
     return JSON.stringify({
       success: true,
       book: book.title,

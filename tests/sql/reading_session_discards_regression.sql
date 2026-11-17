@@ -299,18 +299,28 @@ BEGIN
     UPDATE pds.books SET notion_page_id = 'sql-regression-page-b' WHERE book_id = v_book2;
     r := pds.create_reading_session('00000000-0000-4000-8000-000000000027', v_book, DATE '2030-03-04', 1, 1, NULL, NULL, NULL, NULL, 'manual');
     v_sid := (r->'session'->>'session_id')::bigint;
+    -- Round 2 of T01-R14: a keyed create on a book with a page stores the claim that owes its entry and the progress
+    -- obligation in the same transaction.
+    ASSERT EXISTS (SELECT 1 FROM pds.reading_mirror_claims
+                    WHERE claim_id = (r->>'mirror_claim_id')::uuid AND session_id = v_sid AND book_id = v_book AND owes_entry
+                      AND block_id IS NULL AND replaces_block_id IS NULL), 'a keyed create stores the claim that owes its entry';
+    ASSERT EXISTS (SELECT 1 FROM pds.reading_progress_owed
+                    WHERE owed_id = (r->>'progress_owed_id')::uuid AND book_id = v_book), 'and its book''s progress obligation';
     UPDATE pds.reading_sessions SET notion_block_id = 'sql-regression-blk-old' WHERE session_id = v_sid;
     r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-04', 1, 1, NULL, NULL, NULL, NULL, NULL);
     ASSERT r->>'mirror_claim_id' IS NOT NULL, 'a move returns its claim';
     ASSERT EXISTS (SELECT 1 FROM pds.reading_mirror_claims
                     WHERE claim_id = (r->>'mirror_claim_id')::uuid AND owes_entry AND book_id = v_book2
                       AND block_id IS NULL AND replaces_block_id = 'sql-regression-blk-old'), 'the claim owes the new entry and replaces the old one';
+    ASSERT r->>'replaces_block_id' = 'sql-regression-blk-old', 'the move answers the entry it read under the lock';
     ASSERT jsonb_array_length(r->'progress_owed') = 2, 'both books owe their line';
     ASSERT (SELECT count(*) FROM pds.reading_progress_owed AS o, jsonb_array_elements(r->'progress_owed') AS e
              WHERE o.owed_id = (e->>'owed_id')::uuid) = 2, 'both obligations are stored';
     r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-04', 1, 1, NULL, NULL, NULL, NULL, NULL);
     ASSERT (r->>'entry_pending')::boolean AND r->>'mirror_claim_id' IS NULL, 'the replay finds the move''s claim pending';
-    ASSERT (SELECT count(*) FROM pds.reading_mirror_claims WHERE session_id = v_sid) = 1, 'no claim on the old page''s entry';
+    ASSERT NOT EXISTS (SELECT 1 FROM pds.reading_mirror_claims WHERE session_id = v_sid AND block_id = 'sql-regression-blk-old'),
+           'no claim on the old page''s entry';
+    ASSERT (SELECT count(*) FROM pds.reading_mirror_claims WHERE session_id = v_sid) = 2, 'only the create''s and the move''s claims';
     UPDATE pds.reading_sessions SET notion_block_id = 'sql-regression-blk-new' WHERE session_id = v_sid;
     r := pds.move_reading_session(v_sid, v_book2, DATE '2030-03-04', 1, 1, 30, NULL, NULL, NULL, NULL);
     ASSERT EXISTS (SELECT 1 FROM pds.reading_mirror_claims

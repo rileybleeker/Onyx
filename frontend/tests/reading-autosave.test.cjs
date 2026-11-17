@@ -380,7 +380,18 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
       let marked = false;
       let created = false;
       if (b && b.habit_name) ({ marked, created } = stampTx(a.p_session_date, b.habit_name));
-      return { data: JSON.parse(JSON.stringify({ session: row, finished, habit_marked: marked, habit_created: created })), error: null };
+      // The Notion work the create owes, stored with it for a book with a page (Codex review of PR 376, round 2 of
+      // T01-R14), as the SQL does.
+      let claimId = null;
+      let owedId = null;
+      if (b && b.notion_page_id) {
+        const due = new Date(Date.now() + 15 * 60_000).toISOString();
+        claimId = randomUUID();
+        tables.reading_mirror_claims.push({ claim_id: claimId, session_id: row.session_id, book_id: a.p_book_id, block_id: null, replaces_block_id: null, claimed_at: new Date().toISOString(), attempts: 0, next_try_at: due, owes_entry: true });
+        owedId = randomUUID();
+        tables.reading_progress_owed.push({ owed_id: owedId, book_id: a.p_book_id, attempts: 0, next_try_at: due });
+      }
+      return { data: JSON.parse(JSON.stringify({ session: row, finished, habit_marked: marked, habit_created: created, mirror_claim_id: claimId, progress_owed_id: owedId })), error: null };
     });
   };
   /** pds.stamp_reading_habit called on its own (a keyless create). */
@@ -451,7 +462,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
           tables.reading_mirror_claims.push({ claim_id: claimId, session_id: row.session_id, book_id: a.p_book_id, block_id: null, replaces_block_id: prev.notion_block_id ?? null, claimed_at: new Date().toISOString(), attempts: 0, next_try_at: due, owes_entry: true });
         }
       } else if (row.notion_block_id) {
-        if (tables.reading_mirror_claims.some((c) => c.session_id === row.session_id && c.owes_entry && c.replaces_block_id === row.notion_block_id)) pending = true;
+        if (tables.reading_mirror_claims.some((c) => c.session_id === row.session_id && c.book_id === a.p_book_id && c.owes_entry && c.replaces_block_id === row.notion_block_id)) pending = true;
         else {
           claimId = randomUUID();
           tables.reading_mirror_claims.push({ claim_id: claimId, session_id: row.session_id, book_id: a.p_book_id, block_id: row.notion_block_id, replaces_block_id: null, claimed_at: new Date().toISOString(), attempts: 0, next_try_at: due, owes_entry: false });
@@ -465,7 +476,7 @@ function fakeDb(seed, { noClientKey = false, missFirstKeyLookup = false, noDisca
         owed.push({ book_id: b.book_id, owed_id: owedId });
       }
       return {
-        data: JSON.parse(JSON.stringify({ moved: true, session: row, book: newBook, finished, unfinished, habit_marked: stamp.marked, habit_created: stamp.created, habit_removed: settled.removed, habit_restored: settled.restored, mirror_claim_id: claimId, entry_pending: pending, progress_owed: owed })),
+        data: JSON.parse(JSON.stringify({ moved: true, session: row, book: newBook, finished, unfinished, habit_marked: stamp.marked, habit_created: stamp.created, habit_removed: settled.removed, habit_restored: settled.restored, mirror_claim_id: claimId, replaces_block_id: sameBook ? null : prev.notion_block_id ?? null, entry_pending: pending, progress_owed: owed })),
         error: null,
       };
     });
@@ -1566,9 +1577,10 @@ test("an entry carries its claim's marker, read back from either rich-text form;
   const readSrc = (rel) => fs.readFileSync(path.join(SRC, rel), "utf8");
   const post = readSrc("app/api/reading/sessions/route.ts");
   const patch = readSrc("app/api/reading/sessions/[id]/route.ts");
-  assert.match(post, /placeEntry\(supabase, result\.book, result\.session, null\)/);
+  assert.match(post, /placeEntry\(supabase, result\.book, result\.session, null, result\.mirrorClaimId\)/, "a keyed create's entry is written under the claim the create stored");
   assert.match(post, /placeEntry\(supabase, other as Book, placed\.row, null\)/, "the create's catch-up after a move is claimed too");
-  assert.match(patch, /placeEntry\(supabase, r\.book, r\.session, old, r\.mirrorClaimId\)/, "a move's new entry is written under the claim the move stored (T01-R14)");
+  assert.match(patch, /placeEntry\(supabase, r\.book, r\.session, replaced, r\.mirrorClaimId\)/, "a move's new entry is written under the claim the move stored (T01-R14)");
+  assert.match(patch, /const replaced = r\.mirrorReplaces;/, "and replaces the entry the move read under the lock, never this request's earlier read");
   assert.match(patch, /placeEntry\(supabase, r\.book, r\.session, old\)/, "without the SQL file a move's new entry is still claimed first");
   for (const src of [post, patch]) assert.doesNotMatch(src, /mirrorSession\(/, "no entry is written outside placeEntry");
   for (const src of [post, patch]) assert.doesNotMatch(src, /updateMirroredSession\(/, "no entry is rewritten without a claim (T01-R11, round 2)");
@@ -2004,8 +2016,85 @@ test("T01-R12/R14: the move function stores its Notion work in the same transact
   assert.match(fn, /VALUES \(v_claim, p_session_id, p_book_id, v_row\.notion_block_id, NULL, false\)/);
   assert.match(fn, /INSERT INTO pds\.reading_progress_owed \(owed_id, book_id\) VALUES \(v_owed_id, p_book_id\)/);
   assert.match(fn, /INSERT INTO pds\.reading_progress_owed \(owed_id, book_id\) VALUES \(v_owed_id, v_old_book\.book_id\)/);
-  assert.match(fn, /'mirror_claim_id', v_claim,\s+'entry_pending', v_pending,\s+'progress_owed', v_owed/);
+  assert.match(fn, /'mirror_claim_id', v_claim,\s+'replaces_block_id', CASE WHEN v_same_book THEN NULL ELSE v_prev\.notion_block_id END,\s+'entry_pending', v_pending,\s+'progress_owed', v_owed/);
+  assert.match(fn, /c\.session_id = p_session_id AND c\.book_id = p_book_id AND c\.owes_entry/, "a pending entry is a claim on this book only");
+  const create = sql.slice(sql.indexOf("CREATE OR REPLACE FUNCTION pds.create_reading_session("), sql.indexOf("CREATE OR REPLACE FUNCTION pds.move_reading_session("));
+  assert.match(create, /VALUES \(v_claim, v_row\.session_id, p_book_id, NULL, NULL, true\)/, "a keyed create stores the claim that owes its entry (round 2 of T01-R14)");
+  assert.match(create, /INSERT INTO pds\.reading_progress_owed \(owed_id, book_id\) VALUES \(v_owed_id, p_book_id\)/, "and its book's progress obligation");
+  assert.match(create, /'mirror_claim_id', v_claim,\s+'progress_owed_id', v_owed_id\)/);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS owes_entry boolean NOT NULL DEFAULT false/);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS next_try_at timestamptz NOT NULL DEFAULT now\(\) \+ interval '2 minutes'/);
   assert.doesNotMatch(sql, /drop/i, "additive only, and the Supabase connector refuses the word");
+});
+
+/* ---------- Codex round 2 of T01-R12 / T01-R14 (PR 376) ---------- */
+
+test("round 2 of T01-R14: a move uses the entry its transaction read under the lock, so a create callback that attached the entry just before the move cannot leave the old entry with no new one", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [{ ...PAGED_BOOK }, { ...PAGED_BOOK2 }], reading_sessions: [session({ notion_block_id: null })] });
+  // The edit's first read sees no entry; the create's callback attaches "blk-x" before the move's transaction runs.
+  const realRpc = db.rpc;
+  db.rpc = async (name, args) => {
+    if (name === "move_reading_session") db.tables.reading_sessions[0].notion_block_id = "blk-x";
+    return realRpc(name, args);
+  };
+  notion.mirror = async () => "blk-moved";
+  const r = await R.updateSession(db, 41, upd({ book: "other-book", chapter_through: 5 }));
+  assert.equal(r.ok, true);
+  assert.equal(r.mirrorReplaces, "blk-x", "the move answers the entry it read under the lock");
+  const placed = await RR.placeEntry(db, r.book, r.session, r.mirrorReplaces, r.mirrorClaimId);
+  assert.equal(placed.kind, "attached");
+  assert.equal(db.tables.reading_sessions[0].notion_block_id, "blk-moved");
+  assert.deepEqual(notion.trashed, ["blk-x"], "the old entry comes off the old page");
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+});
+
+test("round 2 of T01-R14: a surplus entry's claim goes only once the entry it replaces is settled", async () => {
+  const { RR, notion } = removalWithNotion();
+  // The session holds an unrelated entry on the claim's book (attached by another writer); the claim replaces "blk-x".
+  const db = fakeDb({ books: [{ ...PAGED_BOOK2 }], reading_sessions: [session({ book_id: 8, notion_block_id: "blk-other" })] });
+  const id = "00000000-0000-4000-8000-0000000000a1";
+  db.tables.reading_mirror_claims.push(claimRow({ claim_id: id, book_id: 8, replaces_block_id: "blk-x", owes_entry: true }));
+  notion.mirror = async () => "blk-own";
+  notion.trash = async (blk) => blk !== "blk-x";
+  const placed = await RR.placeEntry(db, { ...PAGED_BOOK2 }, db.tables.reading_sessions[0], "blk-x", id);
+  assert.equal(placed.kind, "surplus");
+  assert.ok(notion.trashed.includes("blk-own"), "its own entry is trashed");
+  assert.equal(db.tables.reading_mirror_claims.length, 1, "the replaced entry could not be trashed: the claim stays for the sweep");
+});
+
+test("round 2 of T01-R14: a keyed create stores its entry claim and progress obligation with the create, so a lost answer (the replay mirrors nothing) is finished by the sweep", async () => {
+  const { RR, notion } = removalWithNotion();
+  const db = fakeDb({ books: [{ ...PAGED_BOOK }] });
+  const first = await R.logSession(db, create({ date: "2026-11-15" }));
+  assert.equal(first.ok, true);
+  assert.match(String(first.mirrorClaimId), /^[0-9a-f-]{36}$/);
+  assert.match(String(first.progressOwedId), /^[0-9a-f-]{36}$/);
+  const claim = db.tables.reading_mirror_claims.find((c) => c.claim_id === first.mirrorClaimId);
+  assert.deepEqual([claim.session_id, claim.book_id, claim.block_id, claim.replaces_block_id, claim.owes_entry], [first.session.session_id, 7, null, null, true]);
+  assert.ok(db.tables.reading_progress_owed.some((o) => o.owed_id === first.progressOwedId && o.book_id === 7));
+  // The answer was lost: the form's retry is a replay, which writes nothing in Notion and stores nothing more.
+  const replay = await R.logSession(db, create({ date: "2026-11-15" }));
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.mirrorClaimId, null);
+  assert.equal(db.tables.reading_mirror_claims.length, 1);
+  // A same-book edit of the session (no entry yet) stores no rewrite claim: the create's claim writes the entry.
+  const edited = await R.updateSession(db, first.session.session_id, upd({ minutes: 30 }));
+  assert.equal(edited.ok, true);
+  assert.equal(edited.mirrorClaimId, null);
+  // An hour on with no entry carrying the claim's marker, the sweep writes it from the session as it is then.
+  claim.claimed_at = new Date(Date.now() - 61 * 60_000).toISOString();
+  notion.mirror = async () => "blk-created";
+  assert.equal(await RR.settleMirrorClaim(db, claimOf(claim), Date.now()), true);
+  assert.equal(notion.mirrored.length, 1);
+  assert.equal(notion.mirrored[0].marker, claim.claim_id);
+  assert.equal(db.tables.reading_sessions.find((x) => x.session_id === first.session.session_id).notion_block_id, "blk-created");
+  assert.equal(db.tables.reading_mirror_claims.length, 0);
+});
+
+test("round 2 of T01-R14: Onyx Chat writes a keyed create's entry under the claim the create stored, and its line under the stored obligation", () => {
+  const chat = fs.readFileSync(path.join(SRC, "app/api/chat/route.ts"), "utf8");
+  assert.match(chat, /placeEntry\(supabase, book, result\.session, null, entryClaim\)/);
+  assert.match(chat, /result\.mirrorClaimId \?\? \(ownInsert \? await createEntryClaimOf\(/);
+  assert.match(chat, /rewriteProgressNow\(supabase, book\.book_id, result\.progressOwedId\)/);
 });

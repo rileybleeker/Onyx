@@ -273,8 +273,9 @@ export interface MirrorClaim {
   claimedAt: string;
   attempts: number;
   /**
-   * The claim of a move to another book, stored with the move (pds.move_reading_session, Codex T01-R14): it owes the
-   * session's entry on `bookId`'s page, so a sweep that finds no entry for it writes one.
+   * The claim of a move to another book or of a keyed create, stored in the same transaction (pds.move_reading_session,
+   * pds.create_reading_session; Codex T01-R14 and its round 2): it owes the session's entry on `bookId`'s page, so a
+   * sweep that finds no entry for it writes one.
    */
   owesEntry?: boolean;
 }
@@ -318,6 +319,27 @@ export async function claimMirror(
     if (attempt < 2) await new Promise((r) => setTimeout(r, RETRY_PAUSE_MS * (attempt + 1)));
   }
   return null;
+}
+
+/**
+ * The claim a keyed create stored for the session's entry (pds.create_reading_session: owes the entry on `bookId`'s
+ * page, nothing replaced, no block id yet), for a caller that knows the create committed but not its answer (Onyx
+ * Chat's retry of its own insert). Null when there is none or it cannot be read: the caller then writes as before.
+ */
+export async function createEntryClaimOf(supabase: Supa, sessionId: number, bookId: number): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("reading_mirror_claims")
+    .select("claim_id")
+    .eq("session_id", sessionId)
+    .eq("book_id", bookId)
+    .eq("owes_entry", true)
+    .is("replaces_block_id", null)
+    .is("block_id", null)
+    .order("claimed_at", { ascending: true })
+    .limit(1);
+  if (error || !Array.isArray(data) || data.length === 0) return null;
+  const id = (data[0] as { claim_id?: unknown }).claim_id;
+  return typeof id === "string" ? id : null;
 }
 
 /** The block id Notion answered, on the claim (which outlives the session). False when it could not be stored: the marker still finds the entry. */
@@ -392,7 +414,8 @@ export async function placeEntry(
   storedClaimId: string | null = null,
 ): Promise<Placement> {
   if (!book.notion_page_id || !notionMirrorEnabled()) return { kind: "none" };
-  // `storedClaimId` = the claim a move stored in its own transaction (Codex T01-R14); otherwise one is stored now.
+  // `storedClaimId` = the claim a move or a keyed create stored in its own transaction (Codex T01-R14 and its round
+  // 2); otherwise one is stored now.
   const claim: MirrorClaim | "missing" | null = storedClaimId
     ? { claimId: storedClaimId, sessionId: session.session_id, bookId: book.book_id, blockId: null, replaces, claimedAt: new Date().toISOString(), attempts: 0, owesEntry: true }
     : await claimMirror(supabase, session.session_id, book.book_id, replaces);
@@ -435,7 +458,11 @@ export async function placeEntry(
   if (!now) return { kind: "gone", blockId, claimId: own?.claimId ?? null };
   // A sweep settled this claim first and put the entry on the session itself.
   if (now.notion_block_id === blockId) return attached(now);
-  await discardEntry(supabase, blockId, own?.claimId ?? null);
+  // Surplus: this entry is trashed, and the claim goes only once the entry it replaces (a move) is settled too
+  // (settleReplaced: left alone while the session holds it on another book, where a later move's claim owns it), so a
+  // claim never goes with its replaced entry still owed (Codex review of PR 376, round 2 of T01-R14).
+  const trashed = await trashWithRetry(blockId);
+  if (trashed && own && (await settleReplaced(supabase, own, now, blockId))) await dropClaim(supabase, own.claimId);
   return { kind: "surplus", row: now };
 }
 
@@ -561,7 +588,8 @@ async function settleReplaced(supabase: Supa, claim: MirrorClaim, session: Readi
  * this becomes its entry (conditionally), is brought up to date, and the replaced one is trashed. Otherwise (the
  * session is gone, on another book, or has another entry) this one is surplus: it is trashed and taken off the session
  * if it is still on it, the replaced entry is settled, and for a gone session the book's progress line is rewritten.
- * No entry found an hour after the claim: none was created. A move's claim (owesEntry, stored with the move) then
+ * No entry found an hour after the claim: none was created. A move's or a keyed create's claim (owesEntry, stored in
+ * the same transaction) then
  * writes the entry itself when the session still wants it (Codex T01-R14); otherwise the replaced entry of a move is
  * still settled before the claim goes. True when settled (the claim row is deleted); false leaves it for a later try. Exported for the tests.
  */
