@@ -1206,7 +1206,7 @@ const FLAG_SAYS: Record<string, RegExp> = {
     `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:wrong|incorrect|false|inaccurate|mistaken|an error)\\b|\\b(?:flag|report|mark|marked)\\b[^.!?\\n]*\\bas\\s+(?:wrong|incorrect|inaccurate)\\b`,
   ),
   unclear: new RegExp(
-    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:unclear|confusing|ambiguous|vague|poorly worded|badly worded|nonsense)\\b|\\b(?:makes?|made) no sense\\b|\\b(?:doesn't|does not|didn't|did not) make (?:any )?sense\\b|\\b(?:flag|report|mark)\\b[^.!?\\n]*\\bas\\s+(?:unclear|confusing|ambiguous|vague)\\b`,
+    `\\b(?:is|was|seems|looks|sounds|feels|are|'s)\\s+${FLAG_ADVERB}(?:unclear|confusing|ambiguous|vague|poorly worded|badly worded|nonsense)\\b|\\b(?:makes?|made) no sense\\b|\\b(?:doesn't|does not|didn't|did not) make (?:any )?sense\\b|\\b(?:flag|report|mark|marked)\\b[^.!?\\n]*\\bas\\s+(?:unclear|confusing|ambiguous|vague)\\b`,
   ),
   not_in_chapter:
     /\b(?:not|isn't|wasn't|aren't)\s+(?:in|from|part of|covered in|about)\s+(?:this|that|the|that same)\s+chapter\b|\bnot (?:in|from) (?:chapter|ch\.?)\s*\d+\b|\bwrong chapter\b|\bfrom (?:another|a different|the wrong) chapter\b/,

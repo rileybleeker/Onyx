@@ -480,6 +480,12 @@ const MATRIX = [
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
   ["a flag: the question was marked as wrong", BANK_FLAG("Q1201 was marked as wrong"),
     "flag_reading_question", { question_id: 1201, kind: "wrong" }, ALLOWED],
+  ["a flag: the question is marked as unclear, the same phrase as wrong", BANK_FLAG("Q1201 is marked as unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, ALLOWED],
+  ["a flag: the score on the question was marked as unclear, which is marking", BANK_FLAG("The score on Q1201 was marked as unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, refused("flag_not_stated")],
+  ["a flag: my answer to the question was marked as unclear, which is the user's own answer", BANK_FLAG("My answer to Q1201 was marked as unclear"),
+    "flag_reading_question", { question_id: 1201, kind: "unclear" }, refused("flag_not_stated")],
 ];
 
 for (const [name, messages, tool, input, expected] of MATRIX) {
