@@ -1,6 +1,6 @@
 "use client";
 
-import { AutosaveRefused } from "@/lib/autosave";
+import { AutosaveRefused, messageOf } from "@/lib/autosave";
 import { useAutosave, type UseAutosave } from "@/lib/use-autosave";
 
 /** The finance pages' write runner: runs fn, shows its error text, then re-reads the page (router.refresh / onChanged). */
@@ -22,6 +22,7 @@ export function useFinanceAutosave<T>(
     name,
     {
       delayMs: opts.delayMs ?? 1200,
+      describeError: messageOf,
       ready: opts.ready,
       save: async (v) => {
         const err = await send(v);

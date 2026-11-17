@@ -14,7 +14,7 @@ import CalendarConnectionCard from './CalendarConnectionCard';
 import CalendarEventsCard from './CalendarEventsCard';
 import InfoHint from '@/components/InfoHint';
 import { AutosaveStatus } from '@/components/AutosaveStatus';
-import { AutosaveRefused } from '@/lib/autosave';
+import { AutosaveRefused, messageOf } from '@/lib/autosave';
 import { useAutosave } from '@/lib/use-autosave';
 import { Part, PartGroup, PartGrid } from '@/components/personalize/PartGrid';
 import type { PageLayout } from '@/lib/personalize-layout';
@@ -223,6 +223,7 @@ export default function HealthClient({ initial, calendar, headingTestId = 'page-
   };
   const autosave = useAutosave<FormValue>('care-item', {
     delayMs: 1200,
+    describeError: messageOf,
     ready: formReady,
     save: async v => {
       const { id, ...fields } = v;

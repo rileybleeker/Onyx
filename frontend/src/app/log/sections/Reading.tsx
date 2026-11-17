@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { useInFeed } from "@/components/FeedContext";
-import { AutosaveRefused, saveRequest } from "@/lib/autosave";
+import { AutosaveRefused, messageOf, saveRequest } from "@/lib/autosave";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import { useLogDrafts, type ReadingLogDraft } from "@/lib/log-drafts";
@@ -444,6 +444,7 @@ export default function ReadingSection() {
       delayMs: 1500,
       ready: (v) => v.reason,
       same: sameValue,
+      describeError: messageOf,
       // A failure that may have been stored anyway leaves no value counted as saved until a save is answered.
       unknownOutcome: mayHaveStored,
       save: async (v, ctx) => {

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { useInFeed } from "@/components/FeedContext";
 import InfoHint from "@/components/InfoHint";
-import { AutosaveRefused } from "@/lib/autosave";
+import { AutosaveRefused, messageOf } from "@/lib/autosave";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
 import { easternDate, JOURNAL_CONFIDENCES, JOURNAL_MAX_BODY_CHARS, JOURNAL_MOODS, JOURNAL_SOURCES, type JournalSource } from "@/lib/journal-entry";
@@ -255,6 +255,7 @@ export default function JournalSection() {
 
   const autosave = useAutosave<Words>("journal", {
     delayMs: FIRST_FILE_DELAY_MS,
+    describeError: messageOf,
     ready: (w) => (w.body ? null : "An entry can't be empty. Type something, or start a new entry."),
     save: async (w, { keepalive }) => {
       let f = filedRef.current;

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Autosaver, messageOf, type AutosaveState, type AutosaverOptions } from "@/lib/autosave";
+import { Autosaver, plainSaveFailure, type AutosaveState, type AutosaverOptions } from "@/lib/autosave";
 import { formRetainer, type RetainOptions } from "@/lib/autosave-retain";
 import { useUnsavedWork } from "@/lib/use-unsaved-work";
 
@@ -37,7 +37,7 @@ export function useAutosave<T>(name: string, opts: Omit<AutosaverOptions<T>, "on
           ready: (v) => optsRef.current.ready?.(v),
           same: (a, b) => (optsRef.current.same ? optsRef.current.same(a, b) : JSON.stringify(a) === JSON.stringify(b)),
           unknownOutcome: (e) => optsRef.current.unknownOutcome?.(e) ?? false,
-          describeError: (e) => (optsRef.current.describeError ?? messageOf)(e),
+          describeError: (e) => (optsRef.current.describeError ?? plainSaveFailure)(e),
           delayMs: opts.delayMs,
           retryDelaysMs: opts.retryDelaysMs,
           onState: (s) => {
