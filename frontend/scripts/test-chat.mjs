@@ -1367,7 +1367,7 @@ test("an intake or reading session written by a lost try and removed since is ne
   await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody);
   rstate.failFinish = false;
   rdb.seed("chat_operation_tombstones", [{ op_id: rdb.rows("chat_operations")[0].op_id, target: "reading_sessions" }]);
-  const readingRetry = await (await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2 }),{ supabase: rdb, reading, readingNotion }).post(readingBody)).json();
+  const readingRetry = await (await route(afterTool("log_reading_session", { chapter_from: 1, chapter_through: 2 }), { supabase: rdb, reading, readingNotion }).post(readingBody)).json();
   assert.equal(sessions, 1, "the session was not written again");
   assert.equal(readingRetry.receipts[0].status, "not_saved");
 
