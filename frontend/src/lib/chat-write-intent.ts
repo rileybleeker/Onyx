@@ -875,6 +875,20 @@ function reportVerb(s: string): string | null {
   return first && first !== "did" && PAST.test(first) ? first : null;
 }
 
+/** Verbs that introduce what someone else said or wrote: "she said…", "the app told me…", "my note says…". */
+const REPORT_FRAME = new Set(["said", "says", "told", "tells", "wrote", "writes", "asked", "asks", "reminded", "reminds", "noted"]);
+
+/**
+ * A clause that reports someone else's words without quotation marks ("she said please log it", "the app told me to
+ * mark it done", "my note says log two"): it is not the user's request, whatever it contains. The words before the
+ * frame name the reporter; an "I" before it means the user is speaking ("I said log it"), so it is not reported speech.
+ */
+function reportedSpeech(s: string): boolean {
+  const words = tokens(s);
+  const frame = words.findIndex((w) => REPORT_FRAME.has(w));
+  return frame >= 0 && !words.slice(0, frame).some((w) => w === "i" || w === "i've" || w === "ive");
+}
+
 /** Words that say something was not done. */
 const NEGATION =
   /\b(?:not|no|never|none|nothing|didn't|didnt|don't|dont|doesn't|haven't|havent|hasn't|hadn't|wasn't|weren't|won't|wont|isn't|aren't|can't|cannot|couldn't|skipped|skip|skipping|forgot|forget|missed|miss)\b/g;
@@ -964,6 +978,8 @@ function intentClauses(text: string): IntentClause[] {
       // gives its polarity, names its record and carries its arguments. A clause that is only a reason ends the list.
       const clause = mainPart(whole);
       if (!clause) { chain = null; continue; }
+      // Someone else's words, unquoted ("she said please log it"): neither a request nor a report by the user.
+      if (reportedSpeech(clause)) { chain = null; continue; }
       const pol = polarity(clause);
       const negMatch = afterColon ? null : NEG_IMPERATIVE.exec(clause);
       const posMatch = afterColon || negMatch ? null : IMPERATIVE.exec(clause);
