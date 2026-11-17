@@ -27,7 +27,9 @@ import {
   type DrinkItemState,
   type DrinkRecord,
   type DrinkSave,
+  TIME_PROBLEM_TEXT,
   type PendingOp,
+  type TimeProblem,
 } from "./drink-capture";
 
 export const DRINK_STORAGE_KEY = "onyx.drinks.pending";
@@ -103,7 +105,21 @@ export type Call = (method: "POST" | "PATCH" | "DELETE", body: unknown, keepaliv
 
 const METHOD: Record<PendingOp["op"], "POST" | "PATCH" | "DELETE"> = { create: "POST", edit: "PATCH", remove: "DELETE" };
 const recordOf = (a: CallAnswer) => (a.json.record && typeof a.json.record === "object" ? (a.json.record as DrinkRecord) : null);
-const errorText = (a: CallAnswer) => (typeof a.json.error === "string" && a.json.error ? a.json.error : `Save failed (${a.status}).`);
+const SAVE_FAILED = "Could not save the drink. Try again.";
+/**
+ * The words shown for a failed autosave. Server text is kept only where the server sends it on purpose: a time problem
+ * (the app's own sentence for that fixed code), a 503 "unavailable" refusal, an overlap refusal, and a 400 validation
+ * message. Everything else (5xx, 408/429, 404, unknown, non-JSON, missing error) gets fixed copy; no status number.
+ */
+function failureText(a: CallAnswer): string {
+  const code = typeof a.json.code === "string" ? a.json.code : null;
+  const err = typeof a.json.error === "string" && a.json.error ? a.json.error : null;
+  if (code && Object.prototype.hasOwnProperty.call(TIME_PROBLEM_TEXT, code)) return TIME_PROBLEM_TEXT[code as TimeProblem];
+  if (err && a.status === 503 && code === "unavailable") return err;
+  if (err && a.status === 409 && code === "overlap_unverified") return err;
+  if (err && a.status === 400) return err;
+  return SAVE_FAILED;
+}
 const saveOf = (op: PendingOp): DrinkSave | null => {
   if (op.op === "remove") return null;
   const { client_key, product_id, servings, time, overlap } = op.body;
@@ -256,9 +272,9 @@ function applyAnswer(key: string, op: PendingOp, a: CallAnswer): void {
     if (a.status === 503) {
       items.set(key, { ...it, pending: null });
       emit();
-      throw new AutosaveRefused(errorText(a));
+      throw new AutosaveRefused(failureText(a));
     }
-    throw new Error(errorText(a));
+    throw new Error(failureText(a));
   }
   const rec = recordOf(a);
   if (a.status === 409 && rec && (a.json.code === "changed" || a.json.code === "stale")) {
@@ -275,7 +291,7 @@ function applyAnswer(key: string, op: PendingOp, a: CallAnswer): void {
   }
   items.set(key, { ...it, pending: null });
   emit();
-  throw new AutosaveRefused(errorText(a));
+  throw new AutosaveRefused(failureText(a));
 }
 
 async function send(call: Call, key: string, op: PendingOp, keepalive: boolean): Promise<void> {
