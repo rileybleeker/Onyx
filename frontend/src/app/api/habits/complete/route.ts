@@ -105,7 +105,8 @@ export async function POST(req: NextRequest) {
       .eq("question", habit)
       .eq("cycle_date", completionDate);
     if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
+      console.error("habits/complete", error);
+      return NextResponse.json({ error: "Couldn't save that habit. Try again." }, { status: 500 });
     }
   } else {
     const { error } = await supabase
@@ -115,7 +116,8 @@ export async function POST(req: NextRequest) {
         { onConflict: "cycle_date,question" }
       );
     if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
+      console.error("habits/complete", error);
+      return NextResponse.json({ error: "Couldn't save that habit. Try again." }, { status: 500 });
     }
   }
 
