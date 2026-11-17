@@ -965,7 +965,7 @@ export async function GET() {
           daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
-          errorMessage: (entry?.error_message as string) ?? (entry && ageH > 15 * 24 ? `No forecast snapshot for ${Math.floor(ageH / 24)} days - check cash-forecast-snapshot.yml.` : null),
+          errorMessage: (entry?.error_message as string) ?? (entry && ageH > 15 * 24 ? `No forecast snapshot for ${Math.floor(ageH / 24)} days - the weekly snapshot job has not run. Check the Actions tab on GitHub for the cash forecast snapshot job.` : null),
           cadence: CADENCE.cash_forecast,
           integrationMethod: METHOD.cash_forecast.method,
           methodLabel: METHOD.cash_forecast.label,
