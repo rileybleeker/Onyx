@@ -96,7 +96,7 @@ export default function NycClient({ initial }: { initial: NycLead[] | null }) {
       })
       .catch((e) => {
         console.error("NYC leads load failed:", e);
-        if (!cancelled) setError("Couldn't load leads. Try again.");
+        if (!cancelled) setError("Couldn't load NYC leads right now. Try again in a moment.");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
