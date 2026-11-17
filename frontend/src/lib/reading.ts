@@ -832,6 +832,9 @@ function computeBadges(ctx: {
   const earliest = (pred: (s: ReadingSession) => boolean) =>
     [...sessions].filter(pred).map((s) => s.session_date).sort()[0] ?? null;
   const cps = checkpoints;
+  // A book with no chapter count has no checkpoints: those two badges stay unearned (never a made-up chapter number).
+  const cp1 = cps[0]?.chapter ?? null;
+  const cp2 = cps[1]?.chapter ?? null;
   const commented = highlights.filter((h) => (h.comment ?? "").trim());
   const reviewDays = [...new Set([...reviews.map((r) => r.review_date), ...(ctx.practiceDays ?? [])])].sort();
   const passedQuizzes = quizzes.filter((q) => q.total > 0 && q.score / q.total >= 0.8);
@@ -848,8 +851,8 @@ function computeBadges(ctx: {
 
   return [
     badge("first-session", "Log your first session", firstSession?.session_date ?? null),
-    badge("checkpoint-1", `Reach chapter ${cps[0]?.chapter ?? 12}`, earliest((s) => (s.chapter_through ?? 0) >= (cps[0]?.chapter ?? 12))),
-    badge("checkpoint-2", `Reach chapter ${cps[1]?.chapter ?? 26}`, earliest((s) => (s.chapter_through ?? 0) >= (cps[1]?.chapter ?? 26))),
+    badge("checkpoint-1", cp1 === null ? "Reach the first checkpoint" : `Reach chapter ${cp1}`, cp1 === null ? null : earliest((s) => (s.chapter_through ?? 0) >= cp1)),
+    badge("checkpoint-2", cp2 === null ? "Reach the second checkpoint" : `Reach chapter ${cp2}`, cp2 === null ? null : earliest((s) => (s.chapter_through ?? 0) >= cp2)),
     badge("finisher", "Reach the last chapter", totalChapters && chaptersDone >= totalChapters ? earliest((s) => (s.chapter_through ?? 0) >= totalChapters) : null),
     badge("streak-7", "A 7-day session streak", best >= 7 ? "✓" : null),
     badge("scribe", "10 highlights with a comment", commented.length >= 10 ? commented.map((h) => h.created_at.slice(0, 10)).sort()[9] : null),

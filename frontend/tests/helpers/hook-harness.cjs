@@ -104,7 +104,9 @@ function mountClient(relPath, { props = {}, stubs = {}, cache = new Map() } = {}
       }
     }
   }
-  return { flush, text, nodes, button, buttons, click, unmount, find: (pred) => nodes().filter(pred) };
+  // Render again with the (mutated) props object, as a parent passing new props would; `flush()` does the work.
+  const rerender = () => { dirty = true; };
+  return { flush, rerender, text, nodes, button, buttons, click, unmount, find: (pred) => nodes().filter(pred) };
 }
 
 /** A fetch Response stand-in. */

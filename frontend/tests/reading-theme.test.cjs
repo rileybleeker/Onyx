@@ -3,7 +3,9 @@
 //    the level and the badges, validated (plain text, limits, a bad part falls back on its own), and carried on the
 //    overview without a new request; the badge keys name no book;
 //  - the concept picker: the theme's concepts plus the titles of linked question-bank ideas (GET /api/reading/idea-titles,
-//    on demand, fail-open), deduplicated and capped;
+//    on demand, fail-open), deduplicated and capped; run under the hook harness against the real client cache: a write
+//    or a move of the overview's numbers empties the list at once (a title the spoiler gate hides never waits for the
+//    next answer), and an answer to a read that started earlier never lands;
 //  - sql/reading_book_theme.sql: additive, the column's shape check, the linked-titles function behind the spoiler gate;
 //  - the public repo names no book: hashes of the words that used to sit in code are looked for in the reading files
 //    (the words themselves are not in this test).
@@ -15,8 +17,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createClient } = require("@supabase/supabase-js");
 const { loadTs } = require("./helpers/load-ts.cjs");
+const { mountClient, deferred } = require("./helpers/hook-harness.cjs");
 
 const R = loadTs("lib/reading.ts");
+const CC = loadTs("lib/client-cache.ts");
 
 const REPO = path.join(__dirname, "..", "..");
 const read = (rel) => fs.readFileSync(path.join(REPO, rel), "utf8");
@@ -144,6 +148,19 @@ test("with no theme the level ladder and the badges are generic, and the badge k
   assert.equal(badge(o, "checkpoint-2").description, `Reach chapter ${R.checkpointChapters(20)[1]}`);
   assert.deepEqual(o.theme, R.defaultBookTheme(), "the overview always carries a theme");
   assert.deepEqual(overview({ theme: null }).theme, R.defaultBookTheme());
+});
+
+test("a book with no chapter count has no checkpoints, so those two badges say so and stay unearned (never a made-up chapter number)", () => {
+  const o = R.computeOverview({ book: { ...book, total_chapters: null }, today: TODAY, sessions: [session(1, "2026-03-09", 40)], highlights: [], reviews: [], quizzes: [] });
+  assert.deepEqual(o.checkpoints, []);
+  assert.deepEqual(o.badges.map((b) => b.key), [...R.BADGE_KEYS]);
+  for (const [key, words] of [["checkpoint-1", "Reach the first checkpoint"], ["checkpoint-2", "Reach the second checkpoint"]]) {
+    assert.equal(badge(o, key).description, words);
+    assert.equal(badge(o, key).earned, false, "chapter 40 reached, and still no checkpoint to have reached");
+    assert.equal(badge(o, key).earnedOn, null);
+  }
+  const src = read("frontend/src/lib/reading.ts");
+  assert.doesNotMatch(src, /\?\? 12\b|\?\? 26\b/, "no checkpoint chapter of the first book is left as a fallback");
 });
 
 test("a theme renames the level ladder and the badges it names, and nothing else changes", () => {
@@ -288,29 +305,192 @@ test("the picker's route: GET only, owner session (never a CI route), a slug or 
   assert.doesNotMatch(read("frontend/src/middleware.ts"), /idea-titles/, "no CI path: the owner's session is the only way in");
 });
 
-test("the highlight form offers the theme's concepts plus the linked idea titles, and asks for the titles only while the bank is on", () => {
+test("the highlight form hands the concept select to ConceptPicker: the theme's concepts plus the linked idea titles, read only while the bank is on", () => {
   const src = read("frontend/src/app/reading/ReadingClient.tsx");
-  assert.match(src, /import \{[^}]*\bconceptOptions\b[^}]*\bparseIdeaTitles\b[^}]*\} from "@\/lib\/reading";/);
+  assert.match(src, /import ConceptPicker from "\.\/ConceptPicker";/);
   assert.doesNotMatch(src, /\bCONCEPTS\b/, "no constant list of one book's concepts");
-  assert.match(src, /conceptOptions\(o\.theme\?\.concepts, ideaTitles\)/);
-  assert.match(src, /useLinkedIdeaTitles\(o\.book\.slug, o\.practice\?\.enabled === true, mapSignature\(o\.practice\)\)/, "nothing is read while the book's questions are off, and it reads again when the gate or the counts move");
-  assert.match(src, /\{concepts\.map\(\(c\) => \(/);
-  assert.match(src, /\/api\/reading\/idea-titles\?book=\$\{encodeURIComponent\(slug\)\}/);
+  assert.doesNotMatch(src, /useLinkedIdeaTitles|ideaTitles|conceptOptions|parseIdeaTitles/, "the reads and the list moved with the picker");
+  assert.match(
+    src,
+    /<ConceptPicker\s+slug=\{o\.book\.slug\}\s+on=\{o\.practice\?\.enabled === true\}\s+signature=\{mapSignature\(o\.practice\)\}\s+themeConcepts=\{o\.theme\?\.concepts\}\s+value=\{concept\}/,
+    "nothing is read while the book's questions are off, and it reads again when the gate or the counts move",
+  );
+  assert.doesNotMatch(src, /new Map<string, \{ at: number; titles/, "no module-level memo outlives a write, a sign-out or the gate");
+  const picker = read("frontend/src/app/reading/ConceptPicker.tsx");
+  assert.match(picker, /import \{ conceptOptions, parseIdeaTitles \} from "@\/lib\/reading";/);
+  assert.match(picker, /\{concepts\.map\(\(c\) => \(/);
+  assert.match(picker, /\/api\/reading\/idea-titles\?book=\$\{encodeURIComponent\(slug\)\}/);
   // The read is a GET through the shared helper (no side effect); the picker never writes it.
-  const hook = src.slice(src.indexOf("function useLinkedIdeaTitles"), src.indexOf("const BurnupChart"));
-  assert.ok(hook.length > 200 && hook.length < 4000, "the slice is the hook and nothing else");
+  const hook = picker.slice(picker.indexOf("export function useLinkedIdeaTitles"), picker.indexOf("export default function ConceptPicker"));
+  assert.ok(hook.length > 200 && hook.length < 4500, "the slice is the hook and nothing else");
   assert.match(hook, /getJsonShared\(url\)/, "the read at mount joins a read another part just started");
   assert.match(hook, /getJson\(url\)/, "a read after a write is a plain GET, never joined");
-  assert.doesNotMatch(hook, /method: "(POST|PUT|PATCH|DELETE)"|postJson/);
-  // Spoiler gate: a write to the reading area drops the cache entry, the hook reads again, and a read that started
-  // before the write cannot land after it (the effect's cleanup); a failed read is no titles, never a kept one.
-  assert.match(hook, /clientCache\.subscribe\(url, \(v\) => \{[^}]*v === undefined[^}]*setEpoch/s);
-  assert.match(hook, /if \(!live\) return;/);
+  assert.doesNotMatch(picker, /method: "(POST|PUT|PATCH|DELETE)"|postJson/);
+  // Spoiler gate (run for real in the tests below): a write that drops the entry is counted by the listener itself,
+  // synchronously, and an answer is kept only while the key, the numbers and the write count are still the ones it started with.
+  assert.match(hook, /clientCache\.subscribe\(url, \(v\) => \{\s*if \(v !== undefined\) return;\s*now\.current\.writes \+= 1;\s*setSeen\(now\.current\.writes\);/);
+  assert.match(hook, /if \(!live \|\| c\.url !== url \|\| c\.signature !== signature \|\| c\.writes !== seen\) return;/);
+  assert.match(hook, /return on && got\.stamp === stamp \? got\.titles : NO_TITLES;/, "what shows belongs to the current stamp only");
   assert.match(hook, /clientCache\.put\(url, \{ titles: next \}, \{ persist: false/, "memory only: never on the device");
-  assert.match(hook, /\[url, on, signature, epoch\]/, "the read repeats when the key, the bank switch, the overview's numbers or a write change");
+  assert.match(hook, /\[url, on, signature, seen\]/, "the read repeats when the key, the bank switch, the overview's numbers or a write change");
   assert.match(hook, /r\.status === 200/);
-  assert.doesNotMatch(src, /new Map<string, \{ at: number; titles/, "no module-level memo outlives a write, a sign-out or the gate");
   assert.equal(read("frontend/src/lib/reading.ts").includes("export const CONCEPTS"), false);
+});
+
+/* ------------------------------------------------------------------ */
+/* The concept picker, run: hooks under the harness, the real client cache, one fake read per GET */
+/* ------------------------------------------------------------------ */
+
+const IDEA_URL = `/api/reading/idea-titles?book=${SLUG}`;
+const FLAG_WRITE = "/api/reading/practice/flag";
+const NONE = ["", "Tide tables", "__custom"];
+const titles = (...t) => ({ titles: t });
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+const offered = (h) => h.find((n) => n.type === "option").map((n) => n.props.value);
+
+function mountPicker(t, { on = true, value = "", preset } = {}) {
+  const cache = new CC.ClientCache({ schedule: (task) => task(), readyTimeoutMs: 20 });
+  if (preset) cache.put(IDEA_URL, titles(...preset), { persist: false });
+  const reads = [];
+  const reader = (shared) => (url) => {
+    const d = deferred();
+    reads.push({ url, shared, answer: (body, status = 200) => d.resolve({ status, body }), fail: () => d.resolve({ status: null, body: null }) });
+    return d.promise;
+  };
+  const changes = [];
+  const props = { slug: SLUG, on, signature: "gate-1", themeConcepts: ["Tide tables"], value, onChange: (v) => changes.push(v) };
+  const h = mountClient("app/reading/ConceptPicker.tsx", {
+    props,
+    stubs: { "@/lib/client-cache": { clientCache: cache }, "@/lib/reading-practice-client": { getJson: reader(false), getJsonShared: reader(true) } },
+  });
+  t.after(() => h.unmount());
+  return { h, cache, reads, props, changes };
+}
+
+test("the picker lists the theme's concepts first, then the linked idea titles once they are read (repeats ignoring case dropped)", async (t) => {
+  const p = mountPicker(t);
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), NONE, "only the theme's concepts before the answer");
+  assert.equal(p.reads.length, 1);
+  assert.deepEqual([p.reads[0].url, p.reads[0].shared], [IDEA_URL, true], "the read at mount may join one another part just started");
+  p.reads[0].answer(titles("Lamp rotation", "Fog signals", "tide TABLES"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), ["", "Tide tables", "Lamp rotation", "Fog signals", "__custom"]);
+  assert.deepEqual(p.cache.peek(IDEA_URL).titles, ["Lamp rotation", "Fog signals", "tide TABLES"], "the answer is cached for the session (memory only: the entry is put with persist false)");
+  assert.deepEqual(p.cache.invalidate(CC.writeInvalidates("/api/reading/practice/attempt")), [], "answering a question drops nothing");
+  await p.h.flush();
+  assert.equal(p.reads.length, 1, "and reads nothing again");
+});
+
+test("a write that drops the entry (a Not read yet hold) empties the picker at once and keeps it empty until the new answer; a title the gate hides never comes back", async (t) => {
+  const p = mountPicker(t);
+  await p.h.flush();
+  p.reads[0].answer(titles("Lamp rotation", "Fog signals"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h).slice(2, 4), ["Lamp rotation", "Fog signals"]);
+  assert.deepEqual(p.cache.invalidate(CC.writeInvalidates(FLAG_WRITE)), [IDEA_URL], "the flag write drops the picker's entry");
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), NONE, "the titles are gone before the new read has answered");
+  assert.equal(p.reads.length, 2);
+  assert.equal(p.reads[1].shared, false, "a read after a write is a plain GET, never joined to an older one");
+  await p.h.flush();
+  await tick();
+  assert.deepEqual(offered(p.h), NONE, "and they stay gone while the request is slow or stuck");
+  p.reads[1].answer(titles("Fog signals"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), ["", "Tide tables", "Fog signals", "__custom"], "only what the gate allows now");
+  assert.deepEqual(p.cache.peek(IDEA_URL), titles("Fog signals"));
+});
+
+test("an answer to a read that started before a write is thrown away even when it arrives before the page has rendered again", async (t) => {
+  const p = mountPicker(t);
+  await p.h.flush(); // the first read is on its way
+  p.cache.invalidate(CC.writeInvalidates(FLAG_WRITE)); // the hold lands before the first answer
+  p.reads[0].answer(titles("Locked idea"));
+  await tick(); // the answer is handled; React has not rendered since the write
+  assert.equal(p.cache.peek(IDEA_URL), undefined, "the old answer was not stored");
+  await p.h.flush();
+  assert.equal(p.reads.length, 2);
+  assert.deepEqual(offered(p.h), NONE, "and never shown");
+  p.reads[1].answer(titles("Open idea"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), ["", "Tide tables", "Open idea", "__custom"]);
+  assert.doesNotMatch(JSON.stringify(p.cache.peek(IDEA_URL)), /Locked idea/);
+});
+
+test("the overview's numbers moving (the gate, the counts) empty the picker at once, and an answer for an older overview is not shown", async (t) => {
+  const p = mountPicker(t);
+  await p.h.flush();
+  p.reads[0].answer(titles("Lamp rotation"));
+  await p.h.flush();
+  assert.ok(offered(p.h).includes("Lamp rotation"));
+  p.props.signature = "gate-2";
+  p.h.rerender();
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), NONE, "emptied by the move itself, not by the next answer");
+  assert.equal(p.reads.length, 2);
+  assert.equal(p.reads[1].shared, false);
+  p.reads[1].answer(titles("Fog signals"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), ["", "Tide tables", "Fog signals", "__custom"]);
+  // Two moves while a read is still out: the first read's answer is for an older overview.
+  p.props.signature = "gate-3";
+  p.h.rerender();
+  await p.h.flush();
+  p.props.signature = "gate-4";
+  p.h.rerender();
+  await p.h.flush();
+  assert.equal(p.reads.length, 4);
+  p.reads[2].answer(titles("Old gate title"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), NONE, "an answer for an older overview is not shown");
+  assert.doesNotMatch(JSON.stringify(p.cache.peek(IDEA_URL) ?? null), /Old gate title/, "and not stored");
+  p.reads[3].answer(titles("Current title"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), ["", "Tide tables", "Current title", "__custom"]);
+});
+
+test("a failed or refused read is no titles (stored as such), never the last answer", async (t) => {
+  const cases = [
+    ["server error", (r) => r.answer({ error: "x" }, 500)],
+    ["no answer", (r) => r.fail()],
+    ["not an object", (r) => r.answer("oops", 200)],
+    ["refused", (r) => r.answer(titles("Locked idea"), 403)],
+  ];
+  for (const [label, respond] of cases) {
+    const p = mountPicker(t, { preset: ["Cached idea"] });
+    await p.h.flush();
+    assert.ok(offered(p.h).includes("Cached idea"), `${label}: the cached titles show at once`);
+    respond(p.reads[0]);
+    await p.h.flush();
+    assert.deepEqual(offered(p.h), NONE, label);
+    assert.deepEqual(p.cache.peek(IDEA_URL), titles(), `${label}: stored as no titles`);
+  }
+});
+
+test("with the bank off nothing is read and no title is shown, even from the cache", async (t) => {
+  const p = mountPicker(t, { on: false, preset: ["Cached idea"] });
+  await p.h.flush();
+  assert.equal(p.reads.length, 0);
+  assert.deepEqual(offered(p.h), NONE);
+});
+
+test("a chosen concept stays in the select while it is not offered, is listed once when it is, and choosing reports the value", async (t) => {
+  const p = mountPicker(t, { value: "Fog signals" });
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), ["", "Fog signals", "Tide tables", "__custom"], "what is stored stays visible while the list is read");
+  p.reads[0].answer(titles("Fog signals"));
+  await p.h.flush();
+  assert.deepEqual(offered(p.h), ["", "Tide tables", "Fog signals", "__custom"], "listed once, in its place");
+  const select = p.h.find((n) => n.type === "select")[0];
+  assert.equal(select.props.value, "Fog signals");
+  select.props.onChange({ target: { value: "Tide tables" } });
+  assert.deepEqual(p.changes, ["Tide tables"]);
+  for (const value of ["", "__custom"]) {
+    const q = mountPicker(t, { value });
+    await q.h.flush();
+    assert.deepEqual(offered(q.h), NONE, `${JSON.stringify(value)} is not a tag and adds no option`);
+  }
 });
 
 /* ------------------------------------------------------------------ */
@@ -424,6 +604,7 @@ test("the reading files name no book: no level title, concept tag or badge label
     "frontend/src/lib/reading-recall.ts",
     "frontend/src/lib/reading-bank.ts",
     "frontend/src/app/reading/ReadingClient.tsx",
+    "frontend/src/app/reading/ConceptPicker.tsx",
     "frontend/src/app/reading/ChapterMap.tsx",
     "frontend/src/app/reading/PracticePart.tsx",
     "frontend/src/app/reading/PracticeRunner.tsx",

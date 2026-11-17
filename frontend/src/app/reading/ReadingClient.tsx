@@ -6,14 +6,14 @@ import Link from "next/link";
 import { Check, ChevronDown, Flame, Highlighter, Sparkles, Trophy, X } from "lucide-react";
 import MetricRing from "@/components/MetricRing";
 import InfoHint from "@/components/InfoHint";
-import { CHECKPOINT_SIZE, checkpointOffer, conceptOptions, parseIdeaTitles, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
+import { CHECKPOINT_SIZE, checkpointOffer, type Checkpoint, type Highlight, type HighlightSource, type ReadingOverview, type Book } from "@/lib/reading";
 import { clientCache } from "@/lib/client-cache";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused, saveRequest } from "@/lib/autosave";
 import { highlightValue, ownRetriedHighlight, sameReadingValue, type HighlightValue } from "@/lib/reading-autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { sameJson } from "@/lib/format";
-import { getJson, getJsonShared } from "@/lib/reading-practice-client";
+import { getJson } from "@/lib/reading-practice-client";
 import { checkpointRefusal, checkpointUrl, hasUnrecordedAnswers, mapSignature, parseCheckpoint } from "@/lib/reading-map";
 import { Part, PartGroup, PartGrid } from "@/components/personalize/PartGrid";
 import LogLink from "@/components/LogLink";
@@ -22,6 +22,7 @@ import ReviewCard from "./ReviewCard";
 import PracticePart from "./PracticePart";
 import ChapterMap from "./ChapterMap";
 import CheckpointQuiz from "./CheckpointQuiz";
+import ConceptPicker from "./ConceptPicker";
 
 /**
  * Which checkpoints held answers without a result, as last read, kept for the session (memory only, one entry per book
@@ -29,61 +30,6 @@ import CheckpointQuiz from "./CheckpointQuiz";
  */
 const UNRECORDED_TTL_MS = 120_000;
 const unrecordedMemo = new Map<string, { at: number; pending: boolean }>();
-
-/**
- * The titles of the question-bank ideas the book's highlights are linked to (GET /api/reading/idea-titles), for the
- * concept picker. Like every cached read: one key (the URL), memory only (never written to the device, gone with the
- * rest of the client cache on sign-out), shown at once from the cache and read again on every mount.
- */
-const IDEA_TITLES_MAX_AGE_MS = 300_000;
-const NO_TITLES: string[] = [];
-const ideaTitlesUrl = (slug: string) => `/api/reading/idea-titles?book=${encodeURIComponent(slug)}`;
-const titlesOf = (raw: unknown): string[] => (raw && typeof raw === "object" ? parseIdeaTitles((raw as { titles?: unknown }).titles) : NO_TITLES);
-
-/**
- * The linked idea titles for the concept picker. A plain GET with no side effect, made only while the book's
- * questions are on (nothing to read otherwise). The database applies the spoiler gate, so a title the gate no longer
- * allows has to go the moment the gate moves, and three things see to that:
- * - any write to the reading area (a "Not read yet" hold, a flag, a rebuild) drops this cache entry (writeInvalidates),
- *   which reads the titles again; the answer of a read that started before the write is dropped, never shown;
- * - the overview's own numbers (`signature`: the spoiler gate, stage counts, chapter states) moving reads them again;
- * - a read that fails or answers anything but 200 is stored as no titles, so it never keeps a title that is gone.
- */
-function useLinkedIdeaTitles(slug: string, on: boolean, signature: string): string[] {
-  const url = ideaTitlesUrl(slug);
-  const [got, setGot] = useState<{ url: string; titles: string[] }>(() => ({ url, titles: on ? titlesOf(clientCache.peek(url)) : NO_TITLES }));
-  const [epoch, setEpoch] = useState(0);
-  const firstRead = useRef(true);
-  useEffect(() => {
-    if (!on) return;
-    return clientCache.subscribe(url, (v) => {
-      if (v === undefined) setEpoch((e) => e + 1);
-    });
-  }, [url, on]);
-  useEffect(() => {
-    if (!on) {
-      setGot((prev) => (prev.url === url && prev.titles.length === 0 ? prev : { url, titles: NO_TITLES }));
-      return;
-    }
-    let live = true;
-    // An entry has to exist for a write to remove it (and so tell this read to drop its answer): hold the place.
-    if (clientCache.peek(url) === undefined) clientCache.put(url, { titles: [] }, { persist: false, maxAgeMs: IDEA_TITLES_MAX_AGE_MS });
-    // The read at mount may join the same read another part started a moment ago; a read after a write never does.
-    const first = firstRead.current;
-    firstRead.current = false;
-    void (first ? getJsonShared(url) : getJson(url)).then((r) => {
-      if (!live) return;
-      const next = r.status === 200 && r.body && typeof r.body === "object" ? titlesOf(r.body) : NO_TITLES;
-      // Memory only; an answer with no titles is stored as such, so a failed read never keeps a title that is gone.
-      clientCache.put(url, { titles: next }, { persist: false, maxAgeMs: IDEA_TITLES_MAX_AGE_MS });
-      setGot((prev) => (prev.url === url && sameJson(prev.titles, next) ? prev : { url, titles: next }));
-    });
-    return () => {
-      live = false;
-    };
-  }, [url, on, signature, epoch]);
-  return on && got.url === url ? got.titles : NO_TITLES;
-}
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
@@ -580,9 +526,6 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
   const [chapter, setChapter] = useState<string>("");
   const [concept, setConcept] = useState<string>("");
   const [customConcept, setCustomConcept] = useState("");
-  // The concept tags offered: the book's own (pds.books.theme, generic when none) plus the titles of its linked ideas.
-  const ideaTitles = useLinkedIdeaTitles(o.book.slug, o.practice?.enabled === true, mapSignature(o.practice));
-  const concepts = useMemo(() => conceptOptions(o.theme?.concepts, ideaTitles), [o.theme, ideaTitles]);
   const [source, setSource] = useState<HighlightSource>("kindle");
   const [importText, setImportText] = useState("");
   const [preview, setPreview] = useState<{ format: string; count: number } | null>(null);
@@ -783,22 +726,18 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
               placeholder="ch."
               className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] font-mono text-text-primary"
             />
-            <select
+            {/* The concept tags: the book's own (pds.books.theme, none by default) plus the titles of its linked ideas. */}
+            <ConceptPicker
+              slug={o.book.slug}
+              on={o.practice?.enabled === true}
+              signature={mapSignature(o.practice)}
+              themeConcepts={o.theme?.concepts}
               value={concept}
-              onChange={(e) => {
-                setConcept(e.target.value);
-                commit({ concept: e.target.value });
+              onChange={(v) => {
+                setConcept(v);
+                commit({ concept: v });
               }}
-              className="bg-white/[0.03] border border-border-subtle rounded-control px-2 py-2 text-[13px] text-text-primary"
-            >
-              <option value="">Concept (optional)</option>
-              {concepts.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-              <option value="__custom">Other…</option>
-            </select>
+            />
           </div>
           {concept === "__custom" && (
             <input

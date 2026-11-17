@@ -56,7 +56,7 @@ titles, concept tags, badge labels) is kept out of code. Code comments cite its 
 | `frontend/src/lib/reading-recall-server.ts`, `frontend/src/app/api/reading/practice/**` | The practice API and grading: round, attempt, a round's attempts, override, flag, checkpoint (S3, S5) |
 | `frontend/src/app/reading/PracticePart.tsx`, `PracticeRunner.tsx`, `PracticeCards.tsx`, `BankApproval.tsx`, `frontend/src/lib/reading-practice-client.ts`, `frontend/src/lib/reading-practice-urls.ts` | The practice screen, its runner, the approval card, the client's GET / POST helpers and the one place that spells the practice URLs (S4) |
 | `frontend/src/app/api/chat/route.ts`, `frontend/src/lib/chat-receipts.ts` | Three question-bank chat tools; the reading sentence of the system prompt built from the active book (S6) |
-| `sql/reading_book_theme.sql`, `frontend/src/app/api/reading/idea-titles/route.ts` | A book's own flavour as data (`pds.books.theme`) and the linked idea titles for the concept picker (S7) |
+| `sql/reading_book_theme.sql`, `frontend/src/app/api/reading/idea-titles/route.ts`, `frontend/src/app/reading/ConceptPicker.tsx` | A book's own flavour as data (`pds.books.theme`), the linked idea titles, and the concept picker that shows them (S7) |
 
 ## Apply order and rollout (Riley approves production schema writes)
 
@@ -623,7 +623,8 @@ UPDATE pds.books SET theme = '{"v": 1, "level_titles": ["Newcomer", "Keeper"], "
 - **Badges:** a label per badge key; the keys are `first-session`, `checkpoint-1`, `checkpoint-2`, `finisher`,
   `streak-7`, `scribe`, `reviewer`, `quiz-master`, `on-pace`, `runner`. A theme renames badges, never adds or removes
   one, and never changes what earns them. The two checkpoint badges are earned at the first and second checkpoint
-  chapters (30% and 65% of the book).
+  chapters (30% and 65% of the book); a book with no chapter count has no checkpoints, so both stay unearned and say
+  "Reach the first checkpoint" / "Reach the second checkpoint" instead of a chapter number.
 - **Validation:** the database allows an object of at most 6,000 characters. The app reads each part on its own
   (`parseBookTheme`): text only (control characters out, whitespace collapsed, cut to the limits counting characters,
   never splitting one), concepts with repeats ignoring case dropped, level titles kept exactly as listed (a ladder is
@@ -640,12 +641,16 @@ UPDATE pds.books SET theme = '{"v": 1, "level_titles": ["Newcomer", "Keeper"], "
   evidence, supported by at least one highlight whose passage is unchanged since the link was stored, detail ideas left
   out, newest chapter first (so the cut of 40 keeps the chapters being highlighted now), core ideas first within a
   chapter, at most 40. It returns `[]` while the book's questions are off, so a book with the bank off behaves as
-  before. The page asks only while the bank is on, and it follows the spoiler gate: the answer is a cached read like any
-  other (one key, the URL; memory only, gone on sign-out; shown at once and read again on every mount), any write to
-  the reading area (a "Not read yet" hold, a flag) drops it and reads it again, an answer to a read that started before
-  the write is thrown away, and the overview's own numbers moving (the gate, the stage counts) read it again too. A
-  read that fails or answers anything but 200 is no titles (stored as such, so a title that is gone cannot stay on
-  screen). A locked chapter's idea title never leaves the database.
+  before. The picker (`app/reading/ConceptPicker.tsx`) asks only while the bank is on, and it follows the spoiler gate
+  at once: what it shows belongs to one stamp (the URL, the overview's numbers, and how many writes dropped the cache
+  entry). The answer is a cached read like any other (one key, the URL; memory only, gone on sign-out; shown at once and
+  read again on every mount). Any write to the reading area (a "Not read yet" hold, a flag) drops the entry, and the
+  cache listener counts that write the moment it happens: the picker shows no linked titles from the next render on and
+  stays that way until the new answer arrives, however slow it is, and an answer to a read that started before the
+  write is thrown away, even when it comes back before React has rendered again. The overview's own numbers moving (the
+  gate, the stage counts) do the same. A read that fails or answers anything but 200 is no titles (stored as such, so a
+  title that is gone cannot stay on screen). A concept already chosen on the form stays in the select while it is not
+  in the list, so the select keeps showing what is stored. A locked chapter's idea title never leaves the database.
 
 ## Speed and the client cache
 
@@ -678,8 +683,9 @@ UPDATE pds.books SET theme = '{"v": 1, "level_titles": ["Newcomer", "Keeper"], "
 - **Public repo:** prompts are generic, tests use an invented book, and no book, chapter, quote or personal detail goes
   into new code, tests, docs, logs, heartbeats or commit text. A test looks for the words that used to sit in code (as
   hashes) in the reading files. The level titles, concept tags and badge labels of a real book live only on its row.
-  Older mentions of the book in use that sit outside this feature (a search keyword on the navigation, a code comment
-  and an example in the chat's tool text) are being removed file by file as those files are touched.
+  Two older mentions of the book in use sit outside this feature and are removed when their files are next touched: a
+  search keyword in `lib/nav.ts` and a code comment in `api/reading/quiz/route.ts` (the chat's prompt no longer names a
+  book from S6 on).
 
 ## Rollback, measurement, non-goals
 
