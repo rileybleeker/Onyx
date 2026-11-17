@@ -7,6 +7,8 @@ import styles from "./Today.module.css";
 import { ArrowUpRight, BookOpen, CalendarClock, CalendarDays, ClipboardCheck, FlaskConical, ListChecks, Mail, Package, RefreshCw, Wallet, X } from "lucide-react";
 import { agentsApi, clearDeviceNotifications, setBadge, type InboxResponse, type InboxItem } from "@/lib/agents-api";
 import type { ReadingOverview } from "@/lib/reading";
+import { actionHref, actionText, nextAction } from "@/lib/learning-pacing";
+import { useLearningPrefs } from "@/lib/use-learning-prefs";
 import type { UrgentEmailResponse } from "@/lib/urgent-email-query";
 import { ageLabel, isEmailCard, isGmailHref, mergeUrgent } from "@/lib/urgent-email";
 import { dayLabel, isExperimentToday, type ExperimentToday } from "@/lib/experiments";
@@ -200,6 +202,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // Each panel starts from the cached copy when there is one (a revisit is instant), then revalidates.
   const [inbox, setInbox] = useState<Load<InboxResponse>>(() => cachedLoad(CACHE_KEYS.agentsInbox, parseInbox));
   const [reading, setReading] = useState<Load<ReadingOverview | null>>(() => cachedLoad(READING_URL, parseReading));
+  // Voluntary learning pacing (PROD-T06): GET only; one optional suggested action under the reading progress.
+  const learning = useLearningPrefs();
   const [urgent, setUrgent] = useState<Load<UrgentEmailResponse>>(() => cachedLoad(URGENT_URL, parseUrgent));
   // Packages are shown only when something needs attention or arrives today, and a failed check
   // just hides the panel: /orders is where package status lives.
@@ -496,6 +500,12 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // A sync that never ran, or whose heartbeat could not be read (lastSync null), is not a current answer either.
   const syncStale = !!email && syncLateness(lastSync, now.getTime(), LABEL_SYNC_STALE_MS);
   const book = reading.state === "ready" ? reading.value : null;
+  // Only a successful read of both the sessions and the settings produces a suggestion (unknown is never "missed").
+  const learningAction = book && Array.isArray(book.sessions) && Array.isArray(book.dueReviews) && learning.load !== "loading" ? nextAction({
+    prefs: learning.prefs, configured: learning.configured, today: book.today, sessionDates: book.sessions.map((s) => s.session_date),
+    dueReviews: book.dueReviews.length, book: { title: book.book.title, status: book.book.status, chaptersDone: book.chaptersDone, totalChapters: book.totalChapters },
+  }) : null;
+  const learningLine = learningAction ? actionText(learningAction) : "";
   // Chapter questions ready for today's round (READ-QUIZ-01): from the overview's own summary, so no extra request; 0 while the bank is off or an older cached overview has none.
   const practiceCount = practiceReady(book?.practice);
   const packages = orders?.status === "ready" && (orders.attention > 0 || orders.arrivingToday > 0) ? orders : null;
@@ -1031,6 +1041,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
           <p className="mt-1 text-sm text-text-secondary">{Number.isFinite(book.chaptersDone) && Number.isFinite(book.totalChapters) && book.totalChapters > 0 && book.chaptersDone >= 0 && book.chaptersDone <= book.totalChapters ? `${book.chaptersDone} of ${book.totalChapters} chapters recorded.` : "Chapter progress is not available."}</p>
           {practiceCount > 0 && <p className="mt-1 text-sm"><Link href="/reading" className={linkStyle}>Practice · <span className="font-mono">{practiceCount}</span> ready</Link></p>}
           <p className="mt-1 text-xs text-text-secondary">Recorded progress may lag your latest reading.</p>
+          {learningAction && learningLine && <p className="mt-2 text-sm text-text-primary" data-testid="reading-next-action">{learningLine}{(learningAction.kind === "review" || learningAction.kind === "read") && <> <Link href={actionHref(learningAction)} className={linkStyle}>Open</Link></>}</p>}
         </> : <p className="mt-3 text-sm text-text-secondary">No book is currently in progress.</p>)}
         <Link href="/reading" className={`${linkStyle} mt-4 inline-block`}>{book ? "Continue reading" : "Open reading"}</Link>
       </section>

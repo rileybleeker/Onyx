@@ -127,7 +127,8 @@ const DATA: Record<string, () => DataWarmer[]> = {
   // The Want to read list (app/reading/ReadingList.tsx): GET only, same key as the list. The Practice part's two reads
   // (READ-QUIZ-01: today's round and the bank's state, both GET only and side-effect free) for the active book, under
   // the same URLs the part reads (app/reading/PracticePart.tsx); the book comes from the cached /api/reading answer.
-  "/reading": () => [json("/api/reading"), json("/api/reading/list")].concat(readingPracticeWarmers()),
+  // The pacing choices (PROD-T06) are one more GET under the same key the Your pace card reads.
+  "/reading": () => [json("/api/reading"), json("/api/reading/list"), json("/api/ui/preferences?key=reading.pacing")].concat(readingPracticeWarmers()),
   "/status": () => [json("/api/status")],
 };
 
