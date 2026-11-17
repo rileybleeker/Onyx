@@ -56,10 +56,20 @@ const inboxWarmer: DataWarmer = {
   skipOn: (page) => page === "/financials" || page.startsWith("/financials/"),
 };
 
+// The Reading reads the sweep runs from /reading's warmer. /sleep shows none of them, and they compete with its own
+// reads (perf-timing run 44114214710, 2026-11-17: bank 1117 ms and 1137 ms, list 1055 ms and 1160 ms on /sleep), so
+// the sweep leaves them out while /sleep is on screen. Their next run on another page still warms them.
+const skipOnSleep = (page: string) => page === "/sleep" || page.startsWith("/sleep/");
+
 /** /reading's Practice part reads (READ-QUIZ-01) for the active book, once the cached overview names it. */
 function readingPracticeWarmers(): DataWarmer[] {
   const slug = readingSlugOf(clientCache.peek("/api/reading"));
-  return slug ? [json(practiceUrl(slug)), json(bankUrl(slug))] : [];
+  return slug
+    ? [
+        { ...json(practiceUrl(slug)), skipOn: skipOnSleep },
+        { ...json(bankUrl(slug)), skipOn: skipOnSleep },
+      ]
+    : [];
 }
 
 function logUberEatsWarmers(): DataWarmer[] {
@@ -137,7 +147,7 @@ const DATA: Record<string, () => DataWarmer[]> = {
   // (READ-QUIZ-01: today's round and the bank's state, both GET only and side-effect free) for the active book, under
   // the same URLs the part reads (app/reading/PracticePart.tsx); the book comes from the cached /api/reading answer.
   // The pacing choices (PROD-T06) are one more GET under the same key the Your pace card reads.
-  "/reading": () => [json("/api/reading"), json("/api/reading/list"), json("/api/ui/preferences?key=reading.pacing")].concat(readingPracticeWarmers()),
+  "/reading": () => [json("/api/reading"), { ...json("/api/reading/list"), skipOn: skipOnSleep }, json("/api/ui/preferences?key=reading.pacing")].concat(readingPracticeWarmers()),
   "/status": () => [json("/api/status")],
 };
 
