@@ -40,8 +40,10 @@ export async function GET(req: NextRequest) {
       .order("calendar_date", { ascending: false }),
   ]);
 
-  if (eventsRes.error) return NextResponse.json({ error: eventsRes.error.message }, { status: 500 });
-  if (timingRes.error) return NextResponse.json({ error: timingRes.error.message }, { status: 500 });
+  if (eventsRes.error || timingRes.error) {
+    console.error("api/meals GET", eventsRes.error?.message ?? timingRes.error?.message);
+    return NextResponse.json({ error: "Couldn't load your meals. Try again." }, { status: 500 });
+  }
 
   return NextResponse.json({
     days,
@@ -109,7 +111,10 @@ export async function POST(req: NextRequest) {
     .select("event_id,event_date,event_time,kind,notes")
     .single();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("api/meals POST", error.message);
+    return NextResponse.json({ error: "Couldn't save that meal. Try again." }, { status: 500 });
+  }
   return NextResponse.json(data);
 }
 
@@ -162,7 +167,10 @@ export async function PATCH(req: NextRequest) {
     .select("event_id,event_date,event_time,kind,notes")
     .single();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("api/meals PATCH", error.message);
+    return NextResponse.json({ error: "Couldn't save that meal. Try again." }, { status: 500 });
+  }
   return NextResponse.json(data);
 }
 
@@ -178,6 +186,9 @@ export async function DELETE(req: NextRequest) {
     .from("meal_events")
     .delete()
     .eq("event_id", event_id);
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("api/meals DELETE", error.message);
+    return NextResponse.json({ error: "Couldn't save that meal. Try again." }, { status: 500 });
+  }
   return NextResponse.json({ ok: true });
 }
