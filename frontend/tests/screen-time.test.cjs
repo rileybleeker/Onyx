@@ -285,6 +285,8 @@ async function renderPage(load, search = {}) {
     },
     "next/link": { __esModule: true, default: ({ href, children, ...rest }) => React.createElement("a", { href, ...rest }, children) },
     "next/headers": { cookies: async () => ({ get: () => undefined }) },
+    // The error alert's RetryButton calls useRouter(); outside the app router the real one throws.
+    "next/navigation": { useRouter: () => ({ refresh: () => {} }) },
     "./ScreenTimeCharts": CHARTS_STUB,
   });
   const html = renderToStaticMarkup(await page.default({ searchParams: Promise.resolve(search) }));
@@ -300,8 +302,11 @@ test("failed query, empty window and data are three different screens", async ()
   assert.ok(failed.html.includes('role="alert"'));
   assert.ok(!failed.html.includes(EMPTY));
   assert.ok(!failed.html.includes("data-charts"));
+  const alertStart = failed.html.indexOf('role="alert"');
+  const alertHtml = failed.html.slice(alertStart, failed.html.indexOf("</section>", alertStart));
+  assert.ok(alertHtml.includes(">Try again</button>")); // the retry button sits inside the alert region
 
-  const empty = await renderPage({ kind: "empty", windowDays: 30, sync: null });
+  const empty =await renderPage({ kind: "empty", windowDays: 30, sync: null });
   assert.ok(empty.html.includes(`>${EMPTY}<`)); // exact text of one element: the smoke test's legitimateEmpty
   assert.ok(empty.html.includes("has not reported a sync yet"));
   assert.ok(!empty.html.includes(FAILED));
