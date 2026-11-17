@@ -1,4 +1,4 @@
-// Onyx Uber Eats item harvester — runs on Riley's PC (Task Scheduler), headless.
+// Onyx Uber Eats item harvester — runs on the collector PC (Task Scheduler), headless.
 //
 // Receipt emails carry no line items, and Uber has no order-history API for customers.
 // The signed-in web app does: POST https://www.ubereats.com/_p/api/getPastOrdersV1

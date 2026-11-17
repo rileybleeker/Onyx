@@ -19,7 +19,7 @@ chapter, a highlight inside chapter N proves N-1, the reading position does the 
 with a new highlight or note gets a `source='kindle'` session whose recall is the notes verbatim.
 New highlights and sessions mirror to the book's Notion reading-log page.
 
-Runs on Riley's PC (Task Scheduler, every 3 hours while logged on), like the StreetEasy
+Runs on the collector PC (Task Scheduler, every 3 hours while logged on), like the StreetEasy
 harvester in `browse-proxy/local/`. It needs a real Chrome with a signed-in Amazon session,
 which is why it does not run in GitHub Actions.
 

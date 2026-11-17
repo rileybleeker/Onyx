@@ -1,4 +1,4 @@
-"""Onyx PC activity logger: coarse active / idle time per hour and minutes per program, from Riley's PC.
+"""Onyx PC activity logger: coarse active / idle time per hour and minutes per program, from the collector PC.
 
 What it records, every 30 seconds, and nothing else:
   - how many seconds since the last keyboard or mouse input (GetLastInputInfo returns a timestamp

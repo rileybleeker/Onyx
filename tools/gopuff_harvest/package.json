@@ -2,7 +2,7 @@
   "name": "onyx-gopuff-harvester",
   "private": true,
   "type": "module",
-  "description": "Runs on Riley's PC on a schedule: reads goPuff order history (items, delivery time) from a signed-in Chrome profile and posts it to Onyx /api/delivery/items/import with provider gopuff.",
+  "description": "Runs on the collector PC on a schedule: reads goPuff order history (items, delivery time) from a signed-in Chrome profile and posts it to Onyx /api/delivery/items/import with provider gopuff.",
   "scripts": {
     "harvest": "node harvest.mjs",
     "dry-run": "node harvest.mjs --dry-run",
