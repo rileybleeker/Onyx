@@ -15,6 +15,10 @@ const { loadTs } = require("./helpers/load-ts.cjs");
 const { mountClient, response, deferred, withGlobals } = require("./helpers/hook-harness.cjs");
 
 const O = loadTs("lib/log-supplement-options.ts");
+const intake = loadTs("lib/supplement-intake.ts");
+const { createFakePostgrest } = require("./helpers/fake-postgrest.cjs");
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const withoutKey = ({ event_key: _key, ...rest }) => rest;
 const TODAY = loadTs("lib/checkin.ts").fallbackBehavioralToday(new Date());
 
 const prod = (id, full_name, brand_name = "Synthetic Labs") => ({ product_id: id, brand_name, full_name, serving_size: 1, serving_unit: "capsule" });
@@ -259,7 +263,8 @@ test("section: tapping an option fills the form like a search result and writes 
   await h.flush();
   assert.equal(h.calls.writes.length, 1);
   assert.equal(h.calls.writes[0].url, "/api/supplements/log-product");
-  assert.deepEqual(h.calls.writes[0].body, { product_id: "p-beta", product: "Synthetic Beta", amount: null, unit: null, times: [], date: null });
+  assert.match(h.calls.writes[0].body.event_key, UUID, "each attempt carries its own event key");
+  assert.deepEqual(withoutKey(h.calls.writes[0].body), { product_id: "p-beta", product: "Synthetic Beta", amount: null, unit: null, times: [], date: null });
   assert.equal(h.field("Amount"), undefined, "the form resets after the log");
 });
 
@@ -462,9 +467,55 @@ test("section: a Log answering after Riley picked another product keeps the new 
   second.resolve(response({ ok: false, error: "Synthetic refusal" }, 422));
   await h.flush();
   assert.equal(h.calls.writes.length, 2);
-  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
+  assert.deepEqual(withoutKey(h.calls.writes[1].body), { product_id: "p-beta", product: "Synthetic Beta", amount: 3, unit: "serving", times: [], date: null });
   assert.equal(h.option("Synthetic Gamma").props["aria-checked"], true);
   assert.match(h.text(), /Synthetic Beta not saved: Synthetic refusal/);
+});
+
+test("section: a lost answer for an untimed earlier-day dose, then a retry, writes one intake (same event key, replayed by the server)", async (t) => {
+  // The server side is the real lib/supplement-intake.ts against a fake database. The first answer is lost after the
+  // insert has committed (the failure a retry must survive); the retry carries the same key and reads the rows back.
+  const d = createFakePostgrest({
+    unique: { supplement_intake: [["client_event_key", "client_event_line"]] },
+    defaults: { supplement_intake: (_now, seq) => ({ intake_id: seq, client_event_key: null, client_event_line: null }) },
+    tables: {
+      supplement_products: [{ product_id: "p-alpha", brand_name: "Synthetic Labs", full_name: "Synthetic Alpha", serving_size: 1, serving_unit: "capsule", ingredients: [], is_active: true }],
+    },
+    rpc: { behavioral_today_now: TODAY, tz_for_instant: "America/New_York" },
+  });
+  let lost = false;
+  const h = mountSection(t, {
+    post: async () => {
+      const body = h.calls.writes.at(-1).body;
+      const out = await intake.logSupplementIntake(d, {
+        product: body.product, product_id: body.product_id, amount: body.amount, unit: body.unit,
+        times: body.times, date: body.date, notes: "Logged from /log", event_key: body.event_key,
+      });
+      if (!lost) {
+        lost = true;
+        throw new TypeError("fetch failed (synthetic: the answer was lost after the commit)");
+      }
+      return response(out, out.ok ? 200 : 400);
+    },
+  });
+  await h.flush();
+  h.field("Day").props.onChange({ target: { value: "yesterday" } });
+  await h.flush();
+  h.option("Synthetic Alpha").props.onClick();
+  await h.flush();
+  await h.click("Log");
+  await h.flush();
+  assert.equal(h.calls.writes.length, 1);
+  assert.equal(d.rows("supplement_intake").length, 1, "the first answer was lost, but the row is in");
+  assert.equal(h.option("Synthetic Alpha").props["aria-checked"], true, "unconfirmed: still checked, to retry");
+
+  await h.click("Log");
+  await h.flush();
+  assert.equal(h.calls.writes.length, 2);
+  assert.equal(h.calls.writes[1].body.event_key, h.calls.writes[0].body.event_key, "the retry reuses the attempt's key");
+  assert.equal(d.rows("supplement_intake").length, 1, "one intake, not two");
+  assert.equal(d.rows("supplement_intake")[0].intake_time, null, "an earlier-day dose with no time stays untimed");
+  assert.equal(h.option("Synthetic Alpha").props["aria-checked"], false, "confirmed: unchecked, not sent again");
 });
 
 test("section: a Say it product moved into the form with Edit keeps its amount, unit and time when another option is tapped", async (t) => {
@@ -495,7 +546,7 @@ test("section: a Say it product moved into the form with Edit keeps its amount, 
   await h.click("Log");
   await h.flush();
   assert.equal(h.calls.writes.length, 2);
-  assert.deepEqual(h.calls.writes[1].body, { product_id: "p-gamma", product: "Synthetic Gamma", amount: 15, unit: "mg", times: ["08:30"], date: null });
+  assert.deepEqual(withoutKey(h.calls.writes[1].body), { product_id: "p-gamma", product: "Synthetic Gamma", amount: 15, unit: "mg", times: ["08:30"], date: null });
 });
 
 test("source: the options are radio buttons with 44 px targets, accent when selected, visible focus; a tap only sets state", () => {

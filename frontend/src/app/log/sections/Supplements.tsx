@@ -166,6 +166,16 @@ function instantOn(day: string, hhmm: string): string {
   const [y, mo, d] = day.split("-").map(Number);
   return new Date(y, mo - 1, d + (h < 6 ? 1 : 0), h, m).toISOString();
 }
+/** One random id per attempt (the server's event key): a retry with it returns the stored rows, never a second write. */
+function newClientKey(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = Array.from(b, (n) => n.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function nowHHMM(): string {
   const d = new Date();
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -225,6 +235,8 @@ interface Suggestion {
   item: SupplementLogDraft;
   state: SuggestionState;
   error: string | null;
+  /** The server event key of this suggestion's product write, reused by its retries. */
+  eventKey?: string;
 }
 
 const btn =
@@ -525,7 +537,9 @@ export default function SupplementsSection() {
   // The checked products, in the order they were checked: each with its own amount and unit ("" = one serving, the
   // placeholder). `sentTimes` is set on the first send and reused by every retry, so a retry of a dose that did land
   // before its answer was lost is recognised by the server as already logged (the same time, not a new "now").
-  interface Pick { amount: string; unit: string; sentTimes?: string[] }
+  // `eventKey` is the same idea for the server's event key: one UUID per attempt, sent with every retry, so a lost
+  // answer for an untimed earlier-day dose (which the duplicate check cannot recognise) is replayed, not written twice.
+  interface Pick { amount: string; unit: string; sentTimes?: string[]; eventKey?: string }
   const [checked, setChecked] = useState<Map<string, Pick>>(() => new Map());
   const [results, setResults] = useState<Map<string, ItemResult>>(() => new Map());
   const [saving, setSaving] = useState<Set<string>>(() => new Set());
@@ -621,6 +635,7 @@ export default function SupplementsSection() {
   /** One product write through the chat tool's rules. Returns an error message, or null when saved. `quiet`: no receipt. */
   async function logProduct(args: {
     product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
+    event_key: string;
   }, quiet = false): Promise<string | null> {
     if (args.date && day && args.date > day) return "That day has not started yet";
     writeSeq.current += 1;
@@ -632,6 +647,7 @@ export default function SupplementsSection() {
         unit: args.amount == null ? null : args.unit,
         times: args.times,
         date: args.date,
+        event_key: args.event_key,
       });
       if (!r.ok || r.json.ok !== true) {
         const msg = typeof r.json.error === "string" ? screenError(r.json.error) : `Not saved (${r.status})`;
@@ -677,7 +693,7 @@ export default function SupplementsSection() {
       setFormError("Fill in or remove the empty time");
       return;
     }
-    const items: { key: string; name: string; amount: number | null; unit: string; times: string[] }[] = [];
+    const items: { key: string; name: string; amount: number | null; unit: string; times: string[]; eventKey: string }[] = [];
     for (const id of todo) {
       const pk = checked.get(id)!;
       const p = products?.find((x) => x.product_id === id);
@@ -689,26 +705,26 @@ export default function SupplementsSection() {
       }
       const todayDose = formDate == null || formDate === day;
       const sent = pk.sentTimes ?? (clean.length ? clean : todayDose ? [nowHHMM()] : []);
-      items.push({ key: id, name, amount: amt, unit: pk.unit, times: sent });
+      items.push({ key: id, name, amount: amt, unit: pk.unit, times: sent, eventKey: pk.eventKey ?? newClientKey() });
     }
 
     batchRef.current = true;
     setBatchBusy(true);
     setFormError(null);
     setSaving(new Set(todo));
-    // Remember the times this attempt sends, so a retry sends the same ones.
+    // Remember the times and the event key this attempt sends, so a retry sends the same ones.
     setChecked((m) => {
       const n = new Map(m);
       for (const it of items) {
         const cur = n.get(it.key);
-        if (cur && !cur.sentTimes) n.set(it.key, { ...cur, sentTimes: it.times });
+        if (cur && (!cur.sentTimes || !cur.eventKey)) n.set(it.key, { ...cur, sentTimes: cur.sentTimes ?? it.times, eventKey: cur.eventKey ?? it.eventKey });
       }
       return n;
     });
     try {
       const done = await logEach(
         items,
-        (it) => logProduct({ product_id: it.key, name: it.name, amount: it.amount, unit: it.amount == null ? null : it.unit, times: it.times, date: formDate }, true),
+        (it) => logProduct({ product_id: it.key, name: it.name, amount: it.amount, unit: it.amount == null ? null : it.unit, times: it.times, date: formDate, event_key: it.eventKey }, true),
         results,
         (key, r) => setResults((prev) => new Map(prev).set(key, r)),
       );
@@ -798,7 +814,10 @@ export default function SupplementsSection() {
       let err: string | null = null;
       if (s.item.kind === "product") {
         const d = s.item;
-        err = await logProduct({ product_id: d.product_id, name: d.name, amount: d.amount, unit: d.unit, times: d.times, date: d.date });
+        // One event key per suggestion, kept across its retries (a lost answer is replayed, not written twice).
+        const eventKey = s.eventKey ?? newClientKey();
+        if (!s.eventKey) items = items.map((x) => (x.key === s.key ? { ...x, eventKey } : x));
+        err = await logProduct({ product_id: d.product_id, name: d.name, amount: d.amount, unit: d.unit, times: d.times, date: d.date, event_key: eventKey });
       } else {
         const d = s.item;
         const stack = findStack(stacks ?? [], d);
