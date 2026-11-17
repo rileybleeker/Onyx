@@ -335,7 +335,7 @@ function LabEntryForm({ today, docs, series, onSaved }: { today: string; docs: M
     const a = await call('POST', '/api/medical/labs', { results: out });
     setSaving(false);
     const saved = a.ok && Array.isArray(a.data.results) ? a.data.results.map(rowFromApiLab).filter((r): r is LabResult => r !== null) : null;
-    if (!a.ok || !saved) { setError(`Not saved: ${a.ok ? 'unexpected answer' : a.error}`); return; }
+    if (!a.ok || !saved) { setError('The lab results were not saved. Check the values and try again.'); return; }
     onSaved(saved);
     setRows([blankRow(), blankRow(), blankRow()]);
   }
@@ -541,7 +541,7 @@ function DocumentUpload({ today, onUploaded }: { today: string; onUploaded: (d: 
     });
     const ticket = start.ok ? (start.data.upload as { path?: unknown; token?: unknown } | undefined) : undefined;
     if (!start.ok || typeof ticket?.path !== 'string' || typeof ticket?.token !== 'string') {
-      setPhase('idle'); setError(`Not uploaded: ${start.ok ? 'unexpected answer' : start.error}`); return;
+      setPhase('idle'); setError('The file was not uploaded. Try again.'); return;
     }
     setPhase('uploading');
     // Straight to the private bucket with the one-time token (Vercel would cap a file sent
@@ -560,7 +560,7 @@ function DocumentUpload({ today, onUploaded }: { today: string; onUploaded: (d: 
     const done = await call('POST', `/api/medical/documents/${id}/complete`);
     setPhase('idle');
     const doc = done.ok ? rowFromApiDoc(done.data.document) : null;
-    if (!doc) { setError(uploadFailed ? 'The file did not upload. Check the connection and try again.' : `Not finished: ${done.ok ? 'unexpected answer' : done.error}`); return; }
+    if (!doc) { setError(uploadFailed ? 'The file did not upload. Check the connection and try again.' : 'The upload did not finish. Try again.'); return; }
     onUploaded(doc);
     setFile(null); setTitle(''); setProvider(''); setNotes('');
     if (input.current) input.current.value = '';
