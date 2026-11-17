@@ -16,8 +16,8 @@ const card = (entry) => S.medicalBackupCard({ entry, nowMs: NOW });
 test("no heartbeat yet reads unknown with the setup steps", () => {
   const c = card(null);
   assert.equal(c.status, "unknown");
-  assert.match(c.errorMessage, /keygen/);
-  assert.match(c.errorMessage, /register-task\.ps1/);
+  assert.match(c.errorMessage, /^No backup yet\. Finish the backup setup on the PC/);
+  assert.doesNotMatch(c.errorMessage, /python|keygen|register-task|\.ps1/);
   assert.equal(c.recordsSynced, 0);
 });
 
@@ -36,7 +36,7 @@ test("a failed run is red at once and names what to do", () => {
   const c = card({ status: "failed", sync_start: daysAgo(0.1), error_message: "age_missing" });
   assert.equal(c.status, "failed");
   assert.match(c.errorMessage, /winget install FiloSottile\.age/);
-  assert.match(card({ status: "failed", sync_start: daysAgo(0), error_message: "recipient_missing" }).errorMessage, /keygen/);
+  assert.match(card({ status: "failed", sync_start: daysAgo(0), error_message: "recipient_missing" }).errorMessage, /No usable backup key is set up on the PC \(recipient_missing\)/);
   assert.match(card({ status: "failed", sync_start: daysAgo(0), error_message: "crash_OSError" }).errorMessage, /backup\.log/);
 });
 
