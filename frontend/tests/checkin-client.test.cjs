@@ -633,6 +633,18 @@ test("client: a transient failed day switch keeps the old date explicit and cann
   assert.equal(h.storage.values.has(dayKey("2031-03-04")), false);
 });
 
+test("client: a day switch whose pending save is refused stays on the day, keeps the draft and shows the reason", async (t) => {
+  const h = await mount(t, { onPost: async () => response({ error: "Synthetic refusal" }, 400) });
+  h.click(`${DAY}: yes`); await h.flush();
+  h.navigate("2031-03-04"); await h.flush(); // the waiting tap is saved first; the refusal stops the switch
+  assert.equal(h.gets.includes("2031-03-04"), false, "the other day is never fetched, so it never replaces the screen");
+  assert.match(h.text(), /2031-03-05/);
+  assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "the unsaved answer is still on screen");
+  assert.match(h.text(), /Not saved: Save failed \(400\)\. Your answers are still here\./);
+  assert.equal(h.posts.length, 1, "a refusal is not retried by the switch");
+  assert.ok(h.button("Retry"), "Retry is offered");
+});
+
 test("client: a voice fill that answers late keeps the taps and clears made while it was read", async (t) => {
   const OTHER = "Synthetic second daytime question?";
   const THIRD = "Synthetic third daytime question?";

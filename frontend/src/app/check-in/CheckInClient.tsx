@@ -149,8 +149,11 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const params = useSearchParams();
   const [feedDate, setFeedDate] = useState<string | null>(null);
   const requested = feed ? feedDate : params.get("date");
+  // The day the screen shows (kept by showDate): a day switch whose save failed puts the URL back on it.
+  const shownDate = useRef<string | null>(requested);
   // Switch the day being checked in (null = the server's today).
   const showDate = useCallback((date: string | null) => {
+    shownDate.current = date;
     if (feed) setFeedDate(date);
     else router.replace(date ? `/check-in?date=${date}` : "/check-in", { scroll: false });
   }, [feed, router]);
@@ -247,7 +250,13 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
 
   const load = useCallback(async (date: string | null, afterSave = false) => {
     // A tap still waiting to be saved goes first, under the day it was made on: the GET below replaces the screen.
-    if (!afterSave) await autosaveRef.current.flush().catch(() => {});
+    // If that save failed (or was refused), the screen stays on its day with the draft and the save-failed line
+    // (Retry) shown; nothing is replaced.
+    if (!afterSave && !(await autosaveRef.current.flush().catch(() => false))) {
+      // Back/forward may already have moved the URL to the other day: put it back on the day still on screen.
+      if (date !== shownDate.current) showDate(shownDate.current);
+      return;
+    }
     // Back/forward can change the URL while a save runs. Finish the dated save first.
     if (savingRef.current && !afterSave) {
       deferredLoad.current = { date };
@@ -693,9 +702,10 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   };
 
   // A tap still waiting is saved under its own day before the tab changes (the cached copy of the next day must
-  // not be drawn under it).
+  // not be drawn under it). If that save fails, the tab does not change: the draft stays with its day and the
+  // save-failed line (Retry) shows.
   const goTo = (date: string) => {
-    void autosaveRef.current.flush().catch(() => {}).then(() => showDate(date));
+    void autosaveRef.current.flush().catch(() => false).then((saved) => { if (saved) showDate(date); });
   };
 
   const reviewDraft = (entry: DatedDraft) => {
