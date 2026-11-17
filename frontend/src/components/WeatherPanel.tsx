@@ -77,7 +77,7 @@ export default function WeatherPanel() {
   if (load.s === "loading") {
     body = <div className="animate-pulse rounded bg-surface-hover/40" style={{ minHeight: MIN_HEIGHT }} aria-label="Loading weather" />;
   } else if (load.s === "not_connected") {
-    body = <Note>Weather table not set up yet</Note>;
+    body = <Note>Weather data is not set up yet.</Note>;
   } else if (load.s === "error") {
     body = <Note>Couldn&apos;t load weather</Note>;
   } else if (load.days.length === 0) {
