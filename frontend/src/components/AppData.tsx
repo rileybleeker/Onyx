@@ -47,7 +47,14 @@ function localDay(d: Date): string {
 // response must never replace a confirmed answer).
 const windDownWarmer = (): DataWarmer => ({ key: "/api/sleep/winddown", fetch: () => import("@/lib/use-winddown").then((m) => m.warmWindDownRead()) });
 
-const inboxWarmer: DataWarmer = { key: CACHE_KEYS.agentsInbox, fetch: () => agentsApi.inbox() };
+// The inbox feeds Today's cards, the Agents screen and the nav badge (which also keeps its last count on the device).
+// No Financials page uses it, and its request is slow on some runs (perf-timing 2026-11-17: 1082 ms in the forecast
+// view), so the sweep leaves it to the other pages and to its next run.
+const inboxWarmer: DataWarmer = {
+  key: CACHE_KEYS.agentsInbox,
+  fetch: () => agentsApi.inbox(),
+  skipOn: (page) => page === "/financials" || page.startsWith("/financials/"),
+};
 
 /** /reading's Practice part reads (READ-QUIZ-01) for the active book, once the cached overview names it. */
 function readingPracticeWarmers(): DataWarmer[] {

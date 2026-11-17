@@ -99,6 +99,20 @@ test('a failing fetch or prefetch does not stop the warm-up', async () => {
   assert.deepEqual(log, ['register k:a', 'fetch k:a', 'route /b']);
 });
 
+test('a read skipOn a page is left out of the sweep there, and still warmed on other pages and on intent', async () => {
+  const warmers = () => [
+    { key: 'k:shared', fetch: async () => 1 },
+    { key: 'k:skip', fetch: async () => 2, skipOn: (page) => page.startsWith('/financials') },
+  ];
+  const targets = [{ href: '/today', prefetch: 'full', data: warmers }];
+  const onFinance = harness();
+  await runWarmup(targets, onFinance.deps, '/financials/forecast?x=1').done;
+  assert.deepEqual(onFinance.log, ['route /today full', 'register k:shared', 'fetch k:shared'], 'skipOn leaves the read out on a finance page');
+  const onOther = harness();
+  await runWarmup(targets, onOther.deps, '/log').done;
+  assert.ok(onOther.log.includes('fetch k:skip'), 'the read is warmed on a page that does not skip it');
+});
+
 test('intent (hover, focus, pointer-down) warms that page at once; nav links switch off viewport prefetch', async () => {
   const { deps, log } = harness();
   configureWarmup(deps, [{ href: '/check-in', prefetch: 'full', data: () => [{ key: '/api/habits/checkin', fetch: async () => ({}) }] }, { href: '/orders', prefetch: 'auto' }]);
