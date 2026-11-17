@@ -30,6 +30,23 @@ function createCalls(src) {
   return calls;
 }
 
+// The top-level statements of the finally block in the playlist route that handles a pending
+// creation (parsed with the TypeScript compiler, so comments and edits elsewhere do not matter).
+function playlistFinallyStatements(src) {
+  const ts = require("typescript");
+  const sf = ts.createSourceFile("route.ts", src, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+  const found = [];
+  const visit = (node) => {
+    if (ts.isTryStatement(node) && node.finallyBlock && /\bcreationPending\b/.test(node.finallyBlock.getText())) {
+      found.push(node.finallyBlock);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  assert.equal(found.length, 1, "exactly one finally block handles a pending creation");
+  return [...found[0].statements];
+}
+
 const DAY = 86_400_000;
 const NOW = Date.parse("2026-11-16T12:00:00Z");
 const on = (extra = {}) =>
@@ -316,8 +333,16 @@ test("route deadlines count from the handler's entry and end the model call befo
   assert.match(pl, /timeout: attemptMs,\s*maxRetries: 0,\s*signal: AbortSignal\.any\(\[stop\.signal, attempt\]\)/);
   assert.match(pl, /if \(attempt\.aborted && !stop\.signal\.aborted\) throw new AttemptTimeoutError\(\);/);
   assert.match(pl, /e instanceof AttemptTimeoutError \|\|/);
-  // Every request is observed, also one whose client disconnected mid-loop.
-  assert.match(pl, /\} finally \{[\s\S]{0,700}?observe\(\);/);
+  // Every request is observed, also one whose client disconnected mid-loop: the stream's finally
+  // block (the one that waits for a pending creation) calls observe() at its own top level, after
+  // that wait and outside any branch, then marks the request done.
+  const fin = playlistFinallyStatements(pl);
+  const top = fin.map((st) => st.getText());
+  const waitAt = top.findIndex((t) => /^if \(creationPending\)/.test(t));
+  const observeAt = top.indexOf("observe();");
+  assert.ok(waitAt !== -1, "the finally block waits for a pending creation");
+  assert.ok(observeAt > waitAt, "observe() runs on every path, after the creation wait");
+  assert.ok(top.indexOf("finished();") > observeAt, "the request is marked done after it is observed");
 });
 
 test("a failed estimate batch answers with its arm first, so the harvester can read it", () => {
@@ -555,8 +580,30 @@ async function runPlaylistCase(attempts, opts = {}) {
   const origInfo = console.info;
   const origSetTimeout = global.setTimeout;
   console.info = (msg) => lines.push(JSON.parse(msg));
-  // The route's retry wait goes through setTimeout; run it at once so the test does not sleep.
-  global.setTimeout = (fn) => origSetTimeout(fn, 0);
+  // The route's timers go through setTimeout. Each is recognised by when it would fire relative to
+  // the request start (the route reads Date.now() just after `t0`) and given a real, short delay:
+  // retry waits run at once, the creation grace and the hard end get `opts.graceMs` / `opts.hardMs`
+  // (defaults 0 and 2000 ms), so grace, hard end and a test's own creation timing stay distinct.
+  const timers = { short: 0, grace: 0, hard: 0, unknown: [] };
+  const graceOffset = R.PLAYLIST_REQUEST_BUDGET_MS + R.PLAYLIST_CREATE_GRACE_MS;
+  const SLACK_MS = 2000;
+  let t0 = Date.now();
+  global.setTimeout = (fn, ms = 0) => {
+    const offset = Date.now() + ms - t0;
+    let delay = 0;
+    if (offset >= R.PLAYLIST_CREATE_HARD_MS - 1 && offset <= R.PLAYLIST_CREATE_HARD_MS + SLACK_MS) {
+      timers.hard++;
+      delay = opts.hardMs ?? 2000;
+    } else if (offset >= graceOffset - 1 && offset <= graceOffset + SLACK_MS) {
+      timers.grace++;
+      delay = opts.graceMs ?? 0;
+    } else if (ms < 60_000) {
+      timers.short++;
+    } else {
+      timers.unknown.push(ms);
+    }
+    return origSetTimeout(fn, delay);
+  };
   // Optionally shorten the per-attempt deadline (a real AbortSignal.timeout, not setTimeout).
   const origAbortTimeout = AbortSignal.timeout;
   if (opts.attemptMs) {
@@ -576,6 +623,7 @@ async function runPlaylistCase(attempts, opts = {}) {
           (async ({ name, trackIds }) => ({ playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length })),
       },
     });
+    t0 = Date.now();
     const res = await route.POST({ json: async () => ({ prompt: "Upbeat songs for a morning run", source_pool: "discovery" }) });
     text = await res.text();
     // What `after` keeps alive (a creation still running when the response closed).
@@ -589,7 +637,7 @@ async function runPlaylistCase(attempts, opts = {}) {
       else process.env[k] = v;
     }
   }
-  return { lines, seenOptions, text };
+  return { lines, seenOptions, text, timers };
 }
 
 test("a playlist attempt whose body stalls ends at its own deadline and is retried", async () => {
@@ -615,18 +663,38 @@ test("a second create in one playlist request reuses the first creation", async 
   assert.match(text, /"type":"done"/);
 });
 
-test("a creation still running when the request gives up is observed with its real outcome", async () => {
-  // The grace timer runs at once in this test (setTimeout is shortened), so the route gives up on
-  // the creation while it is still running; it lands 30 ms later.
+test("a creation that settles after the grace but before the hard end is observed with its real outcome", async () => {
+  // Grace 5 ms, creation lands at 30 ms, hard end 500 ms: the route gives up on the creation while it
+  // is still running, then waits for it and observes the playlist that landed.
   const realSetTimeout = setTimeout;
   const createPlaylist = ({ name, trackIds }) =>
     new Promise((resolve) => realSetTimeout(() => resolve({ playlist_id: "pl1", spotify_url: "", name, track_count: trackIds.length }), 30));
-  const { lines, text } = await runPlaylistCase(["answer_tool", "answer_end"], { createPlaylist });
+  const { lines, text, timers } = await runPlaylistCase(["answer_tool", "answer_end"], { createPlaylist, graceMs: 5, hardMs: 500 });
+  assert.equal(timers.grace, 1, "the creation grace timer ran");
+  assert.equal(timers.hard, 1, "the creation was still pending when the request ended");
+  assert.deepEqual(timers.unknown, []);
   assert.match(text, /may still appear in Spotify/);
   assert.doesNotMatch(text, /"type":"done"/);
   assert.equal(lines.length, 1, "observed once, after the creation settled");
   assert.equal(lines[0].ok, true, "a playlist that landed late counts as accepted");
   assert.equal(lines[0].accepted, 1);
+  assert.equal(lines[0].unresolved, false);
+  assert.equal(R.pilotCostEvidence(lines).complete, true);
+});
+
+test("a creation that never settles is observed as unresolved at the hard end", async () => {
+  // Grace 5 ms, hard end 40 ms, the creation never settles: the request is still observed once,
+  // as unresolved, and that line blocks cost promotion.
+  const createPlaylist = () => new Promise(() => undefined);
+  const { lines, text, timers } = await runPlaylistCase(["answer_tool", "answer_end"], { createPlaylist, graceMs: 5, hardMs: 40 });
+  assert.equal(timers.grace, 1);
+  assert.equal(timers.hard, 1);
+  assert.deepEqual(timers.unknown, []);
+  assert.match(text, /may still appear in Spotify/);
+  assert.equal(lines.length, 1, "observed once, at the hard end");
+  assert.equal(lines[0].ok, false);
+  assert.equal(lines[0].unresolved, true);
+  assert.equal(R.pilotCostEvidence(lines).complete, false, "an unresolved request blocks cost promotion");
 });
 
 for (const c of FX.playlist_measurement.cases) {
