@@ -69,18 +69,18 @@ const MATRIX = [
   ["yes to the offer just made", [user("What could help me sleep?"), assistant("It may help. Want me to log Synthetic Calm at 10pm?"), user("Yes please")],
     "log_supplement_intake", { product: "Synthetic Calm", times: ["22:00"] }, ALLOWED],
   ["quiz the user asked for", [user("Quiz me on the synthetic book"), assistant("Question 1: what limits output?"), user("The bottleneck"),
-    assistant("Correct. Question 2: what sets the pace?"), user("The drum")],
+    assistant("Correct. Question 2: what sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
   ["a quiz result the user states", [user("Record my synthetic quiz: 4 out of 5")], "record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 }, ALLOWED],
   ["a complete quiz with unnumbered questions", [user("Quiz me on the synthetic book"), assistant("What limits output?"), user("The bottleneck"),
-    assistant("Correct. What sets the pace?"), user("The drum")],
+    assistant("Correct. What sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 2, total: 2 }, ALLOWED],
   ["the checkpoint the quiz request named", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
     "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, ALLOWED],
   ["a review quiz", [user("Give me a review quiz"), assistant("Question 1: what limits output?"), user("The bottleneck")],
     "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, ALLOWED],
   ["a new quiz after a cancelled one", [user("Quiz me"), assistant("Question 1: what limits output?"), user("Stop the quiz"),
-    user("Quiz me again"), assistant("Question 1: what sets the pace?"), user("The drum")],
+    user("Quiz me again"), assistant("Question 1: what sets the pace?"), user("The drum, chapter 1")],
     "record_reading_quiz", { checkpoint: "ch1", score: 1, total: 1 }, ALLOWED],
   ["a report with a plan after it", [user("I took 15 mg of Synthetic Focus at 8:30, will take the rest later")],
     "log_supplement_intake", { product: "Synthetic Focus", amount: 15, unit: "mg", times: ["08:30"] }, ALLOWED],
@@ -368,6 +368,15 @@ const MATRIX = [
     "record_reading_quiz", { checkpoint: "review", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
   ["a checkpoint sent as a number", [user("Quiz me on chapter 4"), assistant("Question 1: what limits output?"), user("The bottleneck")],
     "record_reading_quiz", { checkpoint: 4, score: 1, total: 1 }, refused("invalid_value")],
+  // Quiz result identity (unbound quiz: the request named no checkpoint): the latest message must name the checkpoint.
+  ["a quiz result bound by the latest message", [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck, chapter 4")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, ALLOWED],
+  ["a quiz result bound only by an earlier mention", [user("Chapter 4 was synthetic"), assistant("Noted."), user("Quiz me"),
+    assistant("Question 1: what limits output?"), user("The bottleneck")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, refused("not_named")],
+  ["a quiz result for a different quiz named in the latest message", [user("Quiz me"), assistant("Question 1: what limits output?"),
+    user("The bottleneck, chapter 5")],
+    "record_reading_quiz", { checkpoint: "ch4", score: 1, total: 1 }, refused("quiz_checkpoint_mismatch")],
 
   // Round 4 (action-bound record kind): the clause that carries the verb decides what is written. A record-shaped
   // name inside another write (a playlist's name, a shopping-list item, a note's topic) authorizes nothing else.
@@ -471,7 +480,7 @@ test("a playlist or a quiz result is granted once per message", () => {
 });
 
 test("a complete quiz with one finalization authorizes exactly one score", () => {
-  const messages = [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck")];
+  const messages = [user("Quiz me"), assistant("Question 1: what limits output?"), user("The bottleneck, chapter 1")];
   assert.deepEqual(sequence(messages, "record_reading_quiz",
     [{ checkpoint: "ch1", score: 1, total: 1 }, { checkpoint: "ch1", score: 1, total: 1 }]), ["allowed", "once_per_request"]);
 });

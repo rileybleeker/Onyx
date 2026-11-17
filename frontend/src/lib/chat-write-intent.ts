@@ -1411,6 +1411,13 @@ export function authorizeWrite(
       // Only the complete active quiz: recognized quiz questions exist, every one has an answer, and the score is
       // out of exactly those questions.
       if (q.asked < 1 || !q.answeredAll || total !== q.asked) return deny("quiz_score_invalid");
+      // A quiz whose request named no checkpoint is bound only by the checkpoint the latest message names itself. An
+      // earlier mention never binds it, and a checkpoint the message does not name is refused, not taken on trust.
+      if (q.checkpoint === null) {
+        const named = quizCheckpoint(maskQuotes(grant.latest));
+        if (named === null) return deny("not_named");
+        if (cp === null || cp.toLowerCase() !== named) return deny("quiz_checkpoint_mismatch");
+      }
     }
     const bad = bookCheck(input, stated ? stated.text : grant.quiz.userText, ctx.books);
     if (bad) return deny(bad);
