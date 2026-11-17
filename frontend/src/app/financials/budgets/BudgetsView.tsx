@@ -25,14 +25,14 @@ const STATUS: Record<BudgetLine["status"], { text: string; cls: string }> = {
   none: { text: "no budget", cls: "text-text-tertiary" },
 };
 
+// Returns null on success, else the fixed copy to show. The server's error text is never shown.
 async function put(url: string, body: unknown): Promise<string | null> {
   try {
     const res = await fetch(url, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (res.ok) return null;
-    const j = (await res.json().catch(() => ({}))) as { error?: string };
-    return j.error ?? `failed (${res.status})`;
+    return "Not saved. Try again.";
   } catch {
-    return "network error";
+    return "Not saved. Check your connection and try again.";
   }
 }
 
@@ -76,7 +76,7 @@ export default function BudgetsView({
   return (
     <div className="space-y-6">
       {setupPending && <p className="text-[13px] text-mid">Budgets could not be read; showing spending only.</p>}
-      {error && <p role="alert" className="text-[13px] text-down">Not saved: {error}</p>}
+      {error && <p role="alert" className="text-[13px] text-down">{error}</p>}
 
       {/* Personalize: every tile and card is its own part; parts move within and between the sections below. */}
       <PartGrid page="/financials/budgets" title="Budgets" initial={layout}>
