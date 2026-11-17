@@ -36,6 +36,19 @@ const unrecordedMemo = new Map<string, { at: number; pending: boolean }>();
 
 const BurnupChart = dynamic(() => import("./BurnupChart"), { ssr: false, loading: () => <div className="h-[180px]" /> });
 
+const HIGHLIGHT_REMOVED_COPY = "That highlight was removed elsewhere. Retry saves it again.";
+
+/**
+ * The status line text for a failed highlight save: fixed plain copy, never the server's words. The raw error goes to
+ * the console only, so a developer still sees it.
+ */
+function highlightSaveMessage(e: unknown): string {
+  if (e instanceof AutosaveRefused && e.message === HIGHLIGHT_REMOVED_COPY) return HIGHLIGHT_REMOVED_COPY;
+  console.error("Highlight save failed:", e);
+  if (e instanceof AutosaveRefused) return "This highlight could not be saved as written. Your text is still here. Check it and try again.";
+  return "Could not save this highlight. Your text is still here. Try again.";
+}
+
 /**
  * /reading — the reading quest (2026-11-07).
  *
@@ -195,7 +208,7 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
       <div className="max-w-3xl">
         <h2 data-testid={headingTestId} className="text-[28px] font-medium text-text-primary">Reading</h2>
         <p className="mt-3 text-sm text-red-400">{error}</p>
-        <p className="mt-1 text-[12px] text-text-tertiary">If this is a fresh deploy, apply sql/reading_schema.sql in Supabase first.</p>
+        <p className="mt-1 text-[12px] text-text-tertiary">Reading could not load. Try again in a moment.</p>
         <div className="mt-5">{wantList}</div>
       </div>
     );
@@ -612,6 +625,7 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
     delayMs: 1500,
     ready: (v) => v.reason,
     same: sameReadingValue,
+    describeError: highlightSaveMessage,
     save: async (v, { keepalive }) => {
       if (!v.body) return;
       const hl = hlRef.current;
@@ -649,8 +663,9 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
         await saveRequest(`/api/reading/highlights/${hl.id}`, { method: "PATCH", body, keepalive });
       } catch (e) {
         if (e instanceof AutosaveRefused && /no longer exists/i.test(e.message)) {
+          console.error("Highlight was removed elsewhere:", e.message);
           if (hlRef.current?.id === hl.id) setHighlight(null);
-          throw new AutosaveRefused("That highlight was removed elsewhere. Retry saves it again.");
+          throw new AutosaveRefused(HIGHLIGHT_REMOVED_COPY);
         }
         throw e;
       }
