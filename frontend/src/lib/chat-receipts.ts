@@ -223,11 +223,14 @@ export function buildWriteReceipt(name: string, input: unknown, result: string):
   }
 
   const built = savedDetails(name, args, r);
+  // Saved, but follow-up steps an earlier call may or may not have done (and that were not done now) could not be
+  // confirmed (a replayed reading session's habit Yes or Notion entry): each is listed, and the receipt says to check.
+  const unconfirmed = Array.isArray(r.unconfirmed) ? r.unconfirmed.map(str).filter((d): d is string => !!d).slice(0, 4) : [];
   return {
     tool: name,
-    status: built.status,
+    status: unconfirmed.length > 0 ? "unknown" : built.status,
     title: built.title ?? label.saved,
-    details: built.details,
+    details: [...built.details, ...unconfirmed.map((d) => clip(d, 240))],
     ...(built.link ? { link: built.link } : {}),
   };
 }

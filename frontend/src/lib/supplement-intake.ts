@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { REMOVED_SINCE_CODE, REMOVED_SINCE_ERROR, ambiguousDbError } from "./write-outcome";
 
 /**
  * Log one product from the /supplements list by NAME, with an optional
@@ -47,7 +48,16 @@ export interface LogIntakeInput {
   unit?: string | null;
   times?: string[] | null;
   date?: string | null;
+  /** A retried chat request's first instant (ISO) and behavioral day: an implicit clock time is stamped with them. */
+  now?: string | null;
+  today?: string | null;
   notes?: string | null;
+  /**
+   * Event identity (SEC-04, sql/chat_operations.sql): a UUID (the chat operation id). Every row of this log carries it
+   * and its place, all in ONE insert, so a repeated call with the same key returns the rows already written instead
+   * of logging again (also an untimed "now" log, which the duplicate check below cannot recognise).
+   */
+  event_key?: string | null;
 }
 
 export interface LogIntakeResult {
@@ -63,7 +73,16 @@ export interface LogIntakeResult {
   amount_each?: string;
   logged?: Array<{ intake_id: number; time: string | null }>;
   skipped_duplicates?: string[];
+  /** The rows of an earlier call with the same event_key; nothing was written now. */
+  replayed?: boolean;
+  /** The insert failed in a way that does not prove nothing was written (lib/write-outcome.ts): it may be logged. */
+  incomplete?: boolean;
+  /** An earlier call with this event_key wrote it and it was deleted since: nothing was written again. */
+  removed_since?: boolean;
 }
+
+export const INTAKE_MAYBE_LOGGED =
+  "The database did not confirm this intake, and it may have been saved anyway. Do not log it again: tell the user to check /supplements first.";
 
 const norm = (s: string | null | undefined) =>
   (s ?? "").toLowerCase().replace(/[^a-z0-9µ.]+/g, " ").trim();
@@ -246,7 +265,80 @@ export async function behavioralToday(supabase: Pds): Promise<string> {
 
 // ---------- the write ----------
 
+const EVENT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The key columns are missing (sql/chat_operations.sql not applied, or rolled back). Codes only, never a 23505. A
+ * keyed log is then REFUSED (nothing written), never written without its key: a retry could not find it again.
+ */
+const missingColumn = (error: { code?: string } | null | undefined) => !!error && (error.code === "42703" || error.code === "PGRST204");
+
+export const INTAKE_KEY_UNAVAILABLE =
+  "Onyx could not set up safe logging for this intake, so it was not logged and nothing was written. Try again in a moment.";
+
+interface EventRow {
+  intake_id: number;
+  product_id: string;
+  doses: number | string;
+  intake_date: string;
+  intake_time: string | null;
+}
+
+/** The rows an earlier call with this key wrote (empty when none, or when the column is not there yet). */
+async function rowsForEvent(supabase: Pds, key: string): Promise<EventRow[]> {
+  const { data, error } = await supabase
+    .from("supplement_intake")
+    .select("intake_id,product_id,doses,intake_date,intake_time")
+    .eq("client_event_key", key)
+    .order("client_event_line", { ascending: true });
+  if (error) return [];
+  return (data ?? []) as EventRow[];
+}
+
+/** The result of the call that wrote these rows, rebuilt from what is stored (the product may be inactive by now). */
+async function replayIntake(supabase: Pds, rows: EventRow[]): Promise<LogIntakeResult> {
+  const first = rows[0];
+  const { data: product } = await supabase
+    .from("supplement_products")
+    .select("product_id,brand_name,full_name")
+    .eq("product_id", first.product_id)
+    .maybeSingle();
+  const tz = await currentTimeZone(supabase, wallClockToUtc(first.intake_date, 12, 0, "America/New_York"));
+  const local = (iso: string | null) =>
+    iso ? new Date(iso).toLocaleTimeString("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }) : null;
+  const name = product ? [product.brand_name, product.full_name].filter(Boolean).join(" ") : "";
+  return {
+    ok: true,
+    product: name || first.product_id,
+    product_id: first.product_id,
+    intake_date: first.intake_date,
+    timezone: tz,
+    doses_each: Number(first.doses),
+    logged: rows.map((r) => ({ intake_id: r.intake_id, time: local(r.intake_time) })),
+    replayed: true,
+  };
+}
+
+/**
+ * The stored result of an earlier single-product log with this event key, or null (no key, nothing written under it,
+ * or the rows cannot be read). Read-only: the chat route asks this when a re-run must only read back, never write.
+ */
+export async function intakeEventReplay(supabase: Pds, event_key: unknown): Promise<LogIntakeResult | null> {
+  const key = typeof event_key === "string" && EVENT_UUID.test(event_key) ? event_key.toLowerCase() : null;
+  if (!key) return null;
+  const prior = await rowsForEvent(supabase, key);
+  return prior.length > 0 ? replayIntake(supabase, prior) : null;
+}
+
 export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput): Promise<LogIntakeResult> {
+  const key = typeof input.event_key === "string" && EVENT_UUID.test(input.event_key) ? input.event_key.toLowerCase() : null;
+  // A key that was given but is not a UUID is refused, never dropped (the log would then be unkeyed).
+  if (!key && input.event_key != null && input.event_key !== "") return { ok: false, error: "event_key must be a UUID" };
+  if (key) {
+    const prior = await rowsForEvent(supabase, key);
+    if (prior.length > 0) return replayIntake(supabase, prior);
+  }
+
   const byId = (input.product_id ?? "").trim();
   let query = (input.product ?? "").trim();
   if (!query && !byId) return { ok: false, error: "product is required" };
@@ -279,7 +371,8 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
   const dose = dosesFor(match, query, input.amount, input.unit);
   if ("error" in dose) return { ok: false, error: dose.error, product: label(match) };
 
-  const today = await behavioralToday(supabase);
+  // A retry passes the first try's day and instant, so an implicit clock time stays on the request's own day.
+  const today = input.today || (await behavioralToday(supabase));
   const intake_date = input.date || today;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(intake_date)) return { ok: false, error: "date must be YYYY-MM-DD" };
 
@@ -294,7 +387,7 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       stamps.push(instantOnBehavioralDay(intake_date, c.h, c.m, tz).toISOString());
     }
   } else {
-    stamps = [intake_date === today ? new Date().toISOString() : null];
+    stamps = [intake_date === today ? (input.now && Number.isFinite(Date.parse(input.now)) ? new Date(input.now).toISOString() : new Date().toISOString()) : null];
   }
 
   // A re-sent message must not double-log: skip a timed entry that already
@@ -327,12 +420,30 @@ export async function logSupplementIntake(supabase: Pds, input: LogIntakeInput):
       intake_time,
       notes: input.notes ?? "Logged from chat",
     }));
+    const keyed = key ? rows.map((r, i) => ({ ...r, client_event_key: key, client_event_line: i })) : rows;
     const { data: inserted, error: insErr } = await supabase
       .from("supplement_intake")
-      .insert(rows)
+      .insert(keyed)
       .select("intake_id,intake_time");
-    if (insErr) return { ok: false, error: insErr.message };
-    logged = (inserted ?? []).map((r) => ({ intake_id: r.intake_id, time: local(r.intake_time) }));
+    let unreadable = false;
+    // The event was written once and deleted since (its key is tombstoned): the database refused it, nothing written.
+    if (insErr && key && insErr.code === REMOVED_SINCE_CODE) return { ok: false, error: REMOVED_SINCE_ERROR, removed_since: true };
+    // Fail closed: the insert was rejected for the key columns, so nothing was written; it is not tried again unkeyed.
+    if (insErr && key && missingColumn(insErr)) return { ok: false, error: INTAKE_KEY_UNAVAILABLE };
+    if (insErr && key) {
+      // The same event arrived twice at once (a 23505 on the key: the other call wrote the whole set), or the answer
+      // was lost after the insert committed: read the rows back under the key.
+      const prior = await rowsForEvent(supabase, key);
+      if (prior.length > 0) return replayIntake(supabase, prior);
+      unreadable = insErr.code === "23505";
+    }
+    if (insErr) {
+      // Only a definite refusal (lib/write-outcome.ts) wrote nothing; any other error may have come after the commit.
+      return unreadable || ambiguousDbError(insErr)
+        ? { ok: false, error: INTAKE_MAYBE_LOGGED, incomplete: true }
+        : { ok: false, error: insErr.message };
+    }
+    logged = (inserted ?? []).map((r: { intake_id: number; intake_time: string | null }) => ({ intake_id: r.intake_id, time: local(r.intake_time) }));
   }
 
   return {

@@ -223,6 +223,27 @@ test("logSession: before sql/reading_sessions_client_key.sql is applied the key 
   assert.equal("client_key" in db.tables.reading_sessions[0], false);
 });
 
+test("logSession with require_client_key (Onyx Chat) never writes a session without its key", async () => {
+  // The key column is missing: refused, nothing written (a retried chat message could never find an unkeyed session).
+  const db = fakeDb({ books: [BOOK] }, { noClientKey: true });
+  const r = await R.logSession(db, create({ source: "chat", require_client_key: true }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error, R.SESSION_KEY_REQUIRED);
+  assert.equal(db.tables.reading_sessions.length, 0);
+  assert.equal(db.log.filter((c) => c.table === "reading_sessions" && c.op === "insert").length, 1, "one keyed insert, no unkeyed second one");
+  // A key that is not a UUID is refused too, before anything is read or written.
+  const bad = fakeDb({ books: [BOOK] });
+  const refused = await R.logSession(bad, create({ client_key: "not-a-uuid", require_client_key: true }));
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error, R.SESSION_KEY_REQUIRED);
+  assert.equal(bad.tables.reading_sessions.length, 0);
+  // With the column there the session is written with its key.
+  const ok = fakeDb({ books: [BOOK] });
+  const written = await R.logSession(ok, create({ require_client_key: true }));
+  assert.equal(written.ok, true);
+  assert.equal(ok.tables.reading_sessions[0].client_key, KEY);
+});
+
 test("logSession reports a habit row it did not make as not created", async () => {
   const db = fakeDb({ books: [BOOK], habit_journal: [yes("2026-11-15")] });
   const r = await R.logSession(db, create({ date: "2026-11-15" }));
