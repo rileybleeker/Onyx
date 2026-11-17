@@ -1089,6 +1089,11 @@ test("server read: the answers and the WHOOP feedback are read only once the goa
   const p = await S.readWindDown(db);
   assert.equal(p.status, "not_set_up");
   assert.ok(!db.calls.some((c) => c.table === "habit_journal"), "no answers before a goal exists");
+  assert.ok(!db.calls.some((c) => c.table === "sleep_winddown_starts"), "no starts before a goal exists");
+  assert.ok(!db.calls.some((c) => c.table === "whoop_sleep"), "no WHOOP read before a goal exists");
+  const missing = fakeDb({}, { fail: { sleep_winddown_rules: "PGRST205" } });
+  assert.equal((await S.readWindDown(missing)).status, "not_connected");
+  assert.ok(!missing.calls.some((c) => ["sleep_winddown_starts", "whoop_sleep", "habit_journal"].includes(c.table)), "not_connected reads no starts, WHOOP or answers");
   const db2 = fakeDb({ sleep_winddown_rules: [RULE_ROW], sleep_winddown_pauses: [], habit_name_map: [{ notion_page_id: ID_A, habit_name: HABIT }], habit_journal: [], whoop_sleep: [], sleep_winddown_starts: [] });
   const p2 = await S.readWindDown(db2);
   assert.equal(p2.status, "ready");
