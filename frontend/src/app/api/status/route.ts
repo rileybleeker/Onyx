@@ -84,6 +84,7 @@ const CADENCE: Record<string, string> = {
   ubereats: "Every 6h (Riley's PC, while logged on)",
   gopuff: "Every 6h (Riley's PC, while logged on)",
   pc_activity: "Hourly (Riley's PC, while signed in)",
+  uber_rides: "On demand (Uber privacy download, imported by hand)",
   ai_usage: "Every 3h (Riley's PC, while signed in)",
   youtube: "Daily look on Riley's PC; new data every 2 months (scheduled Google Takeout)",
   medical_backup: "Weekly (Riley's PC, while signed in)",
@@ -145,6 +146,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
   gopuff:         { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
+  uber_rides:     { method: "manual",         label: "Privacy download import" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
   youtube:        { method: "semi-automated", label: "Scheduled Takeout in OneDrive" },
   medical_backup: { method: "automated",      label: "Encrypted PC backup" },
@@ -497,6 +499,7 @@ export async function GET() {
         ["pc_activity", "usage"],
         // AI tool usage harvester (Riley's PC, every 3h while signed in).
         ["ai_usage", "sessions"],
+        ["uber_rides", "import"],
         // YouTube watch history importer (Riley's PC, one heartbeat a day).
         ["youtube", "history"],
         // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
@@ -1290,6 +1293,27 @@ export async function GET() {
           cadence: CADENCE.ubereats,
           integrationMethod: METHOD.ubereats.method,
           methodLabel: METHOD.ubereats.label,
+        };
+      })(),
+      // Uber rides (uber_rides_import.py): a hand-run import of Uber's own privacy download, so
+      // data age is not a fault. Only a failed import turns the card red; none yet is unknown.
+      uber_rides: (() => {
+        const entry = latestBySrcType["uber_rides|import"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry ? "unknown" : entry.status === "failed" ? "failed" : entry.status === "partial" ? "partial" : "success";
+        return {
+          label: "Uber Rides",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No import yet - apply sql/uber_rides_schema.sql, request the download at myprivacy.uber.com, then run uber_rides_import.py --apply on it." : null),
+          cadence: CADENCE.uber_rides,
+          integrationMethod: METHOD.uber_rides.method,
+          methodLabel: METHOD.uber_rides.label,
         };
       })(),
       // goPuff item harvester (tools/gopuff_harvest/harvest.mjs on Riley's PC): same shape and
