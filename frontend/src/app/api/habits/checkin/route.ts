@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { after, NextRequest, NextResponse } from "next/server";
-import { fetchActiveHabits, fetchActiveHabitsCached, NotionHabitsError, type NotionHabit } from "@/lib/habits-notion";
+import { fetchActiveHabits, fetchActiveHabitsCached, habitsUnreachableCopy, NotionHabitsError, type NotionHabit } from "@/lib/habits-notion";
 import { behavioralToday, dateError, isDate, loadChannels, loadItems, toItems, WHOOP_JOURNAL_FROZEN_THROUGH } from "@/lib/checkin-server";
 import {
   addDays,
@@ -222,7 +222,10 @@ async function buildPayload(today: string, date: string, habitsP: Promise<Notion
     Promise.all(nightDates.map((n) => sleepSuggestionsFor(n, sleepNames, newestBed))),
     channelsP,
   ]);
-  if (error) return { error: error.message };
+  if (error) {
+    console.error("habits/checkin", error);
+    return { error: "Couldn't load your check-in. Try again." };
+  }
   const kitHistory = kitRows.error ? [] : ((kitRows.data ?? []) as { cycle_date: string; question: string; answer: string }[]);
 
   const items = toItems(habits, channel);
@@ -283,7 +286,10 @@ export async function GET(req: NextRequest) {
     if ("error" in built) return NextResponse.json({ error: built.error }, { status: 500 });
     return NextResponse.json(built.payload, { headers: { "Cache-Control": "no-store" } });
   } catch (e) {
-    if (e instanceof NotionHabitsError) return NextResponse.json({ error: e.message }, { status: 502 });
+    if (e instanceof NotionHabitsError) {
+      console.error("habits/checkin", e);
+      return NextResponse.json({ error: habitsUnreachableCopy(e) }, { status: 502 });
+    }
     throw e;
   }
 }
@@ -308,7 +314,10 @@ export async function POST(req: NextRequest) {
   try {
     ({ items } = await itemsP);
   } catch (e) {
-    if (e instanceof NotionHabitsError) return NextResponse.json({ error: e.message }, { status: 502 });
+    if (e instanceof NotionHabitsError) {
+      console.error("habits/checkin", e);
+      return NextResponse.json({ error: habitsUnreachableCopy(e) }, { status: 502 });
+    }
     throw e;
   }
   const byName = new Map(items.map((i) => [i.name, i]));
@@ -328,11 +337,17 @@ export async function POST(req: NextRequest) {
 
   if (upserts.length) {
     const { error } = await supabase.from("habit_journal").upsert(upserts, { onConflict: "cycle_date,question" });
-    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    if (error) {
+      console.error("habits/checkin", error);
+      return NextResponse.json({ error: "Couldn't save your answers. Try again." }, { status: 500 });
+    }
   }
   if (clears.length) {
     const { error } = await supabase.from("habit_journal").delete().eq("cycle_date", date).in("question", clears);
-    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    if (error) {
+      console.error("habits/checkin", error);
+      return NextResponse.json({ error: "Couldn't save your answers. Try again." }, { status: 500 });
+    }
   }
 
   // The mirror decides from Notion's CURRENT "Last Completed", so it reads Notion fresh (never the cached list).

@@ -8,7 +8,8 @@ export async function GET() {
     return NextResponse.json({ habits: await fetchActiveHabitsCached() });
   } catch (e) {
     if (e instanceof NotionHabitsError) {
-      return NextResponse.json({ error: e.message, status: e.status, detail: e.detail }, { status: 500 });
+      console.error("habits/list", e);
+      return NextResponse.json({ error: "Couldn't load your habits. Try again." }, { status: 500 });
     }
     throw e;
   }

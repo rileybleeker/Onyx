@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
-import { NotionHabitsError } from "@/lib/habits-notion";
+import { habitsUnreachableCopy, NotionHabitsError } from "@/lib/habits-notion";
 import { nightLabel, sleepAnswerDate } from "@/lib/checkin";
 import { behavioralToday, dateError, isDate, loadItems, WHOOP_JOURNAL_FROZEN_THROUGH } from "@/lib/checkin-server";
 import { checkVoiceRequest, parseVoiceText, voiceQuestionNames, voiceResult, voiceSleepNames } from "@/lib/checkin-voice";
@@ -139,7 +139,10 @@ export async function POST(req: NextRequest) {
     questions = voiceQuestionNames(items);
     sleepQuestions = voiceSleepNames(items);
   } catch (e) {
-    if (e instanceof NotionHabitsError) return NextResponse.json({ error: e.message }, { status: 502 });
+    if (e instanceof NotionHabitsError) {
+      console.error("habits/checkin/voice", e);
+      return NextResponse.json({ error: habitsUnreachableCopy(e) }, { status: 502 });
+    }
     console.error("[checkin-voice] questions failed");
     return NextResponse.json({ error: "Couldn't load the questions." }, { status: 500 });
   }
