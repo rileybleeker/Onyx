@@ -22,6 +22,7 @@ import {
   newUuid,
   onDrinkChange,
   recentSameProduct,
+  TIME_PROBLEM_TEXT,
   saveFromRecord,
   servingsText,
   whenIssueOf,
@@ -638,6 +639,19 @@ function DrinkItem({
   );
 }
 
+/**
+ * The words shown for a failed save. Server text is never rendered: a time problem keeps the app's own sentence for
+ * that fixed code (the server sends the same code); every other failure gets copy keyed on the HTTP status.
+ */
+function saveFailureText(status: number, json: Record<string, unknown>): string {
+  const code = typeof json.code === "string" ? json.code : null;
+  if (code && Object.prototype.hasOwnProperty.call(TIME_PROBLEM_TEXT, code)) return TIME_PROBLEM_TEXT[code as keyof typeof TIME_PROBLEM_TEXT];
+  if (status === 401 || status === 403) return "Sign in again to keep saving drinks.";
+  if (status === 409) return "This drink changed somewhere else. Refresh to see the latest.";
+  if (status >= 500 && status <= 599) return "Could not save this drink. Try again in a moment.";
+  return "Could not save this drink. Try again.";
+}
+
 // ---- a drink already saved (listed for the day) -------------------------------------------------------------------
 
 function SavedDrink({ rec, check }: { rec: DrinkRecord; check: DayCheck | null }) {
@@ -654,7 +668,7 @@ function SavedDrink({ rec, check }: { rec: DrinkRecord; check: DayCheck | null }
     try {
       const r = await call(method, body);
       // A conflict is shown (the list re-reads the newer version); never repeated with a fresh revision.
-      if (!r.ok) setErr(typeof r.json.error === "string" ? r.json.error : `Failed (${r.status}).`);
+      if (!r.ok) setErr(saveFailureText(r.status, r.json));
       announceDrinkChange();
     } catch {
       setErr("Couldn't reach Onyx.");
