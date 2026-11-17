@@ -1296,9 +1296,9 @@ export async function GET() {
             ?? (countStale ? `No new count since ${pollenLatest} (${countLag} days). The station skips weekends and holidays.` : null)
             ?? (entry ? null
               : pollenPending
-                ? "pds.pollen_daily is missing - apply sql/pollen_schema.sql, then add the Pollen ETL workflow (YAML in the roadmap row)."
+                ? "pds.pollen_daily is missing. Next: apply sql/pollen_schema.sql. Then add the Pollen ETL workflow (YAML in the roadmap row)."
                 : pollenRes.error?.message
-                  ?? "No run yet - add .github/workflows/pollen-etl.yml (YAML in the roadmap row)."),
+                  ?? "No run yet. Next: add .github/workflows/pollen-etl.yml (YAML in the roadmap row)."),
           cadence: CADENCE.pollen,
           integrationMethod: METHOD.pollen.method,
           methodLabel: METHOD.pollen.label,
@@ -1377,7 +1377,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No import yet - apply sql/uber_rides_schema.sql, request the download at myprivacy.uber.com, then run uber_rides_import.py --apply on it." : null),
+            ?? (!entry ? "No import yet. Next: apply sql/uber_rides_schema.sql. Then request the download at myprivacy.uber.com and run uber_rides_import.py --apply on it." : null),
           cadence: CADENCE.uber_rides,
           integrationMethod: METHOD.uber_rides.method,
           methodLabel: METHOD.uber_rides.label,
@@ -1435,7 +1435,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No upload yet - apply sql/pc_activity_schema.sql, then run tools/pc_activity_logger/register-task.ps1 on the PC." : null),
+            ?? (!entry ? "No upload yet. Next: apply sql/pc_activity_schema.sql. Then run tools/pc_activity_logger/register-task.ps1 on the PC." : null),
           cadence: CADENCE.pc_activity,
           integrationMethod: METHOD.pc_activity.method,
           methodLabel: METHOD.pc_activity.label,
@@ -1465,7 +1465,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No upload yet - apply sql/ai_tool_usage_schema.sql, then run tools/ai_usage_harvest/register-task.ps1 on the PC." : null),
+            ?? (!entry ? "No upload yet. Next: apply sql/ai_tool_usage_schema.sql. Then run tools/ai_usage_harvest/register-task.ps1 on the PC." : null),
           cadence: CADENCE.ai_usage,
           integrationMethod: METHOD.ai_usage.method,
           methodLabel: METHOD.ai_usage.label,
@@ -1495,7 +1495,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No upload yet - apply sql/apple_health_schema.sql, install the HealthKit build from /install, allow Health access in the app and add the Shortcuts automation (tools/screentime_ios/README.md)." : null),
+            ?? (!entry ? "No upload yet. Next: apply sql/apple_health_schema.sql. Then install the HealthKit build from /install, allow Health access in the app, and add the Shortcuts automation (tools/screentime_ios/README.md)." : null),
           cadence: CADENCE.apple_health,
           integrationMethod: METHOD.apple_health.method,
           methodLabel: METHOD.apple_health.label,
@@ -1524,7 +1524,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No run yet - apply sql/youtube_watch_history_schema.sql, run tools/youtube_history/register-task.ps1 and set up the scheduled Takeout (docs/youtube-watch-history.md)." : null),
+            ?? (!entry ? "No run yet. Next: apply sql/youtube_watch_history_schema.sql. Then run tools/youtube_history/register-task.ps1 and set up the scheduled Takeout (docs/youtube-watch-history.md)." : null),
           cadence: CADENCE.youtube,
           integrationMethod: METHOD.youtube.method,
           methodLabel: METHOD.youtube.label,

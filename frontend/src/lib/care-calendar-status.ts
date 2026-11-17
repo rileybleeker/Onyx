@@ -87,7 +87,7 @@ export function careCalendarCard(p: {
   }
   if (p.readError) {
     const c = code(p.readError.code);
-    if (c === "PGRST205" || c === "42P01") return { ...base, errorMessage: "Sync table missing: apply sql/care_calendar_sync_schema.sql." };
+    if (c === "PGRST205" || c === "42P01") return { ...base, errorMessage: "Sync table missing. Next: apply sql/care_calendar_sync_schema.sql." };
     return { ...base, status: "failed", errorMessage: `Could not read the sync state (${c}).` };
   }
   const row = p.row;
