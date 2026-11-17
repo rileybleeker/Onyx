@@ -83,15 +83,41 @@ export async function createJournalPage(entry: JournalEntryInput): Promise<strin
   return (await createJournalPageRef(entry)).url;
 }
 
+/** Notion's query page size for the same-title lookup (its maximum), and how many pages are read before giving up. */
+const SAME_TITLE_PAGE_SIZE = 100;
+const SAME_TITLE_MAX_ROUNDS = 10;
+
+/** The same-title lookup could not read the whole list within SAME_TITLE_MAX_ROUNDS (nothing was decided or written). */
+export class JournalLookupIncomplete extends Error {
+  constructor() {
+    super("journal lookup incomplete");
+  }
+}
+
 /**
  * An entry already saved with this date and title (POST /api/journal/entry). `sameWords` = one of them holds exactly
  * these words, so the save is a retry and may be answered with that page. `sameWords: false` = a DIFFERENT entry
  * already uses this title on this day: the caller must not report the new words as saved (Onyx#168, P1). null = none.
+ *
+ * Pagination: Notion returns at most one page of results per query. Every page is read (has_more / next_cursor, passed
+ * back as start_cursor) BEFORE any match is judged, so a matching entry past the first page is still found. If the list
+ * has not ended after SAME_TITLE_MAX_ROUNDS pages, this throws JournalLookupIncomplete instead of answering
+ * sameWords: false; a capped search must never report a conflict for words that may already be saved.
  */
 export async function findSameTitleEntry(entry: JournalEntryInput): Promise<{ url: string | null; sameWords: boolean } | null> {
-  const res = await notionPost(`databases/${NOTION_JOURNAL_DB}/query`, sameEntryQuery(entry));
-  if (!res.ok) throw new NotionRefused(res.status);
-  const pages = ((await res.json()) as { results?: unknown[] }).results ?? [];
+  const pages: unknown[] = [];
+  let cursor: string | null = null;
+  for (let round = 0; ; round++) {
+    if (round >= SAME_TITLE_MAX_ROUNDS) throw new JournalLookupIncomplete();
+    const query = { ...sameEntryQuery(entry), page_size: SAME_TITLE_PAGE_SIZE, ...(cursor ? { start_cursor: cursor } : {}) };
+    const res = await notionPost(`databases/${NOTION_JOURNAL_DB}/query`, query);
+    if (!res.ok) throw new NotionRefused(res.status);
+    const data = (await res.json()) as { results?: unknown[]; has_more?: unknown; next_cursor?: unknown };
+    pages.push(...(Array.isArray(data.results) ? data.results : []));
+    if (data.has_more !== true) break;
+    if (typeof data.next_cursor !== "string" || !data.next_cursor) throw new JournalLookupIncomplete();
+    cursor = data.next_cursor;
+  }
   if (!pages.length) return null;
   const want = bodyAsWritten(entry.body);
   for (const page of pages) {

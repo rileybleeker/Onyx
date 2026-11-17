@@ -118,7 +118,7 @@ const ORIGIN = "https://onyx.example";
 const WORDS = "Synthetic private words that must never reach a log.";
 
 /** The route with lib/journal-file-server replaced: records what reaches Notion, answers `same` for the duplicate check. */
-function journalRoute({ same = null, create } = {}) {
+function journalRoute({ same = null, create, incomplete = false } = {}) {
   const asked = [];
   const created = [];
   class NotionRefused extends Error {
@@ -127,11 +127,14 @@ function journalRoute({ same = null, create } = {}) {
       this.status = status;
     }
   }
+  class JournalLookupIncomplete extends Error {}
   const notion = {
     __esModule: true,
     notionConfigured: () => true,
+    JournalLookupIncomplete,
     findSameTitleEntry: async (e) => {
       asked.push(e);
+      if (incomplete) throw new JournalLookupIncomplete("synthetic cap");
       return same;
     },
     createJournalPage: async (e) => {
@@ -155,6 +158,15 @@ function consoleLines(t) {
   for (const level of ["log", "info", "warn", "error", "debug"]) t.mock.method(console, level, (...args) => lines.push({ level, text: args.map(String).join(" ") }));
   return lines;
 }
+
+test("route: an incomplete same-title lookup answers 503 and writes nothing (never a 409)", async (t) => {
+  const lines = consoleLines(t);
+  const { route, created } = journalRoute({ incomplete: true });
+  const res = await route.POST(post(todays()));
+  assert.equal(res.status, 503);
+  assert.equal(created.length, 0, "no page is created when the lookup did not finish");
+  assert.deepEqual(lines, [], "the failure logs nothing");
+});
 
 test("route: only POST is answered, and a new entry is written to Notion once with the words exactly as sent", async (t) => {
   const lines = consoleLines(t);
