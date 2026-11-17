@@ -16,6 +16,7 @@ import type { FinanceCard } from "@/lib/finance-status";
 import FilterBar from "./FilterBar";
 import SpendingTrendChart from "./SpendingTrendChart";
 import CategoryEditor from "./CategoryEditor";
+import KindOverride from "./KindOverride";
 import { PartGrid, type PartSpec } from "@/components/personalize/PartGrid";
 import PersonalTable, { type TableColumn } from "@/components/personalize/PersonalTable";
 import type { PageLayout } from "@/lib/personalize-layout";
@@ -84,7 +85,7 @@ export function FreshnessLine({ freshness, now }: { freshness: FinanceCard | nul
   );
 }
 
-function BalanceRow({ line, now, liability }: { line: BalanceLine; now: Date; liability?: boolean }) {
+function BalanceRow({ line, now, liability, extra }: { line: BalanceLine; now: Date; liability?: boolean; extra?: ReactNode }) {
   const { account, balance, stale } = line;
   const shown = liability ? Math.abs(balance.balance_cents) : balance.balance_cents;
   return (
@@ -114,11 +115,12 @@ function BalanceRow({ line, now, liability }: { line: BalanceLine; now: Date; li
           )}
         </p>
       </div>
+      {extra ? <div className="basis-full">{extra}</div> : null}
     </li>
   );
 }
 
-function Group({ title, note, lines, now, liability }: { title: string; note?: string; lines: BalanceLine[]; now: Date; liability?: boolean }) {
+function Group({ title, note, lines, now, liability, extra }: { title: string; note?: string; lines: BalanceLine[]; now: Date; liability?: boolean; extra?: (l: BalanceLine) => ReactNode }) {
   if (lines.length === 0) return null;
   return (
     <div>
@@ -126,7 +128,7 @@ function Group({ title, note, lines, now, liability }: { title: string; note?: s
       {note && <p className="mt-0.5 text-[11px] text-text-tertiary">{note}</p>}
       <ul className="mt-1">
         {lines.map((l) => (
-          <BalanceRow key={l.account.account_key} line={l} now={now} liability={liability} />
+          <BalanceRow key={l.account.account_key} line={l} now={now} liability={liability} extra={extra?.(l)} />
         ))}
       </ul>
     </div>
@@ -269,7 +271,13 @@ export default function LedgerView({
       title: "Unclassified accounts",
       node: (
         <div className={box}>
-          <Group title="Unclassified" note="Not counted in net worth until the source labels them." lines={nw.unclassified} now={now} />
+          <Group
+            title="Unclassified"
+            note="Not counted in net worth until the source labels them."
+            lines={nw.unclassified}
+            now={now}
+            extra={(l) => <KindOverride accountId={l.account.account_key} onSaved={onChanged} />}
+          />
         </div>
       ),
     });

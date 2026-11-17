@@ -87,3 +87,14 @@ export async function saveCategoryFix(kind: "rule" | "txn", key: string, categor
   if (res.error) console.error(`category fix save failed: ${res.error.code ?? "unknown"}`);
   return !res.error;
 }
+
+/** Save (or clear) Riley's asset/liability override for one finance account. kind null deletes the row. */
+export async function saveAccountKind(accountId: string, kind: "asset" | "liability" | null): Promise<boolean> {
+  const db = serviceClient();
+  const res =
+    kind === null
+      ? await db.from("finance_account_kind_overrides").delete().eq("account_id", accountId)
+      : await db.from("finance_account_kind_overrides").upsert({ account_id: accountId, kind, updated_at: new Date().toISOString() });
+  if (res.error) console.error(`account kind save failed: ${res.error.code ?? "unknown"}`);
+  return !res.error;
+}
