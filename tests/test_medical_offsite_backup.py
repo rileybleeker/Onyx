@@ -20,11 +20,17 @@ the temporary folder, the printed output or the heartbeat. Covers:
     table without a usable primary key is not copied (partial), a table the schema does not know is listed
     as missing (not a failure), credentials and the trial seed / schedule are never requested; a listing
     that keeps changing is partial;
+  * references between tables: a parent row and its child written between the two tables' reads are read
+    again and copied together (success); a reference that stays broken is partial (tables_inconsistent)
+    and the drill's references_hold fails; a row pointing into an excluded table is partial
+    (parent_not_recoverable); experiment_days is an uncovered table (never requested, listed in the
+    manifest);
   * retention: newest 8 plus the first of each of the 3 latest months plus the newest backup whose
     completeness marker verifies (an empty or foreign marker is no evidence); only this job's names are
     removed; partial runs prune too but never the newest complete one; a marker that cannot be committed
-    fails the run and prunes nothing; a marker that cannot be read stops the prune; ciphertext a killed run
-    left in the temporary folder is removed after a day;
+    fails the run and prunes nothing; a marker that cannot be read, or whose stat fails (Path.is_file()
+    would call it absent), stops the prune; ciphertext a killed run left in the temporary folder is
+    removed after a day;
   * the heartbeat goes to exactly the production origin with the key the backup resolved, whatever
     ONYX_SUPABASE_URL says, and a heartbeat that cannot be written never changes the run's outcome;
   * the drill fails on a changed file, a member outside the pack's names (never extracted), a ciphertext that
@@ -144,6 +150,7 @@ class FakeSupabase:
         self.tables = {"medical_documents": docs(), "lab_results": labs(),
                        "weight_log": [{"log_date": f"2026-01-{d:02d}", "weight_kg": 80.0, "note": "LEAK"} for d in range(1, 4)]}
         self.pk = {"medical_documents": ["id"], "lab_results": ["id"], "weight_log": ["log_date"]}
+        self.fk: dict = {}              # table -> {column: (parent table, parent column)}, as PostgREST marks them
         self.files = {f"documents/{DOC_A}": (PDF, "application/pdf"), f"documents/{DOC_B}": (PNG, "image/png")}
         self.unlisted: set = set()      # in storage, not in the listing
         self.bytes_gone: set = set()    # in the listing, download answers not found
@@ -161,8 +168,16 @@ class FakeSupabase:
         defs = {}
         for t, rows in self.tables.items():
             cols = sorted({k for r in rows for k in r} | set(self.pk.get(t, [])))
-            defs[t] = {"properties": {c: {"format": "text", **({"description": "Note:\nThis is a Primary Key.<pk/>"}
-                                                              if c in self.pk.get(t, []) else {})} for c in cols}}
+            props = {}
+            for c in cols:
+                notes = []
+                if c in self.pk.get(t, []):
+                    notes.append("This is a Primary Key.<pk/>")
+                if c in self.fk.get(t, {}):
+                    parent, pcol = self.fk[t][c]
+                    notes.append(f"This is a Foreign Key to `{parent}.{pcol}`.<fk table='{parent}' column='{pcol}'/>")
+                props[c] = {"format": "text", **({"description": "Note:\n" + "\n".join(notes)} if notes else {})}
+            defs[t] = {"properties": props}
         return {"swagger": "2.0", "definitions": defs}
 
     def _flake(self, key):
@@ -487,6 +502,36 @@ class PartialRuns(Base):
                 ob.prune(self.dest, NOW)
         self.assertTrue(all((self.dest / n).exists() for n in names))
 
+    def test_a_marker_whose_stat_fails_stops_the_prune_with_nothing_removed(self):
+        # Path.is_file() answers False for any OSError on Python 3.14: the marker would look absent and the
+        # only complete backup (the oldest) would be pruned. The explicit stat stops the prune instead.
+        self.dest.mkdir()
+        names = [f"onyx-backup-2025{m:02d}01T000000Z.tar.age" for m in range(1, 13)]
+        for n in names:
+            (self.dest / n).write_bytes(b"x")
+        ob.write_ok_marker(self.dest / names[0])
+        real_stat, marker = os.stat, ob.ok_marker(names[0])
+
+        def denied(path, *a, **k):
+            if Path(path).name == marker:
+                raise PermissionError(13, "denied")
+            return real_stat(path, *a, **k)
+        with mock.patch.object(ob.os, "stat", side_effect=denied):
+            with self.assertRaises(OSError):
+                ob.prune(self.dest, NOW)
+        self.assertTrue(all((self.dest / n).exists() for n in names))
+        self.assertTrue((self.dest / marker).exists())
+
+    def test_is_regular_answers_false_only_for_a_missing_file(self):
+        self.dest.mkdir()
+        (self.dest / "f").write_bytes(b"x")
+        self.assertTrue(ob._is_regular(self.dest / "f"))
+        self.assertFalse(ob._is_regular(self.dest / "missing"))
+        self.assertFalse(ob._is_regular(self.dest))
+        with mock.patch.object(ob.os, "stat", side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(PermissionError):
+                ob._is_regular(self.dest / "f")
+
     def test_unreadable_rebuild_table_is_partial_and_missing_table_is_not(self):
         self.sb.always_500.add("weight_log")
         self.check_partial("rebuild_table_unreadable")
@@ -709,6 +754,86 @@ class Tables(Base):
         code, out = self.backup()
         self.assertEqual(code, 2, out)
         self.assertEqual(self.heartbeats()[0]["error_message"], "listing_changed")
+
+
+class References(Base):
+    def stacks(self, n_items=2):
+        self.sb.tables["supplement_stack"] = [{"id": "s1", "name": "LEAK stack"}]
+        self.sb.tables["supplement_stack_item"] = [{"id": f"i{k}", "stack_id": "s1", "doses": 1} for k in range(n_items)]
+        self.sb.pk.update({"supplement_stack": ["id"], "supplement_stack_item": ["id"]})
+        self.sb.fk["supplement_stack_item"] = {"stack_id": ("supplement_stack", "id")}
+
+    def pack_tables(self):
+        plain = self.cipher.open_plain(self.written()[0])
+        with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+            names = tar.getnames()
+            return names, {n[len("tables/pds/"):-5]: json.loads(tar.extractfile(n).read())
+                           for n in names if n.startswith("tables/pds/")}
+
+    def test_a_stack_and_its_items_created_between_two_reads_are_copied_together(self):
+        self.stacks()
+        state = {"done": False}
+
+        def create_stack_and_item(q):
+            if not state["done"]:  # the stack table was already read: its new row is not in the copy yet
+                state["done"] = True
+                self.sb.tables["supplement_stack"].append({"id": "s2", "name": "LEAK new"})
+                self.sb.tables["supplement_stack_item"].append({"id": "i9", "stack_id": "s2", "doses": 1})
+        self.sb.on_read["supplement_stack_item"] = create_stack_and_item
+        code, out = self.backup()
+        self.assertEqual(code, 0, out)
+        _, tables = self.pack_tables()
+        self.assertEqual({r["id"] for r in tables["supplement_stack"]}, {"s1", "s2"}, "the stack was read again")
+        self.assertIn("i9", {r["id"] for r in tables["supplement_stack_item"]})
+        report = ob.run_drill(dest=self.dest, identity=self.identity, cipher=self.cipher, root=self.tmp / "drill")
+        self.assertTrue(report.checks["references_hold"])
+        self.assertEqual(report.status, "pass", report.as_dict())
+
+    def test_a_reference_that_stays_broken_is_partial_and_the_drill_fails_it(self):
+        self.stacks()
+        self.sb.tables["supplement_stack_item"].append({"id": "i8", "stack_id": "gone", "doses": 1})
+        PartialRuns.check_partial(self, "tables_inconsistent")
+        reads = [u for _, u, _ in self.sb.calls if "/rest/v1/supplement_stack_item?" in u and "select=%2A" in u]
+        self.assertEqual(len(reads), 1 + ob.REFERENCE_ROUNDS, "read again a bounded number of times, then refused")
+        report = ob.run_drill(dest=self.dest, identity=self.identity, cipher=self.cipher, root=self.tmp / "drill")
+        self.assertFalse(report.checks["references_hold"])
+        self.assertEqual(report.status, "fail")
+
+    def test_a_row_pointing_into_an_excluded_table_is_partial(self):
+        self.sb.tables["weight_log"][0]["schedule_ref"] = "LEAK"
+        self.sb.fk["weight_log"] = {"schedule_ref": ("experiment_schedule", "experiment_id")}
+        PartialRuns.check_partial(self, "parent_not_recoverable")
+        report = ob.run_drill(dest=self.dest, identity=self.identity, cipher=self.cipher, root=self.tmp / "drill")
+        self.assertFalse(report.checks["references_hold"])
+
+    def test_a_null_reference_into_an_excluded_table_is_fine(self):
+        self.sb.tables["weight_log"][0]["schedule_ref"] = None
+        self.sb.fk["weight_log"] = {"schedule_ref": ("experiment_schedule", "experiment_id")}
+        code, out = self.backup()
+        self.assertEqual(code, 0, out)
+
+    def test_experiment_days_is_uncovered_and_never_requested(self):
+        self.assertNotIn("experiment_days", ob.REBUILD_TABLES)
+        self.assertIn("experiment_days", ob.UNCOVERED_TABLES)
+        self.sb.tables["experiment_days"] = [{"experiment_id": "x", "behavioral_date": "2026-01-01", "note": "LEAK"}]
+        code, out = self.backup()
+        self.assertEqual(code, 0, out)
+        self.assertFalse(any("/rest/v1/experiment_days" in u for _, u, _ in self.sb.calls))
+        plain = self.cipher.open_plain(self.written()[0])
+        with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+            manifest = json.loads(tar.extractfile("manifest.json").read())
+        self.assertEqual(manifest["uncovered_tables"], ["experiment_days"])
+
+    def test_broken_references_is_column_by_column_between_copied_tables(self):
+        spec = {"definitions": {"child": {"properties": {
+            "a": {"description": "Note:\n<fk table='parent' column='x'/>"},
+            "b": {"description": "Note:\n<fk table='parent' column='y'/>"}}}}}
+        parent = [{"x": 1, "y": "p"}]
+        self.assertEqual(ob.broken_references({"child": [{"a": 1, "b": "p"}], "parent": parent}, spec), set())
+        self.assertEqual(ob.broken_references({"child": [{"a": 2, "b": "p"}], "parent": parent}, spec),
+                         {("child", "parent")})
+        self.assertEqual(ob.broken_references({"child": [{"a": None, "b": None}], "parent": parent}, spec), set())
+        self.assertEqual(ob.broken_references({"child": [{"a": 2}]}, spec), set(), "a parent not copied is not judged here")
 
 
 class Retention(Base):

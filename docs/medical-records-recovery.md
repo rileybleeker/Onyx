@@ -450,15 +450,25 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   under `documents/`, PostgREST's schema description of `pds` (the schema-only part; the repo's `sql/`
   files are the full schema), and a fixed list of hand-entered `pds` tables Onyx cannot fetch again from
   a source (`REBUILD_TABLES` in the job: habits, supplements, weight, reading, care items, layouts, the
-  time-zone log, Uber Eats portions, the finance ledger and plan, procurement, experiments; the finance
-  tables are included on purpose: they are encrypted with the rest and the private key never leaves the
-  PC and the password manager). Tables are paged by primary key with a keyset cursor (each page asks for
+  time-zone log, Uber Eats portions, the finance ledger and plan, procurement, the experiment protocols;
+  the finance tables are included on purpose: they are encrypted with the rest and the private key never
+  leaves the PC and the password manager). **Not covered, on purpose (`UNCOVERED_TABLES`):**
+  `pds.experiment_days` (trial adherence). Its required foreign key points into the trial schedule, which
+  is never copied (concealment), so a copy could not be restored into the declared schema; it stays out
+  until the schedule has a recovery path of its own, and every manifest lists it under
+  `uncovered_tables`. Tables are paged by primary key with a keyset cursor (each page asks for
   the rows after the last key read, never an OFFSET, so a row removed or added between two pages cannot
   push an unread row out of the read), and after the last page the table's keys are read again: the copy
   is used only when they match exactly; otherwise the table is read once more, then counts as unreadable.
   A table with no primary key (or one of a type the cursor cannot compare) is not copied and the run is
   partial (`rebuild_table_unkeyed`). Storage pages its listing by offset, so the listing is read twice
-  and must agree (`listing_changed` otherwise, partial). Credentials (`ci_tokens`) and the N-of-1
+  and must agree (`listing_changed` otherwise, partial). Tables are read one after another, so after the
+  last one every foreign key between two copied tables (from the schema description, plus a lab result's
+  document) is checked: a row whose parent row the copy does not hold (a stack and its items created or
+  removed between the two reads) makes the job read both tables again, up to 3 times; still broken is
+  partial (`tables_inconsistent`). A copied row that points into a table no backup holds is partial
+  (`parent_not_recoverable`). Known limit: a row changed (not added or removed) during its table's read
+  may be copied as it was a moment earlier. Credentials (`ci_tokens`) and the N-of-1
   trial seed and schedule are never read. A listed table the schema does not know is noted as missing
   in the manifest, not a failure. The tables and the listing are read before encryption starts, so a
   failed core read leaves no file anywhere.
@@ -477,7 +487,9 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   and size, nothing else; written under a hidden name, renamed, read back); a backup counts as complete
   only when that marker reads back and matches the file. If the marker cannot be committed the run is
   **failed** (`marker_unwritable`, failed heartbeat, exit 1) and nothing is pruned. Every marker is
-  checked before anything is removed, and an error reading one stops the prune. Only names this job
+  checked before anything is removed, by an explicit file status call (not `Path.is_file()`, which on
+  Python 3.14 calls an unreadable file absent), and every removal is decided before the first is made: an
+  error reading or checking any of this job's files stops the prune with nothing removed. Only names this job
   writes are removed (OneDrive keeps them 30 days in its recycle bin); a failed run removes nothing.
   Ciphertext a killed run left in `backup-tmp` is removed after a day.
 - **Partial and failed runs.** A confirmed document whose file is not listed or not served
@@ -500,7 +512,9 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   `%LOCALAPPDATA%\Onyx\backup-drill` (never into Supabase; refused under OneDrive, in the repo or in the
   backup folder), refuses and never extracts any member outside the pack's names, then checks every
   table's SHA-256, bytes and row count, every file's size and SHA-256, that nothing is missing or extra,
-  that every lab result's document link and every ready document's file are in the pack, that the backup
+  that every lab result's document link and every ready document's file are in the pack, that every
+  foreign key the pack's own schema declares between its tables holds and none points into a table no
+  backup holds (`references_hold`), that the backup
   recorded no problem (`backup_complete`: a partial backup never passes, even when what it holds
   verifies), and that the recovery manifest is valid and agrees with the files. It prints counts, booleans, the restore time and
   the backup's age, and removes the decrypted folder, also when a check or the decryption fails.

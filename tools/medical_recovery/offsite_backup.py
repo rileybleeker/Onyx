@@ -15,10 +15,16 @@ register-task.ps1); standard-library Python plus the `age` command-line tool (X2
            each table's row count and SHA-256 and each file's size and SHA-256; recovery-manifest.json (the
            format recovery_check.py --manifest reads) is added when the copy is complete. Tables are paged by
            primary key (a keyset cursor, never an OFFSET) and their keys are read again after the last page;
-           the copy counts only when both agree. A fully successful run commits a completeness marker
-           (.ok, checked after it is written); a run whose marker cannot be committed FAILS and prunes
-           nothing. Retention after every run that wrote a backup: the newest 8 backups, the first backup
-           of each of the 3 most recent months, and the newest backup whose marker verifies; only this
+           the copy counts only when both agree. Every foreign key between two copied tables is then
+           checked; the tables on both sides of a broken one are read again (a bounded number of times),
+           and a copy still broken, or one pointing into a table no backup holds, is partial
+           (tables_inconsistent / parent_not_recoverable). UNCOVERED_TABLES lists the hand-entered tables
+           deliberately not copied (experiment_days), recorded in every manifest. A fully successful run
+           commits a completeness marker (.ok, checked after it is written); a run whose marker cannot be
+           committed FAILS and prunes nothing. Files are checked by an explicit stat (never Path.is_file(),
+           which hides errors), and an error checking any of this job's files stops the prune. Retention
+           after every run that wrote a backup: the newest 8 backups, the first backup of each of the 3
+           most recent months, and the newest backup whose marker verifies; only this
            job's names (onyx-backup-<UTC time>.tar.age / .ok) in the backup folder are ever removed.
   drill    Decrypts the newest backup (with the private key file) into an isolated folder under
            %LOCALAPPDATA%\\Onyx\\backup-drill (never into Supabase, never under OneDrive), checks every member
@@ -50,6 +56,7 @@ import os
 import re
 import secrets
 import shutil
+import stat as stat_mod
 import subprocess
 import sys
 import tarfile
@@ -100,11 +107,21 @@ REBUILD_TABLES = (
     "finance_accounts", "finance_transactions", "finance_balance_snapshots", "finance_plan_items",
     "finance_plan_drivers", "finance_category_rules", "finance_txn_categories", "finance_budgets",
     "finance_goals", "finance_cancel_marks", "procurement_subscriptions", "procurement_flag_dismissals",
-    "experiments", "experiment_days",
+    "experiments",
 )
 # Never copied: credentials, and the N-of-1 trial seed / schedule (the arm must stay concealed from the app).
 EXCLUDED_TABLES = frozenset({"ci_tokens", "experiment_secrets", "experiment_schedule"})
+# Hand-entered tables this backup does NOT cover, and why. pds.experiment_days (trial adherence) has a
+# required foreign key into pds.experiment_schedule, which is excluded above, so a copy of it could not be
+# restored into the declared schema: it stays uncovered until the trial schedule has a recovery path of its
+# own. Listed in every manifest (uncovered_tables) and in docs/medical-records-recovery.md section 9, so the
+# gap is reported rather than hidden. Not a partial run: the gap is the same every week.
+UNCOVERED_TABLES = {"experiment_days": "parent_excluded"}
 assert not EXCLUDED_TABLES & set(REBUILD_TABLES) and not set(MEDICAL_TABLES) & set(REBUILD_TABLES)
+assert not set(UNCOVERED_TABLES) & (set(REBUILD_TABLES) | set(MEDICAL_TABLES) | EXCLUDED_TABLES)
+# Rounds of re-reading the tables on either side of a broken reference (a row and its parent written or
+# removed between the two tables' reads) before the copy is reported inconsistent.
+REFERENCE_ROUNDS = 3
 PAGE = 1000
 MAX_TABLE_ROWS = 500_000
 # One limit for both sides: the backup never packs a member larger than this (a wider table over it is left
@@ -334,6 +351,55 @@ def table_key(spec: Optional[dict], table: str) -> Optional[tuple[str, ...]]:
     return tuple(pk)
 
 
+FK_RE = re.compile(r"<fk table='([a-z_][a-z0-9_]{0,62})' column='([a-z_][a-z0-9_]{0,62})'/>")
+# Always checked, whatever the schema description says: a lab result's source document.
+MEDICAL_REFERENCES = (("lab_results", "document_id", "medical_documents", "id"),)
+
+
+def references(spec: Optional[dict], tables) -> list[tuple[str, str, str, str]]:
+    """(table, column, parent table, parent column) for every column of `tables` that PostgREST marks as a
+    foreign key (<fk table='..' column='..'/>), plus MEDICAL_REFERENCES. A composite key is checked column
+    by column (each column against its own parent column): weaker than the row check, never a false alarm."""
+    out = list(MEDICAL_REFERENCES)
+    defs = (spec or {}).get("definitions") or {}
+    for table in tables:
+        props = (defs.get(table) or {}).get("properties")
+        for col, v in (props.items() if isinstance(props, dict) else ()):
+            if isinstance(v, dict):
+                for parent, pcol in FK_RE.findall(str(v.get("description") or "")):
+                    if (table, col, parent, pcol) not in out:
+                        out.append((table, col, parent, pcol))
+    return out
+
+
+def _ref_value(v):
+    return v if isinstance(v, (str, int, bool)) else json.dumps(v, sort_keys=True)
+
+
+def broken_references(tables: dict, spec: Optional[dict]) -> set[tuple[str, str]]:
+    """(table, parent) pairs where a copied row points at a parent row the copy does not hold. Only pairs
+    whose two tables are both copied: a parent this job never copies is judged by unrecoverable_parents()
+    (an excluded or uncovered table) or is an ETL table Onyx fetches again from its source."""
+    broken: set[tuple[str, str]] = set()
+    for table, col, parent, pcol in references(spec, tables):
+        if table not in tables or parent not in tables:
+            continue
+        have = {_ref_value(r.get(pcol)) for r in tables[parent] if isinstance(r, dict) and r.get(pcol) is not None}
+        if any(isinstance(r, dict) and r.get(col) is not None and _ref_value(r.get(col)) not in have
+               for r in tables[table]):
+            broken.add((table, parent))
+    return broken
+
+
+def unrecoverable_parents(tables: dict, spec: Optional[dict]) -> bool:
+    """True when a copied row points into a table no backup holds (EXCLUDED_TABLES, UNCOVERED_TABLES): such
+    a copy could not be restored into the declared schema, so it never counts as complete."""
+    gone = EXCLUDED_TABLES | set(UNCOVERED_TABLES)
+    return any(parent in gone and table in tables
+               and any(isinstance(r, dict) and r.get(col) is not None for r in tables[table])
+               for table, col, parent, _ in references(spec, tables))
+
+
 class TableMissing(Exception):
     pass
 
@@ -510,7 +576,48 @@ def collect(target: rc.Target, *, rebuild_tables: tuple[str, ...] = REBUILD_TABL
             if e.denied:
                 raise BackupError("read_denied") from None
             snap.problem("rebuild_table_unreadable")
+    reconcile_references(target, snap, spec)
     return snap
+
+
+def reconcile_references(target: rc.Target, snap: Snapshot, spec: Optional[dict]) -> None:
+    """Each table is consistent on its own (read_table), but they are read one after another: a stack and its
+    items created (or removed) between the two reads would leave an item whose stack the copy does not hold.
+    Every reference between two copied tables is checked; the tables on both sides of a broken one are read
+    again (up to REFERENCE_ROUNDS times), and a copy still broken after that is partial
+    (tables_inconsistent), never complete. A row pointing into a table no backup holds is partial too
+    (parent_not_recoverable)."""
+    broken = broken_references(snap.tables, spec)
+    rounds = 0
+    while broken and rounds < REFERENCE_ROUNDS:
+        rounds += 1
+        involved = {t for pair in broken for t in pair}
+        for table in [t for t in list(snap.tables) if t in involved]:  # the copy's own order: medical first
+            _reread(target, snap, spec, table)
+        broken = broken_references(snap.tables, spec)
+    if broken:
+        snap.problem("tables_inconsistent")
+    if unrecoverable_parents(snap.tables, spec):
+        snap.problem("parent_not_recoverable")
+
+
+def _reread(target: rc.Target, snap: Snapshot, spec: Optional[dict], table: str) -> None:
+    """One table read again for reconcile_references(), with the first read's outcomes: a medical table that
+    cannot be read stops the run; a wider one is dropped from the copy and the run is partial."""
+    try:
+        snap.tables[table] = read_table(target, table, ("id",) if table in MEDICAL_TABLES else table_key(spec, table))
+    except TableMissing:
+        if table in MEDICAL_TABLES:
+            raise BackupError("medical_table_missing") from None
+        snap.tables.pop(table, None)
+        snap.missing_tables.append(table)
+    except rc.Unreadable as e:
+        if e.denied:
+            raise BackupError("read_denied") from None
+        if table in MEDICAL_TABLES:
+            raise BackupError(f"read_failed_{table}") from None
+        snap.tables.pop(table, None)
+        snap.problem("rebuild_table_unreadable")
 
 
 def _add(tar: tarfile.TarFile, name: str, data: bytes, mtime: float) -> None:
@@ -550,6 +657,7 @@ def write_pack(stream: BinaryIO, snap: Snapshot, target: rc.Target, now: datetim
             manifest["tables"][table] = {"rows": len(rows), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         manifest["missing_tables"] = sorted(snap.missing_tables)
         manifest["unkeyed_tables"] = sorted(snap.unkeyed_tables)
+        manifest["uncovered_tables"] = sorted(UNCOVERED_TABLES)  # known gaps, by design (see UNCOVERED_TABLES)
 
         opened: dict[str, dict] = {}
         docs = {d.get("storage_path"): d for d in snap.tables.get("medical_documents", [])}
@@ -626,13 +734,25 @@ def write_ok_marker(backup: Path) -> None:
         raise BackupError("marker_unwritable")
 
 
+def _is_regular(path: Path) -> bool:
+    """Whether `path` is a regular file, by an explicit stat: False only when it does not exist. Any other
+    filesystem error (access denied, a OneDrive file that cannot be reached) propagates. Never Path.is_file():
+    since Python 3.14 it answers False for ANY OSError, which would make an unreadable completeness marker
+    look absent and let retention prune the last complete backup."""
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return stat_mod.S_ISREG(st.st_mode)
+
+
 def marker_valid(dest: Path, backup_name: str) -> bool:
     """True when the backup's completeness marker exists, names it and matches its size. A marker that is
-    missing, empty, not this job's or for another file is not evidence. An OSError while reading one that
-    exists propagates: prune() then removes nothing (a marker it could not read must never let the last
-    complete backup look incomplete)."""
+    missing, empty, not this job's or for another file is not evidence. An OSError while checking or reading
+    one (including its stat) propagates: prune() then removes nothing (a marker it could not read must
+    never let the last complete backup look incomplete)."""
     marker, backup = dest / ok_marker(backup_name), dest / backup_name
-    if not marker.is_file() or not backup.is_file():
+    if not _is_regular(marker) or not _is_regular(backup):
         return False
     try:
         got = json.loads(marker.read_bytes().decode("utf-8"))
@@ -664,21 +784,26 @@ def prune(dest: Path, now: datetime, unlink: Callable[[Path], None] = lambda p: 
     """Removes backups outside retention_keep(), markers whose backup is not kept, and this job's own
     unfinished copies older than a day. Only names this job writes are touched (OneDrive keeps a removed
     file in its recycle bin for 30 days). Every marker is checked BEFORE anything is removed; an error while
-    reading one stops the prune with nothing removed. Returns how many backups and stale copies were removed."""
-    names = [p.name for p in dest.iterdir() if p.is_file()]
+    reading one stops the prune with nothing removed. Every entry with one of this job's names is checked by
+    an explicit stat (_is_regular), and every removal is decided before the first one is made: a filesystem
+    error anywhere in that stops the prune with nothing removed. Returns how many backups and stale copies
+    were removed."""
+    ours = [p for p in dest.iterdir() if NAME_RE.match(p.name) or OK_RE.match(p.name) or DEST_PARTIAL_RE.match(p.name)]
+    names = [p.name for p in ours if _is_regular(p)]
     complete = {n for n in names if NAME_RE.match(n) and ok_marker(n) in names and marker_valid(dest, n)}
     keep = retention_keep(names, complete)
     kept_markers = {ok_marker(n) for n in keep}
-    removed = 0
+    plan: list[tuple[Path, bool]] = []  # (path, counts as a removed backup or stale copy)
     for name in names:
         path = dest / name
-        stale_partial = DEST_PARTIAL_RE.match(name) and now.timestamp() - path.stat().st_mtime > 86400
+        stale_partial = bool(DEST_PARTIAL_RE.match(name)) and now.timestamp() - path.stat().st_mtime > 86400
         if (NAME_RE.match(name) and name not in keep) or stale_partial:
-            unlink(path)
-            removed += 1
+            plan.append((path, True))
         elif OK_RE.match(name) and name not in kept_markers:
-            unlink(path)
-    return removed
+            plan.append((path, False))
+    for path, _counted in plan:
+        unlink(path)
+    return sum(1 for _, counted in plan if counted)
 
 
 def clear_stale_tmp(tmp: Path, now: datetime) -> None:
@@ -906,7 +1031,7 @@ def _verify(run_dir: Path, seen: dict, report: DrillReport) -> None:
     c["manifest_valid"] = ok
     if not ok:
         for k in ("backup_complete", "tables_match", "objects_match", "no_unlisted_members", "medical_links_hold",
-                  "recovery_manifest_valid"):
+                  "references_hold", "recovery_manifest_valid"):
             c[k] = False if "decrypted" in c and c["decrypted"] else None
         return
     # A backup that recorded a problem (a wider table it could not read, a file it could not copy) is not a
@@ -951,6 +1076,18 @@ def _verify(run_dir: Path, seen: dict, report: DrillReport) -> None:
     ready_ok = all(f"objects/{d.get('storage_path')}" in seen for d in docs
                    if isinstance(d, dict) and d.get("status") == "ready")
     c["medical_links_hold"] = links_ok and ready_ok if "medical_documents" in parsed and "lab_results" in parsed else False
+    # Every reference the pack's own schema declares, between the tables it holds (a row whose parent row is
+    # not in the copy could not be restored), and none into a table no backup holds. Unknown without a schema.
+    spec = None
+    if manifest.get("schema") and "schema/openapi.json" in seen:
+        try:
+            spec = json.loads((run_dir / "schema" / "openapi.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            spec = None
+    if isinstance(spec, dict) and tables_ok:
+        c["references_hold"] = not broken_references(parsed, spec) and not unrecoverable_parents(parsed, spec)
+    else:
+        c["references_hold"] = False if not tables_ok else None
     if manifest.get("recovery_manifest"):
         try:
             rec = json.loads((run_dir / "recovery-manifest.json").read_text(encoding="utf-8"))

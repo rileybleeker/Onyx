@@ -59,6 +59,16 @@ export function backupCodeMessage(code: string): string {
   if (code === "rebuild_table_unreadable" || code === "schema_unread" || code === "table_too_large"
       || code === "schema_too_large")
     return `Part of the wider table copy was skipped (${code}); the medical records were copied.`;
+  if (code === "rebuild_table_unkeyed")
+    return "A wider table has no primary key the backup can page by (rebuild_table_unkeyed): run the dry run to see which, then give it a key or drop it from REBUILD_TABLES.";
+  if (code === "listing_changed")
+    return "Medical files were being added or removed while the backup listed them (listing_changed); the next run retries.";
+  if (code === "tables_inconsistent")
+    return "Tables kept changing while they were copied, so a row's parent row was missing from the copy (tables_inconsistent); the next run retries.";
+  if (code === "parent_not_recoverable")
+    return "A copied row points into a table no backup holds (parent_not_recoverable): see UNCOVERED_TABLES in the backup job.";
+  if (code === "marker_unwritable")
+    return "The backup was written but its completeness marker could not be saved (marker_unwritable): check write access to the OneDrive backup folder; nothing was pruned.";
   if (code === "locked") return "A backup run was already in progress (locked).";
   if (code.startsWith("crash_")) return `The backup job stopped with an error (${code}): see %LOCALAPPDATA%\\Onyx\\medical-backup\\backup.log.`;
   return `The last backup reported ${code}.`;
