@@ -165,11 +165,14 @@ export async function PATCH(req: NextRequest) {
     .update(patch)
     .eq("event_id", body.event_id)
     .select("event_id,event_date,event_time,kind,notes")
-    .single();
+    .maybeSingle();
 
   if (error) {
     console.error("api/meals PATCH", error.message);
     return NextResponse.json({ error: "Couldn't save that meal. Try again." }, { status: 500 });
+  }
+  if (!data) {
+    return NextResponse.json({ error: "That meal no longer exists." }, { status: 404 });
   }
   return NextResponse.json(data);
 }
