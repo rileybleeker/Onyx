@@ -168,8 +168,8 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
         stop_reason: json.stop_reason,
       });
       setStep("review");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+    } catch {
+      setError("Couldn't read that label. Try again or enter it by hand.");
       setStep("upload");
     }
   }, []);
@@ -256,8 +256,8 @@ export default function CustomSupplementFlow({ logDate, onSaved, onLogged, onBac
       }
 
       await onSaved();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+    } catch {
+      setError("Couldn't save this supplement. Try again.");
     } finally {
       setSaving(false);
     }
