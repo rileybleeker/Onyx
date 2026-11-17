@@ -93,7 +93,7 @@ jobs:
           sudo xcode-select -s "$NEWEST"
           xcodebuild -version
 
-      # The development private key was generated once on Riley's PC
+      # The development private key was generated once on the signing PC
       # (~/.onyx-ios-signing/onyx_dev.key) and stored as IOS_DEV_KEY_B64.
       - name: Prepare signing key
         env:
