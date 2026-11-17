@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { whoopStepsDay, type WhoopStepsRow } from "@/lib/steps";
 import { CHAT_SCOPE, MAX_TOOL_ROUNDS, MAX_TOOL_CALLS, REQUEST_ID_RE, RETRIEVED_DATA_NOTE, parseRequestId, validateChatMessages } from "@/lib/chat-contract";
-import { authorizeWrite, chatWritesOff, newWriteUsage, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
+import { authorizeWrite, chatWritesOff, commitWrite, newWriteUsage, writeGrantFor, type ReadingBooks } from "@/lib/chat-write-intent";
 import { WRITE_GATE, WRITE_GATE_QUIZ, WRITE_GATE_REQUEST_ONLY, buildWriteReceipt, isWriteTool, type WriteReceipt } from "@/lib/chat-receipts";
 import { conversationSha, openLedger, supabaseLedgerStore, supabaseReconcilers, uncertainText, type ChatLedger, type OpenedLedger } from "@/lib/chat-operations";
 import { createSupabaseServer } from "@/lib/supabase-server";
