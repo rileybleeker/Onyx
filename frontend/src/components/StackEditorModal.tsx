@@ -4,9 +4,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { AutosaveRefused } from "@/lib/autosave";
 import {
+  STACK_CHANGED_ELSEWHERE,
   StackConflict,
   StackSaveChain,
   StackSaveUnconfirmed,
+  stackSaveFailureText,
   stackSaveRequest,
   stackSaveUnknownOutcome,
 } from "@/lib/supplement-stack-chain";
@@ -73,8 +75,6 @@ async function readVersion(stackId: number): Promise<number | null> {
   return json?.stacks?.find((s) => s.stack_id === stackId)?.version ?? null;
 }
 
-const STACK_CHANGED_ELSEWHERE = "This stack was changed somewhere else. Load the latest version, then make your change again.";
-
 /** One random id per new stack: a retried create (lost answer) then returns the same stack instead of a second. */
 function newClientKey(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -129,6 +129,8 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
     // After an unconfirmed save the stack may hold that value: changing back to the loaded values is then sent (as a
     // newer save after the unanswered one), never dropped as "unchanged" with the unwanted change left stored.
     unknownOutcome: stackSaveUnknownOutcome,
+    // A conflict shows its changed-elsewhere guidance; every other failure shows the fixed plain copy.
+    describeError: stackSaveFailureText,
     save: async (f, { keepalive }) => {
       const body = {
         name: f.name.trim(),
