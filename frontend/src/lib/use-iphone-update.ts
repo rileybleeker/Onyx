@@ -30,3 +30,13 @@ export function useIphoneUpdate(): EverythingUpdate {
   }, []);
   return { status, webBehind: behind };
 }
+
+/** True inside the installed home-screen app. Read after mount so server and first client render agree. */
+export function useStandaloneApp(): boolean {
+  const [standalone, setStandalone] = useState(false);
+  useEffect(() => {
+    const nav = navigator as Navigator & { standalone?: boolean };
+    setStandalone(nav.standalone === true || window.matchMedia("(display-mode: standalone)").matches);
+  }, []);
+  return standalone;
+}

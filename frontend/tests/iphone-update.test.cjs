@@ -51,3 +51,12 @@ test('trust step only when the installed build predates the current certificate'
   assert.equal(u.needsTrustStep(null, '200'), false);
   assert.equal(u.needsTrustStep({ version: '0.1.0', build: '100' }, null), false);
 });
+
+test('update button href: Safari hand-off inside the home-screen app, direct link in Safari', () => {
+  const link = 'itms-services://?action=download-manifest&url=https%3A%2F%2Fx';
+  assert.equal(u.updateHref(link, true, 'https://onyx.example'), 'x-safari-https://onyx.example/install?auto=1');
+  assert.equal(u.updateHref(null, true, 'https://onyx.example'), 'x-safari-https://onyx.example/install?auto=1');
+  assert.equal(u.updateHref(link, false, 'https://onyx.example'), link);
+  assert.equal(u.updateHref(null, false, 'https://onyx.example'), null);
+  assert.equal(u.updateHref(link, true, 'http://localhost:3000'), null);
+});
