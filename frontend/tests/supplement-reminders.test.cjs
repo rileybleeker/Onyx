@@ -542,19 +542,21 @@ test('respond log: a definite refusal (check violation) says not saved, puts the
   assert.equal(intakeRows(db, 4).length, 2);
 });
 
-test('respond log: an unconfirmed outcome (connection lost) says it may be saved and settles nothing', async () => {
+test('respond log: an unconfirmed outcome (connection lost) says it may be saved and keeps the reminder logged', async () => {
   const db = await claimed(makeDb());
   // 08006 = connection_failure, class 08: not on the refusal allowlist, so the outcome is unknown —
   // the writer must answer the conservative "may have been saved anyway" message, never "not saved".
   db.failOn = (table, op) => (table === 'supplement_intake' && op === 'insert' ? { message: 'connection lost', code: '08006' } : null);
   const res = await respond(db, LOG);
-  assert.equal(res.httpStatus, 400);
+  // #786: the insert may have committed, so the reminder stays logged (a later tap answers already-logged
+  // and the stable event key makes any retry a replay); only a definite refusal reverts (test above).
+  assert.equal(res.httpStatus, 502);
   assert.equal(res.body.ok, false);
   assert.equal(res.body.error, stacks.STACK_MAYBE_LOGGED);
   assert.match(res.body.error, /may have been saved anyway/);
   assert.match(res.body.error, /Do not log it again/);
-  assert.equal(reminders(db)[0].status, 'prompted', 'not marked skipped or logged');
-  assert.equal(reminders(db)[0].responded_at, null);
+  assert.equal(reminders(db)[0].status, 'logged', 'not reverted: the write may have landed');
+  assert.notEqual(reminders(db)[0].responded_at, null);
   assert.equal(intakeRows(db, 4).length, 0);
 });
 

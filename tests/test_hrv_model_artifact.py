@@ -1149,7 +1149,14 @@ def test_forecast_workflow_never_saves_a_restored_model():
     assert env["HRV_MODEL_PIN_BLOCKED"] == "${{ steps.select.outputs.pin_blocked }}"
     assert env["HRV_MODEL_PIN_REASON"] == "${{ steps.select.outputs.pin_reason }}"
     assert env["HRV_MODEL_SELECTED_SHA256"] == "${{ steps.select.outputs.sha }}"
-    assert env["HRV_MODEL_RESTORED"] == "${{ steps.model-cache.outputs.cache-hit }}"
+    # PIPE-08-R4 (#791): an exact cache hit OR a checked restore from the durable bucket counts as restored.
+    assert env["HRV_MODEL_RESTORED"] == (
+        "${{ (steps.model-cache.outputs.cache-hit == 'true' || steps.durable.outcome == 'success')"
+        " && 'true' || '' }}")
+    durable = next(s for s in steps if s.get("id") == "durable")
+    assert durable["if"] == ("steps.select.outputs.found == 'true' && "
+                             "steps.model-cache.outputs.cache-hit != 'true'")
+    assert 'fetch --sha "${{ steps.select.outputs.sha }}"' in durable["run"]
     assert env["HRV_MODEL_REGISTRY"] == "${{ steps.select.outputs.registry }}"
     # the publication outcome of a model trained in this run reaches the forecast heartbeat:
     # the publish step's output when it succeeded, not_published when it failed or was skipped
