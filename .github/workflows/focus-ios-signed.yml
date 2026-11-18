@@ -338,7 +338,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           EXPECT_BUNDLE_ID: ${{ env.MAIN_BUNDLE_ID }}
           PUBLISH_PREFIX: screentime-focus
-        IDENTITY_SHA1: ${{ env.IDENTITY_SHA1 }}
+          IDENTITY_SHA1: ${{ env.IDENTITY_SHA1 }}
         run: python3 tools/screentime_ios/ci/publish_build.py
 
       - name: Clean up keychain and profiles
