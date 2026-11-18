@@ -1,4 +1,4 @@
-import { AutosaveRefused } from "@/lib/autosave";
+import { AutosaveRefused, plainSaveFailure } from "@/lib/autosave";
 
 /**
  * The stack editor's side of the versioned save (audit PROD-07; server: lib/supplement-stack-save.ts and
@@ -83,6 +83,17 @@ export class StackConflict extends AutosaveRefused {
     super(message);
     this.name = "StackConflict";
   }
+}
+
+/** The guidance the editor shows when the stack changed somewhere else (its conflict panel offers the same action). */
+export const STACK_CHANGED_ELSEWHERE = "This stack was changed somewhere else. Load the latest version, then make your change again.";
+
+/**
+ * The autosave status text for a failed stack save (the editor's describeError): a conflict keeps its own guidance,
+ * every other failure gets the fixed plain copy (no server words).
+ */
+export function stackSaveFailureText(e: unknown): string {
+  return e instanceof StackConflict ? STACK_CHANGED_ELSEWHERE : plainSaveFailure(e);
 }
 
 /** Shown when no clear answer came back (mirrors STACK_UNCONFIRMED_MESSAGE in lib/supplement-stack-save.ts). */

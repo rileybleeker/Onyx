@@ -855,3 +855,14 @@ test("the route saves only through the function; the editor sends versions and h
   assert.match(page, /onClick=\{\(\) => void loadStacks\(\{ blocking: true \}\)\}/);
   assert.doesNotMatch(page, /console\.error\("Stacks load:", e\);\s+\}/, "a failed read is never swallowed");
 });
+
+test("the stack editor's failed-save text: a conflict keeps the changed-elsewhere guidance, anything else is the fixed copy", () => {
+  const guidance = "This stack was changed somewhere else. Load the latest version, then make your change again.";
+  assert.equal(chainLib.STACK_CHANGED_ELSEWHERE, guidance);
+  assert.equal(chainLib.stackSaveFailureText(new chainLib.StackConflict("Invented server text")), guidance);
+  const other = [new autosave.AutosaveRefused("Invented refusal text"), new Error("Invented network text"), { error: "x" }];
+  for (const e of other) assert.equal(chainLib.stackSaveFailureText(e), autosave.SAVE_FAILED_COPY);
+  const modal = fs.readFileSync(path.join(SRC, "components/StackEditorModal.tsx"), "utf8");
+  assert.match(modal, /describeError: stackSaveFailureText,/, "the editor's autosaver describes its failures with the conflict-aware text");
+  assert.doesNotMatch(modal, /const STACK_CHANGED_ELSEWHERE/, "the guidance text lives in the lib, once");
+});
