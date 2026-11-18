@@ -33,7 +33,8 @@ Now:
 CLI, run by the two HRV workflows (outputs go to $GITHUB_OUTPUT):
     python hrv_model_artifact.py select               # forecast: which artifact to restore
     python hrv_model_artifact.py key                  # training: cache key of the model just trained
-    python hrv_model_artifact.py publish --saved true # training: add it to the registry
+    python hrv_model_artifact.py publish --saved true # training: store durably, add to the registry
+    python hrv_model_artifact.py fetch --sha <sha256> # forecast: cache miss -> private bucket copy
 
 Logs carry checksum prefixes, dates and error categories only: never model contents, health
 values or exception text (Actions logs are public).
@@ -84,6 +85,8 @@ COMPATIBLE_PARTS = {"python": 2, "numpy": 1}
 # A training that is not published reports on the HRV Retrain card (/status reads the newest row
 # of this pair), because the hourly forecast then keeps serving the previous model.
 RETRAIN_HEARTBEAT = ("hrv_analysis", "retrain")
+# Private Storage bucket (sql/hrv_model_artifacts_bucket.sql) holding every published artifact.
+DURABLE_BUCKET = "hrv-models"
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -606,6 +609,45 @@ def run_problem(manifest: Mapping, env: Mapping[str, str]) -> str | None:
     return None
 
 
+def _storage_paths(sha: str) -> tuple[str, str]:
+    return f"{sha}/{MODEL_PATH.name}", f"{sha}/{manifest_path_for(MODEL_PATH).name}"
+
+
+def store_durable(db, manifest: Mapping, model_path: Path = MODEL_PATH) -> None:
+    """Copy the verified artifact into the private bucket (audit PIPE-08-R4: the Actions cache
+    evicts entries after 7 days of no use and is not a store of record). Content-addressed by the
+    checksum, so storing the same artifact again writes the same bytes."""
+    sha = manifest["artifact_sha256"]
+    data = model_path.read_bytes()
+    if sha256_bytes(data) != sha:
+        raise ArtifactError(f"GUARD model_publish: pickle changed since it was verified ({sha[:12]}).")
+    pkl_path, man_path = _storage_paths(sha)
+    bucket = db.storage.from_(DURABLE_BUCKET)
+    opts = {"content-type": "application/octet-stream", "upsert": "true"}
+    bucket.upload(pkl_path, data, opts)
+    bucket.upload(man_path, manifest_path_for(model_path).read_bytes(), opts)
+    back = bucket.download(pkl_path)
+    if sha256_bytes(back) != sha:
+        raise ArtifactError(f"Model not published: the stored copy of {sha[:12]} did not read back "
+                            "identical.")
+
+
+def restore_durable(db, sha: str, model_path: Path = MODEL_PATH) -> None:
+    """Fetch artifact `sha` from the private bucket into place. Checks the bytes against the
+    selected checksum BEFORE writing anything, so nothing else can ever land on disk."""
+    if not _is_hex(sha, _HEX64):
+        raise ArtifactError("GUARD model_artifact: not a SHA-256 checksum")
+    pkl_path, man_path = _storage_paths(sha)
+    bucket = db.storage.from_(DURABLE_BUCKET)
+    data = bucket.download(pkl_path)
+    if sha256_bytes(data) != sha:
+        raise ArtifactError(f"GUARD model_artifact: stored copy of {sha[:12]} does not match its checksum.")
+    manifest_bytes = bucket.download(man_path)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(manifest_path_for(model_path), manifest_bytes)
+    _atomic_write(model_path, data)
+
+
 def publish(db, manifest: Mapping) -> str:
     """Add the artifact to the registry. 'published', or 'already_published' when the same
     checksum is there with the same provenance (a retried publish changes nothing)."""
@@ -789,6 +831,7 @@ def cmd_publish(args, db=None) -> int:
             raise ArtifactError(f"Model not published: artifact {sha} trained, but it is not in the "
                                 "Actions cache; the forecast keeps serving the previous model.")
         db = db if db is not None else _client()
+        store_durable(db, manifest)
         outcome = publish(db, manifest)
     except ArtifactError as e:
         log.error(str(e))
@@ -806,6 +849,22 @@ def cmd_publish(args, db=None) -> int:
     return 0
 
 
+def cmd_fetch(args, db=None) -> int:
+    """Forecast: restore the selected artifact from the durable bucket when the Actions cache no
+    longer holds it. Fails the step (the predictor then refuses to forecast) rather than serve
+    anything else."""
+    try:
+        restore_durable(db if db is not None else _client(), args.sha)
+    except ArtifactError as e:
+        log.error(str(e))
+        return 1
+    except Exception as e:  # noqa: BLE001
+        log.error(f"Durable model copy could not be fetched ({_error_code(e)}).")
+        return 1
+    log.info(f"Restored model artifact {args.sha[:12]} from durable storage.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                         datefmt="%H:%M:%S")
@@ -815,8 +874,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("key", help="training: print the cache key of the artifact just trained")
     pub = sub.add_parser("publish", help="training: add the artifact just trained to the registry")
     pub.add_argument("--saved", default="", help="'true' when the exact cache key restores")
+    fetch = sub.add_parser("fetch", help="forecast: restore the selected artifact from durable storage")
+    fetch.add_argument("--sha", required=True, help="checksum of the selected artifact")
     args = parser.parse_args(argv)
-    return {"select": cmd_select, "key": cmd_key, "publish": cmd_publish}[args.command](args)
+    return {"select": cmd_select, "key": cmd_key, "publish": cmd_publish,
+            "fetch": cmd_fetch}[args.command](args)
 
 
 if __name__ == "__main__":

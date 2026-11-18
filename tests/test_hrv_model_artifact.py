@@ -256,6 +256,30 @@ class _FakeDb:
         self.fail_reads: set[str] = set()
         self.fail_writes: set[str] = set()
         self.missing_tables: set[str] = set()
+        self.files: dict[str, bytes] = {}
+        self.fail_storage = False
+
+    @property
+    def storage(self):
+        db = self
+
+        class _Bucket:
+            def upload(self, path, data, _opts=None):
+                if db.fail_storage:
+                    raise RuntimeError("storage down")
+                db.files[path] = bytes(data)
+
+            def download(self, path):
+                if db.fail_storage or path not in db.files:
+                    raise RuntimeError("missing")
+                return db.files[path]
+
+        class _Storage:
+            def from_(self, bucket):
+                assert bucket == ma.DURABLE_BUCKET
+                return _Bucket()
+
+        return _Storage()
 
     def schema(self, _name):
         return self
@@ -1200,6 +1224,33 @@ def test_no_target_shift_and_no_secrets_in_logs():
         if "log." in line and "{e}" in line:
             raise AssertionError(f"exception text in a log line: {line.strip()}")
     print("PASS: the artifact module builds no outcome and logs no exception text")
+
+
+def test_durable_copy_survives_cache_eviction_and_blocks_a_failed_store():
+    cache, db = _FakeCache(), _FakeDb()
+    m = _train(cache, db, "700", commit_h=1, cutoff="2026-11-01")
+    sha = m["artifact_sha256"]
+    assert f"{sha}/xgboost_hrv_model.pkl" in db.files
+    with _workspace() as ws:  # cache entry gone: only the bucket holds the artifact
+        ma.restore_durable(db, sha)
+        assert ma.sha256_bytes((ws / "analysis_output" / "xgboost_hrv_model.pkl").read_bytes()) == sha
+    db.files[f"{sha}/xgboost_hrv_model.pkl"] = b"tampered"
+    with _workspace() as ws:
+        try:
+            ma.restore_durable(db, sha)
+            raise AssertionError("tampered copy restored")
+        except ma.ArtifactError:
+            assert not (ws / "analysis_output" / "xgboost_hrv_model.pkl").exists()
+    cache2, db2 = _FakeCache(), _FakeDb()
+    db2.fail_storage = True
+    with _workspace() as ws, _environ(**_run_env("701")):
+        man = ma.write_artifact(_bundle(), _provenance(run_id="701", commit_offset_h=1,
+                                cutoff="2026-11-01", trained_offset_h=1, deps=ma.dependency_versions()),
+                                Path("analysis_output") / "xgboost_hrv_model.pkl")
+        cache2.save(man["cache_key"], ws)
+        assert ma.cmd_publish(_Args("true"), db=db2) == 1
+    assert db2.registry() == []
+    print("PASS: durable copy restores after eviction; tampering and a failed store publish nothing")
 
 
 if __name__ == "__main__":
