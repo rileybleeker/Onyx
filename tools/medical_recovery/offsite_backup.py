@@ -102,20 +102,22 @@ TMP_RE = re.compile(r"^onyx-backup-\d{8}T\d{6}Z\.tar\.age\.tmp$")
 # backups can never push the last complete one out. A run whose marker cannot be committed is a failed run.
 OK_RE = re.compile(r"^onyx-backup-(\d{8}T\d{6}Z)\.ok$")
 KEEP_WEEKLY, KEEP_MONTHLY = 8, 3
-# The OneDrive cloud-files (cfapi) state of the ciphertext itself, read from the file's own attributes with
-# GetFileAttributesW — the same bits `attrib` prints. A backup counts as off-site only when the cloud filter
-# OWNS the file: OneDrive converts a local file into a cloud-files placeholder (a reparse-point directory
-# entry) once the sync engine has taken it into the cloud, so one of these bits is the cloud's receipt for
-# it; a plain local file (no bit set) is not confirmed off-site. Exact attribute bits used:
-#   0x00001000  FILE_ATTRIBUTE_OFFLINE                 online-only placeholder: all its data is in the cloud
-#   0x00040000  FILE_ATTRIBUTE_RECALL_ON_OPEN         placeholder: opening it needs the cloud
-#   0x00400000  FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS  placeholder: data is fetched on first read
-#   0x00080000  FILE_ATTRIBUTE_PINNED                 "always keep on this device" (attrib +p)
-#   0x00100000  FILE_ATTRIBUTE_UNPINNED              "free up space" (attrib +u)
-#   0x00000400  FILE_ATTRIBUTE_REPARSE_POINT         a cloud-files placeholder directory entry
-# (a fully hydrated synced file keeps its placeholder reparse point, so the bits survive upload).
-INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
-CLOUD_ATTRIBUTE_MASK = 0x00001000 | 0x00040000 | 0x00400000 | 0x00080000 | 0x00100000 | 0x00000400
+# The OneDrive cloud-files (cfapi) state of the ciphertext itself. A backup counts as off-site only when the
+# cloud filter says, explicitly, that this file's placeholder is IN SYNC with the cloud
+# (CfGetPlaceholderStateFromFindData, cldapi.dll: CF_PLACEHOLDER_STATE_PLACEHOLDER and
+# CF_PLACEHOLDER_STATE_IN_SYNC both set). Microsoft keeps that in-sync state separate from the pin state
+# (CF_PLACEHOLDER_BASIC_INFO has InSyncState and PinState) and the placeholder/pin attribute bits
+# (FILE_ATTRIBUTE_PINNED / UNPINNED / OFFLINE / RECALL_ON_* / REPARSE_POINT): a pin is user intent and a
+# placeholder can exist while its current contents are still uploading, so no attribute bit alone is
+# evidence that this replacement reached the cloud (Codex BACKUP449-1 on #484). Anything else (not a
+# placeholder, not in sync, invalid, unreadable, off Windows) reads pending_upload.
+CF_PLACEHOLDER_STATE_PLACEHOLDER = 0x00000001
+CF_PLACEHOLDER_STATE_IN_SYNC = 0x00000008
+CF_PLACEHOLDER_STATE_INVALID = 0xFFFFFFFF
+# The evidence a remote confirmation records. Confirmations without it were recorded by the old
+# attribute-bit predicate (any placeholder or pin bit counted as in sync) and are not trusted: they no
+# longer count for retention until a new run re-confirms with the explicit in-sync state.
+CONFIRMATION_EVIDENCE = "cfapi_in_sync"
 # Bounded wait for OneDrive to take the new ciphertext into the cloud (a large backup over a slow link can
 # take minutes): polled until the file's state reads in sync, else the run reports pending_upload.
 SYNC_WAIT_SECONDS, SYNC_POLL_SECONDS = 300, 10
@@ -239,34 +241,57 @@ def onedrive_sync_ready(dest: Path) -> bool:
         return False
 
 
-def file_attributes(path: Path) -> Optional[int]:
-    """The file's attributes from GetFileAttributesW (ctypes; standard library only). None when they cannot
-    be read, or off Windows — the caller treats that as unconfirmed, never as success."""
+def placeholder_state(path: Path) -> Optional[int]:
+    """The file's CF_PLACEHOLDER_STATE from the cloud filter: FindFirstFileW, then
+    CfGetPlaceholderStateFromFindData (cldapi.dll; ctypes, standard library only). None when it cannot be
+    read, is INVALID, or off Windows — the caller treats that as unconfirmed, never as success."""
     if os.name != "nt":
         return None
     try:
         import ctypes
+        from ctypes import wintypes
+
+        class WIN32_FIND_DATAW(ctypes.Structure):
+            _fields_ = [("dwFileAttributes", wintypes.DWORD), ("ftCreationTime", wintypes.FILETIME),
+                        ("ftLastAccessTime", wintypes.FILETIME), ("ftLastWriteTime", wintypes.FILETIME),
+                        ("nFileSizeHigh", wintypes.DWORD), ("nFileSizeLow", wintypes.DWORD),
+                        ("dwReserved0", wintypes.DWORD), ("dwReserved1", wintypes.DWORD),
+                        ("cFileName", ctypes.c_wchar * 260), ("cAlternateFileName", ctypes.c_wchar * 14)]
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetFileAttributesW.restype = ctypes.c_uint32
-        kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
-        attrs = kernel32.GetFileAttributesW(str(path))
-    except (OSError, AttributeError, ValueError):
+        cldapi = ctypes.WinDLL("cldapi", use_last_error=True)
+        kernel32.FindFirstFileW.restype = wintypes.HANDLE
+        kernel32.FindFirstFileW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(WIN32_FIND_DATAW)]
+        kernel32.FindClose.argtypes = [wintypes.HANDLE]
+        cldapi.CfGetPlaceholderStateFromFindData.restype = ctypes.c_uint32
+        cldapi.CfGetPlaceholderStateFromFindData.argtypes = [ctypes.POINTER(WIN32_FIND_DATAW)]
+        data = WIN32_FIND_DATAW()
+        handle = kernel32.FindFirstFileW(str(path), ctypes.byref(data))
+        if handle is None or handle == wintypes.HANDLE(-1).value:
+            return None
+        try:
+            state = int(cldapi.CfGetPlaceholderStateFromFindData(ctypes.byref(data)))
+        finally:
+            kernel32.FindClose(handle)
+    except (OSError, AttributeError, ValueError, TypeError):
         return None
-    return None if attrs == INVALID_FILE_ATTRIBUTES else int(attrs)
+    return None if state == CF_PLACEHOLDER_STATE_INVALID else state
 
 
 def onedrive_cloud_state(path: Path) -> str:
-    """The ciphertext's own cloud-files state: "in_sync" when OneDrive's cloud filter owns the file (any
-    placeholder attribute bit, CLOUD_ATTRIBUTE_MASK — see the constants above), which is the cloud's
-    receipt that the upload happened; "pending_upload" for a plain local file, off Windows, outside a
-    OneDrive root, or when the attributes cannot be read. Never answers in_sync on inference."""
+    """The ciphertext's own cloud-files state: "in_sync" only when the cloud filter reports this file as a
+    placeholder that is explicitly IN SYNC with the cloud (placeholder_state; see the constants above);
+    "pending_upload" for anything else: a plain local file, a placeholder that is not in sync (still
+    uploading, out of sync), a pinned or unpinned file whose sync state says nothing, an unreadable or
+    invalid state, off Windows, or outside a OneDrive root. Attribute bits alone (placeholder, pin) are
+    never evidence. Never answers in_sync on inference."""
     if os.name != "nt" or not under_onedrive(path):
         return "pending_upload"
-    attrs = file_attributes(path)
-    if attrs is None:
+    state = placeholder_state(path)
+    if state is None:
         return "pending_upload"
-    return "in_sync" if attrs & CLOUD_ATTRIBUTE_MASK else "pending_upload"
+    wanted = CF_PLACEHOLDER_STATE_PLACEHOLDER | CF_PLACEHOLDER_STATE_IN_SYNC
+    return "in_sync" if state & wanted == wanted else "pending_upload"
 
 
 def offsite_confirmed(backup: Path, dest: Path, *, wait_seconds: int = SYNC_WAIT_SECONDS,
@@ -893,7 +918,8 @@ def record_remote_confirmation(dest: Path, backup_name: str, *, now: Optional[da
         raise BackupError("state_unsafe")
     size = (dest / backup_name).stat().st_size
     recs = load_remote_confirmations(p)
-    recs[backup_name] = {"size": size, "confirmed_at": (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")}
+    recs[backup_name] = {"size": size, "evidence": CONFIRMATION_EVIDENCE,
+                         "confirmed_at": (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")}
     p.parent.mkdir(parents=True, exist_ok=True)
     partial = p.parent / f".{p.name}.partial"
     partial.write_bytes(_dump({"backups": recs}))
@@ -902,14 +928,17 @@ def record_remote_confirmation(dest: Path, backup_name: str, *, now: Optional[da
 
 def remote_confirmed_names(dest: Path, confirmations: dict) -> set:
     """Which of the record's confirmations still describe a backup in `dest`: the name is one of this
-    job's, the file is a regular file and its size is the recorded size (a record whose file changed no
-    longer describes it). A stat error propagates, so a confirmation that cannot be checked stops the
+    job's, the record carries the explicit in-sync evidence (CONFIRMATION_EVIDENCE; older records from the
+    attribute-bit predicate do not count), the file is a regular file and its size is the recorded size (a
+    record whose file changed no longer describes it). A stat error propagates, so a confirmation that cannot be checked stops the
     prune rather than letting the backup look unconfirmed."""
     out: set = set()
     for name, rec in (confirmations or {}).items():
         if not NAME_RE.match(name) or not isinstance(rec, dict):
             continue
         path = dest / name
+        if rec.get("evidence") != CONFIRMATION_EVIDENCE:
+            continue  # recorded by the old attribute-bit predicate: not evidence of a remote copy
         if not _is_regular(path):
             continue
         size = rec.get("size")
