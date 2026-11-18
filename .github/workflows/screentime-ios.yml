@@ -78,7 +78,9 @@ jobs:
 
   signed:
     name: Signed development build
-    if: github.event_name == 'workflow_dispatch'
+    # Also on every merge to master that touches the app (2026-11-18): the phone's /install card and
+    # Today's update-ready card always offer the newest build without a manual run.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -435,7 +437,7 @@ jobs:
 
       # Private bucket + the session-protected Onyx /install page. No artifact, no links in the log.
       - name: Publish for over-the-air install
-        if: ${{ inputs.publish }}
+        if: ${{ github.event_name == 'push' || inputs.publish }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
