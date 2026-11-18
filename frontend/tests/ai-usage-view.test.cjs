@@ -179,9 +179,102 @@ test("the AI section draws its tiles, split and top projects next to the phone p
   }
   assert.ok(html.includes("data-charts")); // the phone charts are still there
   assert.ok(!html.includes(AI_EMPTY));
+  assert.ok(!html.includes("partial upload") && !html.includes("it failed"));
 
   const failed = draw(okView({ ...ai, sync: { status: "failed", at: "2030-03-01T15:00:00Z" } }));
-  assert.ok(failed.includes("see the AI Tool Usage card on Status"));
+  assert.ok(failed.includes("it failed; see the "));
+  assert.ok(failed.includes('href="/status"') && failed.includes("AI Tool Usage card on Status</a>"));
+});
+
+test("a partial upload shows its own visible line linking the AI Tool Usage card on Status (AI814-2)", () => {
+  const ai = { ...A.summarizeAi([row("2030-03-01", "codex", "alpha")]), sync: { status: "partial", at: "2030-03-01T15:00:00Z" } };
+  const html = draw(okView(ai));
+  assert.ok(html.includes("partial upload"), "partial line");
+  assert.ok(html.includes('href="/status"') && html.includes("AI Tool Usage card on Status</a>"));
+  assert.ok(!html.includes("it failed"));
+  // The same line on the empty AI section and under the phone's empty screen.
+  const empty = draw(okView({ kind: "empty", sync: { status: "partial", at: "2030-03-01T15:00:00Z" } }));
+  assert.ok(empty.includes(AI_EMPTY) && empty.includes("partial upload"));
+  const phoneEmpty = draw({ kind: "empty", windowDays: 30, sync: null, ai });
+  assert.ok(phoneEmpty.includes("partial upload"));
+});
+
+test("concurrent Claude Code and Codex minutes are summed, and the tiles say so (AI814-3)", () => {
+  // 21:00-22:00 in both tools at once on one synthetic day: 60 wall-clock minutes, 120 summed tool minutes.
+  const s = A.summarizeAi([
+    row("2030-03-01", "claude_code", "alpha", { active_minutes: 60, late_active_minutes: 60 }),
+    row("2030-03-01", "codex", "beta", { active_minutes: 60, late_active_minutes: 60 }),
+  ]);
+  assert.equal(s.activePerDay, 120);
+  assert.equal(s.latePerDay, 120);
+  const html = draw(okView({ ...s, sync: null }));
+  assert.ok(html.includes("Tool minutes, summed") && html.includes("Late tool minutes, summed"));
+  assert.ok(html.includes('aria-label="About Tool minutes, summed"'));
+  assert.ok(html.includes('aria-label="About Late tool minutes, summed"'));
+  assert.ok(!/>Active</.test(html) && !/>Late</.test(html));
+});
+
+// ── Reading the whole window (AI814-1): paged, checked against the exact count ───────────────
+/** A fake PostgREST over `total` synthetic rows that serves at most `cap` rows per request (its max-rows). */
+function fakeTable(total, { cap = Infinity, countOf = () => total, failAt = -1 } = {}) {
+  const all = Array.from({ length: total }, (_, i) => row(`2030-0${1 + Math.floor(i / 2000)}-01`, "codex", `p${i}`, { active_minutes: 1 }));
+  const calls = [];
+  const page = async (from, to) => {
+    calls.push([from, to]);
+    if (calls.length - 1 === failAt) return { data: null, error: { code: "57014" }, count: null };
+    const end = Math.min(to + 1, from + cap, all.length);
+    return { data: all.slice(from, end), error: null, count: countOf(calls.length - 1) };
+  };
+  return { all, calls, page };
+}
+
+test("a window crossing the page size and the server row cap returns every row, newest included", async () => {
+  const t = fakeTable(2500, { cap: 1000 });
+  const f = await A.fetchAllAiRows(t.page, 1000, 20000);
+  assert.equal(f.kind, "ok");
+  assert.equal(f.rows.length, 2500);
+  assert.equal(f.rows[2499], t.all[2499]); // the newest row is not dropped
+  assert.deepEqual(t.calls, [[0, 999], [1000, 1999], [2000, 2999]]);
+  // A server cap below the requested page (max-rows 300) still completes: the next page starts where this one ended.
+  const low = fakeTable(1001, { cap: 300 });
+  const g = await A.fetchAllAiRows(low.page, 1000, 20000);
+  assert.equal(g.kind, "ok");
+  assert.equal(g.rows.length, 1001);
+  assert.deepEqual(low.calls.map((c) => c[0]), [0, 300, 600, 900]);
+  // Exactly one full page, and an empty window.
+  assert.equal((await A.fetchAllAiRows(fakeTable(1000).page, 1000, 20000)).rows.length, 1000);
+  assert.deepEqual(await A.fetchAllAiRows(fakeTable(0).page, 1000, 20000), { kind: "ok", rows: [] });
+  // The summary over the full window counts all 2500 minutes.
+  assert.equal(A.summarizeAi(f.rows).topProjects.length, A.AI_TOP_PROJECTS);
+});
+
+test("an incomplete read is an explicit state with its own line, never partial numbers", async () => {
+  const over = await A.fetchAllAiRows(fakeTable(30).page, 10, 25);
+  assert.deepEqual(over, { kind: "incomplete", fetched: 0, total: 30, reason: "too-many" });
+  assert.match(A.aiIncompleteHint(over, 25), /30 AI tool usage rows, more than the 25/);
+
+  const noCount = await A.fetchAllAiRows(fakeTable(5, { countOf: () => null }).page, 10, 25);
+  assert.equal(noCount.kind, "incomplete");
+  assert.equal(noCount.reason, "no-count");
+
+  // The server says 20 rows but stops serving after 12.
+  const short = fakeTable(12, { countOf: () => 20 });
+  const s = await A.fetchAllAiRows(short.page, 10, 25);
+  assert.deepEqual(s, { kind: "incomplete", fetched: 12, total: 20, reason: "short" });
+  assert.equal(A.aiIncompleteHint(s), "Only 12 of 20 AI tool usage rows loaded, so no AI numbers are shown. Try again in a moment.");
+
+  // Rows added between pages: the offsets shifted.
+  const changed = await A.fetchAllAiRows(fakeTable(15, { countOf: (i) => (i === 0 ? 15 : 16) }).page, 10, 25);
+  assert.equal(changed.reason, "changed");
+
+  const err = await A.fetchAllAiRows(fakeTable(15, { failAt: 1 }).page, 10, 25);
+  assert.deepEqual(err, { kind: "error", code: "57014" });
+  const thrown = await A.fetchAllAiRows(async () => { throw new Error("network"); }, 10, 25);
+  assert.deepEqual(thrown, { kind: "error", code: null });
+
+  // The page draws such a state as the section's error line, not as tiles.
+  const html = draw(okView({ kind: "error", hint: A.aiIncompleteHint(s) }));
+  assert.ok(html.includes("Only 12 of 20 AI tool usage rows loaded") && !html.includes("Tool minutes, summed"));
 });
 
 test("the AI empty and error lines never hide the phone screen, and the section shows when the phone is empty", () => {
