@@ -1,5 +1,12 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { createHash } from "node:crypto";
 import { logStackIntake } from "./supplement-stacks";
+
+/** One stable event key per (stack, behavioral day): a second tap after an unconfirmed write replays, never logs twice (SEC-04 follow-up). */
+export function reminderEventKey(stack_id: number, behavioral_date: string): string {
+  const h = createHash("sha256").update(`onyx-stack-reminder|${stack_id}|${behavioral_date}`).digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
 
 /**
  * Supplement stack reminders (Onyx side).
@@ -477,8 +484,14 @@ export async function respondToReminder(
       // A clock instant is only truthful for the current behavioral day; a
       // late tap on yesterday's card records "time unspecified" instead.
       intake_time: behavioral_date === currentDay ? nowIso : null,
+      event_key: reminderEventKey(stack_id, behavioral_date),
     });
     if (!result.ok) {
+      // The insert may have committed: keep the row "logged" (a tap now answers already-logged, and
+      // the stable event key makes any later log a replay). Only a definite refusal reverts.
+      if (result.incomplete) {
+        return { httpStatus: 502, body: { ok: false, error: result.error ?? "the stack may be logged; check /supplements" } };
+      }
       await revert();
       return { httpStatus: 400, body: { ok: false, error: result.error ?? "could not log the stack" } };
     }
@@ -488,6 +501,7 @@ export async function respondToReminder(
       body: { ok: true, status: "logged", message: `Logged ${name}: ${plural(count, "item")}`, intake_count: count },
     };
   } catch (e) {
+    // A thrown error does not prove nothing was written; the event key makes a retry safe, so revert is still fine.
     await revert().catch(() => undefined);
     throw e;
   }
