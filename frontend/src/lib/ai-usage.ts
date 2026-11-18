@@ -90,6 +90,8 @@ const byKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 /**
  * Sums over every device and project row, divided by the span from the first day with a row through the newest
  * one (a day inside it without rows is 0 use: the harvester runs every 3 h). Unreadable rows are skipped and counted.
+ * The minutes are summed tool activity, not wall-clock time: tools or projects running at once each count (the
+ * page labels the tiles "summed" and says so in an InfoHint; Codex AI814-3).
  */
 export function summarizeAi(rows: readonly unknown[]): AiSummary {
   const parsed: AiRow[] = [];
@@ -158,6 +160,77 @@ export function summarizeAi(rows: readonly unknown[]): AiSummary {
     byTool,
     topProjects,
   };
+}
+
+/** Rows asked for per request. PostgREST's max-rows may cap a page lower; the loop below still completes. */
+export const AI_PAGE_ROWS = 1000;
+/** Safety ceiling: a window with more rows than this shows an explicit error instead of partial numbers. */
+export const AI_MAX_ROWS = 20000;
+
+/** One page of the read, reduced to what the loop needs (the Supabase answer mapped by the caller). */
+export interface AiPage {
+  data: unknown[] | null;
+  error: { code: string | null } | null;
+  /** The exact row count of the whole filtered window (select with count: "exact"). */
+  count: number | null;
+}
+
+export type AiFetch =
+  | { kind: "ok"; rows: unknown[] }
+  | { kind: "error"; code: string | null }
+  | { kind: "incomplete"; fetched: number; total: number | null; reason: "no-count" | "too-many" | "short" | "changed" };
+
+/**
+ * Reads every row of the window page by page (`page(from, to)` is an inclusive range over a stable, unique order) and
+ * checks the total against the exact count, so a server row cap or a page boundary can never silently drop rows.
+ * Anything short of the full window comes back as "incomplete", never as rows to summarize.
+ */
+export async function fetchAllAiRows(
+  page: (from: number, to: number) => PromiseLike<AiPage>,
+  pageRows: number = AI_PAGE_ROWS,
+  maxRows: number = AI_MAX_ROWS,
+): Promise<AiFetch> {
+  const rows: unknown[] = [];
+  let total: number | null = null;
+  try {
+    for (;;) {
+      const from = rows.length;
+      const res = await page(from, from + pageRows - 1);
+      if (res.error) return { kind: "error", code: res.error.code ?? null };
+      if (typeof res.count !== "number" || !Number.isInteger(res.count) || res.count < 0) {
+        return { kind: "incomplete", fetched: rows.length, total, reason: "no-count" };
+      }
+      if (total === null) {
+        total = res.count;
+        if (total > maxRows) return { kind: "incomplete", fetched: 0, total, reason: "too-many" };
+      } else if (res.count !== total) {
+        // Rows were added or removed between pages: the offsets no longer line up.
+        return { kind: "incomplete", fetched: rows.length, total: res.count, reason: "changed" };
+      }
+      const got = res.data ?? [];
+      rows.push(...got);
+      if (rows.length >= total) break;
+      if (got.length === 0) return { kind: "incomplete", fetched: rows.length, total, reason: "short" };
+    }
+  } catch {
+    return { kind: "error", code: null };
+  }
+  if (rows.length !== total) return { kind: "incomplete", fetched: rows.length, total, reason: "short" };
+  return { kind: "ok", rows };
+}
+
+/** The on-screen line for an incomplete read (counts only, never a row). */
+export function aiIncompleteHint(f: Extract<AiFetch, { kind: "incomplete" }>, maxRows: number = AI_MAX_ROWS): string {
+  if (f.reason === "too-many") {
+    return `This window has ${f.total} AI tool usage rows, more than the ${maxRows} this page reads, so no AI numbers are shown. Pick a shorter window.`;
+  }
+  if (f.reason === "no-count") {
+    return "The AI tool usage read returned no row count, so completeness can't be checked and no AI numbers are shown. Try again in a moment.";
+  }
+  if (f.reason === "changed") {
+    return "AI tool usage changed while it was being read, so no AI numbers are shown. Try again in a moment.";
+  }
+  return `Only ${f.fetched} of ${f.total ?? "?"} AI tool usage rows loaded, so no AI numbers are shown. Try again in a moment.`;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);

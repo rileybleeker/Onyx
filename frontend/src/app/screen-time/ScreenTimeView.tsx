@@ -1,5 +1,6 @@
 import Link from "next/link";
 import clsx from "clsx";
+import type { ReactNode } from "react";
 import type { ScreenSync } from "@/lib/screen-time-server";
 import { WINDOW_CHOICES, formatMinutes, type TopEntry } from "@/lib/screen-time";
 import type { ScreenTimeViewData } from "@/lib/screen-time-view";
@@ -43,10 +44,13 @@ function SyncLine({ sync }: { sync: ScreenSync | null }) {
   );
 }
 
-function Tile({ label, value, sub }: { label: string; value: string; sub: string }) {
+function Tile({ label, value, sub, hint }: { label: string; value: string; sub: string; hint?: ReactNode }) {
   return (
     <div className="rounded-card shadow-card border border-border-subtle bg-surface-card p-3">
-      <p className="text-[10px] font-medium uppercase tracking-[0.1em] text-text-tertiary">{label}</p>
+      <div className="flex items-center gap-2">
+        <p className="text-[10px] font-medium uppercase tracking-[0.1em] text-text-tertiary">{label}</p>
+        {hint}
+      </div>
       <p className="mt-1 font-display text-[28px] leading-none tabular-nums text-text-primary">{value}</p>
       <p className="mt-1.5 text-[11px] text-text-tertiary">{sub}</p>
     </div>
@@ -96,10 +100,17 @@ function AiSyncLine({ sync, skippedRows = 0 }: { sync: AiSync | null; skippedRow
     return <p className="text-[12px] text-text-tertiary">The PC has not reported an upload yet.{skipped}</p>;
   }
   const failed = sync.status === "failed";
+  const partial = sync.status === "partial";
+  const statusLink = (
+    <Link href="/status" className="underline underline-offset-2 hover:text-text-primary">
+      AI Tool Usage card on Status
+    </Link>
+  );
   return (
-    <p className={clsx("text-[12px]", failed ? "text-red-300" : "text-text-tertiary")}>
+    <p className={clsx("text-[12px]", failed ? "text-red-300" : partial ? "text-amber-300" : "text-text-tertiary")}>
       Last upload from the PC: {SYNC_TIME.format(new Date(sync.at))} ET
-      {failed ? " - it failed; see the AI Tool Usage card on Status." : ""}
+      {failed ? <> - it failed; see the {statusLink}.</> : null}
+      {partial ? <> - partial upload, some days may be missing; see the {statusLink}.</> : null}
       {skipped}
     </p>
   );
@@ -131,11 +142,30 @@ function aiToolsPart(ai: AiSection): PartSpec {
   const claude = ai.byTool.find((t) => t.tool === "claude_code");
   const codex = ai.byTool.find((t) => t.tool === "codex");
   const pct = (share: number | undefined) => `${Math.round((share ?? 0) * 100)}%`;
+  // The minutes are summed over tools and projects (Codex AI814-3): Claude Code and Codex open side by side count twice.
+  const overlap = (label: string) => (
+    <InfoHint label={label}>
+      <p>
+        Summed over every tool and project. Minutes when Claude Code and Codex, or two projects, ran at the same time
+        count once for each, so this can exceed wall-clock time.
+      </p>
+    </InfoHint>
+  );
   return {
     ...base,
     members: [
-      { id: "ai-active", title: "AI active minutes", width: "quarter", node: <Tile label="Active" value={formatMinutes(ai.activePerDay)} sub={`per day, over ${days}`} /> },
-      { id: "ai-late", title: "AI late minutes", width: "quarter", node: <Tile label="Late" value={formatMinutes(ai.latePerDay)} sub="9 PM to 6 AM, per day" /> },
+      {
+        id: "ai-active",
+        title: "AI tool minutes (summed)",
+        width: "quarter",
+        node: <Tile label="Tool minutes, summed" value={formatMinutes(ai.activePerDay)} sub={`per day, over ${days}`} hint={overlap("Tool minutes, summed")} />,
+      },
+      {
+        id: "ai-late",
+        title: "AI late tool minutes (summed)",
+        width: "quarter",
+        node: <Tile label="Late tool minutes, summed" value={formatMinutes(ai.latePerDay)} sub="9 PM to 6 AM, per day" hint={overlap("Late tool minutes, summed")} />,
+      },
       { id: "ai-sessions", title: "AI sessions", width: "quarter", node: <Tile label="Sessions" value={perDayCount(ai.sessionsPerDay)} sub="per day" /> },
       {
         id: "ai-tools-split",

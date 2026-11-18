@@ -1,7 +1,7 @@
 import "server-only";
 import { createClient } from "@supabase/supabase-js";
 import { SCREEN_TIME_COLUMNS, shapeScreenRows, windowStart, type ScreenDay } from "@/lib/screen-time";
-import { AI_USAGE_COLUMNS, summarizeAi, type AiSection, type AiSync } from "@/lib/ai-usage";
+import { AI_USAGE_COLUMNS, aiIncompleteHint, fetchAllAiRows, summarizeAi, type AiSection, type AiSync } from "@/lib/ai-usage";
 
 /**
  * Server-side read of pds.phone_usage_daily for /screen-time. SERVICE ROLE ONLY: the phone_usage_*
@@ -20,8 +20,6 @@ import { AI_USAGE_COLUMNS, summarizeAi, type AiSection, type AiSync } from "@/li
 const HEARTBEAT_COLS = "status,sync_start";
 /** One row per day, so the largest window (180 days) fits well inside this. */
 const MAX_ROWS = 400;
-/** One row per device, day, tool and project: 180 days x a few of each fits inside this. */
-const MAX_AI_ROWS = 5000;
 
 export type ScreenSync = AiSync;
 
@@ -97,12 +95,24 @@ export async function loadScreenTime(windowDays: number, now: Date = new Date())
         .eq("data_type", "usage")
         .order("sync_start", { ascending: false })
         .limit(1),
-      client
-        .from("ai_tool_usage_daily")
-        .select(AI_USAGE_COLUMNS)
-        .gte("behavioral_date", start)
-        .order("behavioral_date", { ascending: true })
-        .limit(MAX_AI_ROWS),
+      // Every row of the window, paged over the table's unique key and checked against the exact count
+      // (a single capped select dropped the newest rows once a window outgrew it: Codex AI814-1).
+      fetchAllAiRows((from, to) =>
+        client
+          .from("ai_tool_usage_daily")
+          .select(AI_USAGE_COLUMNS, { count: "exact" })
+          .gte("behavioral_date", start)
+          .order("behavioral_date", { ascending: true })
+          .order("device", { ascending: true })
+          .order("tool", { ascending: true })
+          .order("project", { ascending: true })
+          .range(from, to)
+          .then((r) => ({
+            data: (r.data ?? null) as unknown[] | null,
+            error: r.error ? { code: r.error.code ?? null } : null,
+            count: r.count ?? null,
+          })),
+      ),
       client
         .from("sync_log")
         .select(HEARTBEAT_COLS)
@@ -116,10 +126,14 @@ export async function loadScreenTime(windowDays: number, now: Date = new Date())
     const sync = syncFrom({ error: beat.error, data: (beat.data ?? null) as unknown[] | null });
     const aiSync = syncFrom({ error: aiBeat.error, data: (aiBeat.data ?? null) as unknown[] | null });
     let ai: AiSection;
-    if (aiUsage.error) {
-      ai = aiFail(aiUsage.error.code ?? "unknown");
+    if (aiUsage.kind === "error") {
+      ai = aiFail(aiUsage.code);
+    } else if (aiUsage.kind === "incomplete") {
+      // Counts only in the log, never a row.
+      console.error("[/screen-time] ai usage read incomplete", aiUsage.reason, aiUsage.fetched, aiUsage.total);
+      ai = { kind: "error", hint: aiIncompleteHint(aiUsage) };
     } else {
-      const summary = summarizeAi((aiUsage.data ?? []) as unknown[]);
+      const summary = summarizeAi(aiUsage.rows);
       ai = summary.kind === "ok" ? { ...summary, sync: aiSync } : { kind: "empty", sync: aiSync };
     }
     const raw = (usage.data ?? []) as unknown[];
