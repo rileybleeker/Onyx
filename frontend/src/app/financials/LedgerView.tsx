@@ -177,6 +177,9 @@ export default function LedgerView({
   const heading = "mb-3 text-[15px] font-semibold";
   const hasNotes = nw.unclassified.length + nw.nonUsdCount + nw.staleCount + nw.noBalance.length > 0;
   const noBalances = nw.assets.length + nw.liabilities.length + nw.unclassified.length === 0;
+  // Asset / Liability / Clear control under every balance row in the net-worth groups, so a wrong
+  // override can be corrected or cleared after the account has moved out of Unclassified.
+  const kindOverride = (l: BalanceLine) => <KindOverride accountId={l.account.account_key} onSaved={onChanged} />;
 
   const netWorthParts: PartSpec[] = [
     {
@@ -248,7 +251,7 @@ export default function LedgerView({
       width: "half",
       node: (
         <div className={box}>
-          <Group title="Assets" lines={nw.assets} now={now} />
+          <Group title="Assets" lines={nw.assets} now={now} extra={kindOverride} />
         </div>
       ),
     });
@@ -260,7 +263,7 @@ export default function LedgerView({
       width: "half",
       node: (
         <div className={box}>
-          <Group title="Liabilities" lines={nw.liabilities} now={now} liability />
+          <Group title="Liabilities" lines={nw.liabilities} now={now} liability extra={kindOverride} />
         </div>
       ),
     });
@@ -276,7 +279,7 @@ export default function LedgerView({
             note="Not counted in net worth until the source labels them."
             lines={nw.unclassified}
             now={now}
-            extra={(l) => <KindOverride accountId={l.account.account_key} onSaved={onChanged} />}
+            extra={kindOverride}
           />
         </div>
       ),
