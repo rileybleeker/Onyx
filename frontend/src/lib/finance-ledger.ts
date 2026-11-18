@@ -302,19 +302,46 @@ export interface NetWorth {
 }
 
 /**
+ * Apply Riley's per-account kind overrides (pds.finance_account_kind_overrides). The override wins
+ * ONLY where the snapshot's own kind is null: a balance the source labelled as asset or liability
+ keeps its kind. Returns new balance objects; the input rows are never mutated.
+ */
+export function applyKindOverrides(
+  balances: readonly LedgerBalance[],
+  overrides: ReadonlyMap<string, BalanceKind>,
+): LedgerBalance[] {
+  return balances.map((b) => {
+    if (b.kind !== null) return b;
+    const kind = overrides.get(b.account_key);
+    return kind === undefined ? b : { ...b, kind };
+  });
+}
+/** Parse one row of pds.finance_account_kind_overrides (account_id, kind); a malformed row is dropped. */
+export function parseKindOverride(raw: unknown): { account_key: string; kind: BalanceKind } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const key = str(r.account_id);
+  const kind = (str(r.kind) ?? "").trim().toLowerCase();
+  if (!key || (kind !== "asset" && kind !== "liability")) return null;
+  return { account_key: key, kind };
+}
+
+/**
  * Net worth = assets - liabilities, from the newest balance per account.
  *  - kind 'asset': contributes its balance as stored (an overdrawn asset is negative).
  *  - kind 'liability': ALWAYS reduces net worth, by |balance|, whichever sign the source used
  *    for "amount owed".
  *  - kind null: not guessed from the account type; listed under `unclassified` and left out.
  *  - non-USD: never mixed into USD totals; listed and left out.
+ *  - `kindOverrides` (optional): Riley's per-account overrides, applied before anything else.
  */
 export function computeNetWorth(
   accounts: readonly LedgerAccount[],
   balances: readonly LedgerBalance[],
   now: Date,
+  kindOverrides?: ReadonlyMap<string, BalanceKind>,
 ): NetWorth {
-  const latest = latestBalances(balances);
+  const latest = latestBalances(kindOverrides ? applyKindOverrides(balances, kindOverrides) : balances);
   const assets: BalanceLine[] = [];
   const liabilities: BalanceLine[] = [];
   const unclassified: BalanceLine[] = [];

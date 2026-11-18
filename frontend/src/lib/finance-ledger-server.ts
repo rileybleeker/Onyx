@@ -15,6 +15,7 @@ import {
   pageWindow,
   parseAccount,
   parseBalance,
+  parseKindOverride,
   parseTxn,
   shiftMonth,
   summarizeFlows,
@@ -23,6 +24,7 @@ import {
   classifyTxn,
   type LedgerAccount,
   type LedgerBalance,
+  type BalanceKind,
   type LedgerQuery,
   type LedgerTxn,
 } from "@/lib/finance-ledger";
@@ -192,6 +194,22 @@ export async function loadCategoryFixes(db: Db): Promise<CategoryFixes & { faile
   return { ...fixes, ...(failed ? { failed } : {}), ...(truncated ? { truncated } : {}) };
 }
 
+/**
+ * Riley's per-account kind overrides (pds.finance_account_kind_overrides). Fail-open on every
+ * error: a missing table (migration not applied) or a failed read means no overrides, so the page
+ * renders exactly as before. Nothing is logged beyond an error code.
+ */
+export async function loadKindOverrides(db: Db): Promise<Map<string, BalanceKind>> {
+  const { data, error } = await db.from("finance_account_kind_overrides").select("account_id,kind").limit(1000);
+  if (error) return new Map();
+  const out = new Map<string, BalanceKind>();
+  for (const raw of (data ?? []) as unknown[]) {
+    const o = parseKindOverride(raw);
+    if (o) out.set(o.account_key, o.kind);
+  }
+  return out;
+}
+
 export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Promise<LedgerLoad> {
   let db: Db;
   try {
@@ -200,7 +218,8 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
     return fail(e);
   }
   try {
-    const [fixes, accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
+    const [overrides, fixes, accountsRes, minDate, maxDate, txHeartbeat, balHeartbeat] = await Promise.all([
+      loadKindOverrides(db),
       loadCategoryFixes(db),
       db.from("finance_accounts").select(ACCOUNT_COLS).order("institution").order("account_name").order("account_key"),
       dateEdge(db, true),
@@ -271,7 +290,7 @@ export async function loadLedger(query: LedgerQuery, now: Date = new Date()): Pr
         accounts,
         accountLabels,
         months,
-        netWorth: computeNetWorth(accounts, balanceRows, now),
+        netWorth: computeNetWorth(accounts, balanceRows, now, overrides),
         flows: summarizeFlows(monthRows),
         trend: monthlyTrend(windowRows, trailingMonths(month, TREND_MONTHS)),
         list: list.list,

@@ -137,6 +137,33 @@ test("kind null is surfaced as unclassified and left out, never guessed from the
   assert.equal(nw.unclassified[0].contributionCents, null);
 });
 
+test("kind overrides: a per-account override labels an unclassified balance, and only where the source kind is null", () => {
+  const rows = [bal("a", 10000, null), bal("b", 5000, null), bal("c", 9990000, "asset")].map((b) => L.parseBalance(b));
+  const overrides = new Map([["a", "asset"], ["b", "liability"]]);
+  const applied = L.applyKindOverrides(rows, overrides);
+  assert.equal(applied[0].kind, "asset", "override fills a null kind");
+  assert.equal(applied[1].kind, "liability", "override fills a null kind");
+  assert.equal(applied[2].kind, "asset", "a source-labelled balance keeps its kind, never overridden");
+  // Original rows are never mutated.
+  assert.equal(rows[0].kind, null);
+  // computeNetWorth honours the overrides end to end: a and b leave unclassified and join the totals.
+  const nw = L.computeNetWorth([acct("a"), acct("b"), acct("c")], rows, NOW, overrides);
+  assert.equal(nw.unclassified.length, 0);
+  assert.equal(nw.assets.length, 2);
+  assert.equal(nw.liabilities.length, 1);
+  assert.equal(nw.assetsCents, 10000);
+  assert.equal(nw.liabilitiesCents, 5000);
+  assert.equal(nw.netWorthCents, 5000);
+});
+
+test("kind override rows parse only clean (account_id, asset|liability); malformed rows are dropped", () => {
+  assert.deepEqual(L.parseKindOverride({ account_id: "abc123", kind: " liability " }), { account_key: "abc123", kind: "liability" });
+  assert.deepEqual(L.parseKindOverride({ account_id: "x", kind: "asset" }), { account_key: "x", kind: "asset" });
+  for (const bad of [null, {}, { account_id: "x" }, { account_id: "x", kind: "credit" }, { kind: "asset" }, { account_id: "", kind: "asset" }]) {
+    assert.equal(L.parseKindOverride(bad), null, JSON.stringify(bad));
+  }
+});
+
 test("non-USD balances are listed but not mixed into USD totals; accounts without a snapshot are listed", () => {
   const nw = L.computeNetWorth([acct("a"), acct("b"), acct("c")], [bal("a", 10000, "asset"), bal("b", 99999900, "asset", { currency: "EUR" })], NOW);
   assert.equal(nw.netWorthCents, 10000);
