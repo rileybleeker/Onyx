@@ -515,7 +515,7 @@ test("reading session, highlight, quiz and playlist each return a receipt built 
     tool: "add_book_highlight", status: "unchanged", title: "Highlight already saved, nothing new written",
     details: ['"Seen before"', "Synthetic Book, chapter 4"],
   }]);
-  assert.deepEqual(await run("record_reading_quiz", { checkpoint: "ch12", score: 4, total: 5 }, "Record my synthetic quiz: 4 out of 5"), [{
+  assert.deepEqual(await run("record_reading_quiz", { checkpoint: "ch12", score: 4, total: 5 }, "Record my chapter 12 quiz: 4 out of 5"), [{
     tool: "record_reading_quiz", status: "saved", title: "Quiz result recorded", details: ["ch12: 4/5 (passed)", "Day: 2026-11-11"],
   }]);
   assert.deepEqual(await run("create_spotify_playlist", { name: "Synthetic mix", track_ids: ["a", "b"] }, "Create a synthetic playlist"), [{
@@ -839,11 +839,11 @@ test("a malformed request_id is a 400 before the model runs; a failed owner chec
 test("a quiz insert whose answer was lost is reported as possibly recorded; a refusal stays not recorded", async () => {
   const quiz = afterTool("record_reading_quiz", { checkpoint: "ch1", score: 4, total: 5 });
   const lost = route(quiz, { supabase: fakeSupabase(), reading: { recordQuiz: async () => ({ ok: false, status: 500, error: "failed" }) } });
-  const lostBody = await (await lost.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json();
+  const lostBody = await (await lost.post({ messages: [user("Record my chapter 1 quiz: 4 out of 5")] })).json();
   assert.equal(lostBody.receipts[0].status, "unknown");
   assert.doesNotMatch(JSON.stringify(lostBody), /synthetic\)/, "the database text is not passed on");
   const refused = route(quiz, { supabase: fakeSupabase(), reading: { recordQuiz: async () => ({ ok: false, status: 400, error: "score must be between 0 and total" }) } });
-  assert.equal((await (await refused.post({ messages: [user("Record my synthetic quiz: 4 out of 5")] })).json()).receipts[0].status, "not_saved");
+  assert.equal((await (await refused.post({ messages: [user("Record my chapter 1 quiz: 4 out of 5")] })).json()).receipts[0].status, "not_saved");
 });
 
 test("a playlist call that may have reached Spotify is reported as possibly done, not as a clean failure", async () => {
@@ -1891,7 +1891,7 @@ test("a quiz result runs under its operation key with the operation's day, and a
     },
   };
   const call = { checkpoint: "ch12", score: 4, total: 5 };
-  const body = { request_id: RID, messages: [user("Record my synthetic quiz: 4 out of 5")] };
+  const body = { request_id: RID, messages: [user("Record my chapter 12 quiz: 4 out of 5")] };
   await route(afterTool("record_reading_quiz", call), { supabase: db, reading, today: "2026-11-11" }).post(body);
   const op = db.rows("chat_operations")[0];
   assert.equal(op.status, "pending", "the answer was lost before the ledger recorded it");
