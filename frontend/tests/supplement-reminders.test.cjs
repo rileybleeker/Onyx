@@ -82,7 +82,8 @@ function makeDb({ tz = 'America/New_York', failOn = null, seed = {} } = {}) {
       db.calls.push(`${this.op}:${this.table}`);
       const failure = db.failOn && db.failOn(this.table, this.op);
       // A string is an error without a code (a network failure: may have been written); an object can carry one.
-      if (failure) return { data: null, error: typeof failure === 'string' ? { message: failure } : failure };
+      // committed: the write happens, then the reply is lost (the error comes back after the write, below).
+      if (failure && !failure.committed) return { data: null, error: typeof failure === 'string' ? { message: failure } : failure };
       const rows = db.tables[this.table];
       assert.ok(rows, `unknown table ${this.table}`);
       let affected;
@@ -117,6 +118,7 @@ function makeDb({ tz = 'America/New_York', failOn = null, seed = {} } = {}) {
         }
         affected = m;
       }
+      if (failure) return { data: null, error: { message: failure.message, code: failure.code } };
       if (this.op !== 'select' && !this.returning) return { data: null, error: null };
       const data = affected.map((r) => this.project(r));
       if (this.mode === 'single') {
@@ -558,6 +560,63 @@ test('respond log: an unconfirmed outcome (connection lost) says it may be saved
   assert.equal(reminders(db)[0].status, 'logged', 'not reverted: the write may have landed');
   assert.notEqual(reminders(db)[0].responded_at, null);
   assert.equal(intakeRows(db, 4).length, 0);
+});
+
+test('respond log: a retry after an unknown outcome that wrote nothing writes again, and does not say already_logged', async () => {
+  const db = await claimed(makeDb());
+  // The write fails with an unknown outcome and no rows are written (connection lost before the insert).
+  let broken = true;
+  db.failOn = (table, op) => (broken && table === 'supplement_intake' && op === 'insert' ? { message: 'connection lost', code: '08006' } : null);
+  const first = await respond(db, LOG);
+  assert.equal(first.httpStatus, 502);
+  assert.equal(first.body.error, stacks.STACK_MAYBE_LOGGED);
+  assert.equal(reminders(db)[0].status, 'logged');
+  assert.equal(intakeRows(db, 4).length, 0);
+
+  // Still unconfirmed: the retry tries the insert again and answers the same unknown outcome, not already_logged.
+  const inserts = () => db.calls.filter((c) => c === 'insert:supplement_intake').length;
+  const beforeRetry = inserts();
+  const again = await respond(db, LOG);
+  assert.equal(inserts(), beforeRetry + 1, 'the keyed write is attempted again');
+  assert.notEqual(again.body.status, 'already_logged');
+  assert.equal(again.httpStatus, 502);
+  assert.equal(again.body.error, stacks.STACK_MAYBE_LOGGED);
+  assert.equal(reminders(db)[0].status, 'logged', 'an unknown outcome never moves the row back');
+  assert.equal(intakeRows(db, 4).length, 0);
+
+  // The database answers now: the retry logs the stack for real.
+  broken = false;
+  const ok = await respond(db, LOG);
+  assert.equal(ok.httpStatus, 200);
+  assert.equal(ok.body.status, 'logged');
+  assert.equal(ok.body.intake_count, 2);
+  assert.equal(intakeRows(db, 4).length, 2);
+});
+
+test('respond log: an insert that committed with its reply lost is not written twice; the retry says already_logged with the real count', async () => {
+  const db = await claimed(makeDb());
+  // The rows are written, then the reply is lost; the read-back under the event key fails too.
+  let lost = false;
+  db.failOn = (table, op) => {
+    if (table !== 'supplement_intake') return null;
+    if (op === 'insert') { lost = true; return { message: 'connection lost', code: '08006', committed: true }; }
+    if (op === 'select' && lost) return { message: 'connection lost', code: '08006' };
+    return null;
+  };
+  const first = await respond(db, LOG);
+  assert.equal(first.httpStatus, 502);
+  assert.equal(first.body.error, stacks.STACK_MAYBE_LOGGED);
+  assert.equal(intakeRows(db, 4).length, 2, 'the write did commit');
+  assert.equal(reminders(db)[0].status, 'logged');
+
+  db.failOn = null;
+  const insertsBefore = db.calls.filter((c) => c === 'insert:supplement_intake').length;
+  const retry = await respond(db, LOG);
+  assert.equal(retry.httpStatus, 200);
+  assert.equal(retry.body.status, 'already_logged');
+  assert.equal(retry.body.intake_count, 2);
+  assert.equal(db.calls.filter((c) => c === 'insert:supplement_intake').length, insertsBefore, 'no second write');
+  assert.equal(intakeRows(db, 4).length, 2);
 });
 
 test('respond log: an archived stack cannot be logged and its reminder is left alone', async () => {
