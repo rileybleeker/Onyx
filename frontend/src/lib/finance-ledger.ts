@@ -286,7 +286,10 @@ export interface BalanceLine {
   contributionCents: number | null;
   /** Why a line is left out of the totals ('unclassified' | 'non-usd'), else null. */
   excluded: "unclassified" | "non-usd" | null;
-  /** The kind Riley's override saved for this account (pds.finance_account_kind_overrides), else null. */
+  /** The kind the bank source itself gave this balance, before any override; null when the source left it blank. */
+  sourceKind: BalanceKind | null;
+  /** The kind Riley's override saved for this account (pds.finance_account_kind_overrides), else null.
+   *  Only set where the source kind is null: an override never applies to a source-labelled balance. */
   overrideKind: BalanceKind | null;
 }
 export interface NetWorth {
@@ -343,7 +346,9 @@ export function computeNetWorth(
   now: Date,
   kindOverrides?: ReadonlyMap<string, BalanceKind>,
 ): NetWorth {
-  const latest = latestBalances(kindOverrides ? applyKindOverrides(balances, kindOverrides) : balances);
+  // The source's own newest row per account (before overrides), and the row the totals use (after overrides).
+  const sourceLatest = latestBalances(balances);
+  const latest = kindOverrides ? latestBalances(applyKindOverrides(balances, kindOverrides)) : sourceLatest;
   const assets: BalanceLine[] = [];
   const liabilities: BalanceLine[] = [];
   const unclassified: BalanceLine[] = [];
@@ -370,8 +375,10 @@ export function computeNetWorth(
     else if (!usd) excluded = "non-usd";
     else if (balance.kind === "asset") contribution = balance.balance_cents;
     else contribution = -Math.abs(balance.balance_cents);
-    const overrideKind = kindOverrides?.get(account.account_key) ?? null;
-    const line: BalanceLine = { account, balance, stale, contributionCents: contribution, excluded, overrideKind };
+    const sourceKind = sourceLatest.get(account.account_key)?.kind ?? null;
+    // An override only ever applies where the source left the kind blank (see applyKindOverrides).
+    const overrideKind = sourceKind === null ? (kindOverrides?.get(account.account_key) ?? null) : null;
+    const line: BalanceLine = { account, balance, stale, contributionCents: contribution, excluded, sourceKind, overrideKind };
     if (!balance.kind) unclassified.push(line);
     else if (balance.kind === "asset") assets.push(line);
     else liabilities.push(line);

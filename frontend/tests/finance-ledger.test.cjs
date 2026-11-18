@@ -156,6 +156,42 @@ test("kind overrides: a per-account override labels an unclassified balance, and
   assert.equal(nw.netWorthCents, 10000 + 9990000 - 5000);
 });
 
+test("sourceKind is the bank's own kind; an override is reported only where the source left the kind blank", () => {
+  const overrides = new Map([["a", "liability"], ["b", "asset"]]);
+  const accounts = [acct("a"), acct("b"), acct("c")];
+  // a: source says asset and an override exists for it; the override must not apply.
+  // b: source blank, override applies. c: source blank, no override.
+  const balances = [bal("a", 10000, "asset"), bal("b", 5000, null), bal("c", 7000, null)];
+  const nw = L.computeNetWorth(accounts, balances, NOW, overrides);
+  const line = (k) => [...nw.assets, ...nw.liabilities, ...nw.unclassified].find((l) => l.account.account_key === k);
+  assert.equal(line("a").sourceKind, "asset", "source kind kept, before overrides");
+  assert.equal(line("a").overrideKind, null, "a source-labelled row reports no override");
+  assert.equal(line("a").balance.kind, "asset", "the source-labelled row keeps its kind");
+  assert.equal(line("b").sourceKind, null, "a blank source kind stays visible as null");
+  assert.equal(line("b").overrideKind, "asset", "an override on a blank row is reported");
+  assert.equal(line("b").balance.kind, "asset");
+  assert.equal(line("c").sourceKind, null);
+  assert.equal(line("c").overrideKind, null);
+  assert.equal(line("c").excluded, "unclassified");
+});
+
+test("computeNetWorth totals are unchanged by sourceKind: same inputs give the same totals with and without overrides", () => {
+  const accounts = [acct("a"), acct("b"), acct("c"), acct("d")];
+  const balances = [bal("a", 100000, "asset"), bal("b", -30000, "liability"), bal("c", 4000, null), bal("d", 2000, null)];
+  const withoutOverrides = L.computeNetWorth(accounts, balances, NOW);
+  assert.equal(withoutOverrides.netWorthCents, 100000 - 30000);
+  assert.equal(withoutOverrides.assetsCents, 100000);
+  assert.equal(withoutOverrides.liabilitiesCents, 30000);
+  assert.equal(withoutOverrides.includedCount, 2);
+  assert.equal(withoutOverrides.unclassified.length, 2);
+  // Override c as an asset, and override a (source-labelled) as a liability: a must not move.
+  const withOverrides = L.computeNetWorth(accounts, balances, NOW, new Map([["c", "asset"], ["a", "liability"]]));
+  assert.equal(withOverrides.assetsCents, 100000 + 4000, "c joins assets; a keeps its source kind");
+  assert.equal(withOverrides.liabilitiesCents, 30000);
+  assert.equal(withOverrides.netWorthCents, 100000 + 4000 - 30000);
+  assert.equal(withOverrides.unclassified.length, 1, "only d stays unclassified");
+});
+
 test("kind override rows parse only clean (account_id, asset|liability); malformed rows are dropped", () => {
   assert.deepEqual(L.parseKindOverride({ account_id: "abc123", kind: " liability " }), { account_key: "abc123", kind: "liability" });
   assert.deepEqual(L.parseKindOverride({ account_id: "x", kind: "asset" }), { account_key: "x", kind: "asset" });
@@ -457,7 +493,7 @@ test("kind override control: Asset / Liability / Clear sit under every balance r
   // Static guard: one shared `kindOverride` renderer is passed as `extra` to each net-worth Group,
   // so an account keeps its correction control after an override moves it out of Unclassified.
   const ledger = read("app/financials/LedgerView.tsx");
-  assert.match(ledger, /const kindOverride = \(l: BalanceLine\) => <KindOverride accountId=\{l\.account\.account_key\} current=\{l\.overrideKind\} onSaved=\{onChanged\} \/>;/);
+  assert.match(ledger, /const kindOverride = \(l: BalanceLine\) =>\s*l\.sourceKind !== null \? null : <KindOverride accountId=\{l\.account\.account_key\} current=\{l\.overrideKind\} onSaved=\{onChanged\} \/>;/);
   assert.match(ledger, /const unclassifiedKind = \(l: BalanceLine\) => <KindOverride accountId=\{l\.account\.account_key\} current=\{null\} onSaved=\{onChanged\} \/>;/);
   assert.match(ledger, /<Group title="Assets" lines=\{nw\.assets\} now=\{now\} extra=\{kindOverride\} \/>/);
   assert.match(ledger, /<Group title="Liabilities" lines=\{nw\.liabilities\} now=\{now\} liability extra=\{kindOverride\} \/>/);
