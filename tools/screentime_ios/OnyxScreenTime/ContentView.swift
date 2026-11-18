@@ -140,6 +140,13 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let done = update.confirmedLabel {
+                    Section {
+                        Label("Updated to \(done) ✓ — Onyx confirmed", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .font(.headline)
+                    }
+                }
                 if let label = update.availableLabel {
                     Section {
                         Button {

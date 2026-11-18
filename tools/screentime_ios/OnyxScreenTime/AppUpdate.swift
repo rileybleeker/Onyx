@@ -20,6 +20,8 @@ final class AppUpdateModel: ObservableObject {
     @Published var installURL: URL?
     @Published var needsTrust = false
     @Published var tapped = false
+    /// "Updated to 0.1.0 (12)": set once, only when this build is not the one Onyx last confirmed AND the hello was accepted.
+    @Published var confirmedLabel: String?
 
     private var lastCheck: Date?
     private let minInterval: TimeInterval = 5 * 60
@@ -65,6 +67,7 @@ final class AppUpdateModel: ObservableObject {
               (response as? HTTPURLResponse)?.statusCode == 200,
               let answer = try? JSONDecoder().decode(Answer.self, from: data),
               let version = answer.version, let build = answer.build else { return }
+        confirmIfNew()
         if Self.isNewer(version: version, build: build),
            let text = answer.install_url, let link = URL(string: text), link.scheme == "itms-services" {
             availableLabel = "\(version) (\(build))"
@@ -75,6 +78,17 @@ final class AppUpdateModel: ObservableObject {
             installURL = nil
             tapped = false
         }
+    }
+
+    /// The hello was accepted (HTTP 200), so Onyx now knows this build. Shown once per build, and not on the very first
+    /// install (nothing was updated then): the confirmation the Today page waits for is also visible here.
+    private func confirmIfNew() {
+        let key = "onyx.confirmedBuild"
+        let current = "\(Self.shortVersion) (\(Self.buildNumber))"
+        let previous = UserDefaults.standard.string(forKey: key)
+        guard previous != current else { return }
+        UserDefaults.standard.set(current, forKey: key)
+        if previous != nil { confirmedLabel = current }
     }
 
     /// Dotted numeric comparison, version first, then build.

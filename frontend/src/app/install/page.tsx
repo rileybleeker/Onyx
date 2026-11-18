@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import FocusUnlockSettings from "@/components/FocusUnlockSettings";
 import { installTarget } from "@/lib/iphone-update";
+import { useUpdateFlow } from "@/lib/use-update-flow";
+import UpdateFlowPanel from "@/components/UpdateFlowPanel";
 import { BUILD_VARIANTS, buildApiUrl, type BuildVariant } from "@/lib/install-builds";
 
 /**
@@ -269,9 +271,19 @@ function AutoInstall() {
   const target = installTarget(ready(f), ready(d));
   const settled = d.state !== "loading" && f.state !== "loading";
   const link = target?.link_a ?? null;
+  const label = target ? `${target.version} (${target.build})` : null;
+  const flow = useUpdateFlow({ status: null, webChecked: true, webBehind: false, retryHref: "/install?auto=1" });
+  const started = useRef(false);
   useEffect(() => {
-    if (link) window.location.href = link;
+    if (!link || started.current) return;
+    started.current = true;
+    // A fresh attempt for this build: record the prompt before iOS takes the page, so the steps read right when we come back.
+    flow.begin(true, false, label);
+    flow.markPrompt();
+    window.location.href = link;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link]);
+  if (flow.view.active && started.current) return <UpdateFlowPanel view={flow.view} />;
   if (!settled) return <p className="text-text-tertiary text-sm">Preparing the install…</p>;
   if (!link) return <p className="text-down text-sm">No installable build is available right now.</p>;
   return (

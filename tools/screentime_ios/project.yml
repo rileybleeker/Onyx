@@ -24,6 +24,10 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
+        # onyxscreentime:// lets the Onyx update page open this app ("Open Onyx Screen Time once to finish").
+        CFBundleURLTypes:
+          - CFBundleURLName: com.rileybleeker.onyxscreentime
+            CFBundleURLSchemes: [onyxscreentime]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         ITSAppUsesNonExemptEncryption: false
         NSHealthShareUsageDescription: Onyx reads steps, walking metrics, headphone level, mindful minutes, workouts and State of Mind from Health and sends them to your own Onyx. Nothing is shared with anyone else.
