@@ -6,7 +6,7 @@ import { useInFeed } from "@/components/FeedContext";
 import { cachedJson, clientCache, fetchJsonValue, GONE } from "@/lib/client-cache";
 import { fallbackBehavioralToday } from "@/lib/checkin";
 import { sameJson } from "@/lib/format";
-import { useLogDrafts, type SupplementLogDraft } from "@/lib/log-drafts";
+import { useLogDrafts, type SupplementLogDraft, type SupplementProductDraft } from "@/lib/log-drafts";
 import {
   LOG_SUPPLEMENTS_HISTORY_URL,
   LOG_SUPPLEMENTS_PRODUCTS_URL,
@@ -97,6 +97,12 @@ function answerSend(productId: string, eventKey: string, outcome: Outcome) {
   retainedSends = settleLate(retainedSends, productId, eventKey, outcome).filter((i) => !!i.attempt);
   liveAnswer?.(productId, eventKey, outcome);
 }
+// The Say it product suggestions whose write is not settled yet, keyed "draftId:itemKey": each keeps its event key and
+// its payload (module memory, like the drafts: a remount must not mint a new key for the same item, or a retry after a
+// lost answer could write the same dose twice). An attempt is dropped only when the server confirms the write or refuses
+// it (a 4xx); a lost answer, a network error or an unmount keeps it, so Retry sends the same key and payload again.
+type SuggestionPayload = Omit<SupplementProductDraft, "kind">;
+const suggestionAttempts = new Map<string, { eventKey: string; payload: SuggestionPayload }>();
 
 const TODAY_URL = LOG_SUPPLEMENTS_TODAY_URL;
 const STACKS_URL = LOG_SUPPLEMENTS_STACKS_URL;
@@ -717,17 +723,18 @@ export default function SupplementsSection() {
   async function logProduct(args: {
     product_id: string | null; name: string; amount: number | null; unit: string | null; times: string[]; date: string | null;
     event_key?: string;
-  }): Promise<string | null> {
+  }): Promise<{ error: string | null; settled: boolean }> {
     const outcome = await sendProduct(args);
     void reloadToday();
     if (outcome.kind === "saved" || outcome.kind === "already") {
       const when = outcome.intakeDate && outcome.intakeDate !== day ? `, ${dayLabel(outcome.intakeDate, day)}` : "";
       const n = outcome.kind === "saved" ? outcome.logged.length : 0;
       showReceipt(`Saved ${outcome.label}${n > 1 ? `, ${n} times` : ""}${when}` + (outcome.skipped ? ` (${outcome.skipped} already logged)` : ""));
-      return null;
+      return { error: null, settled: true };
     }
-    if (outcome.kind === "unconfirmed") return "Not confirmed. It may be saved, so check Logged today before trying again.";
-    return outcome.kind === "refused" ? outcome.error : "Not saved";
+    // settled = the server definitely did not write it (a refusal), so its attempt can go; an unconfirmed answer keeps it.
+    if (outcome.kind === "unconfirmed") return { error: "Not confirmed. It may be saved, so check Logged today before trying again.", settled: false };
+    return { error: outcome.kind === "refused" ? outcome.error : "Not saved", settled: outcome.kind === "refused" };
   }
 
   /**
@@ -874,8 +881,6 @@ export default function SupplementsSection() {
     return (stackRows.get(stackId)?.length ?? 0) > 0 || justLogged.has(stackId);
   }
 
-  // Event key per draft item, keyed "draftId:itemKey" so item 0 of one draft never shares a key with item 0 of another.
-  const suggestionKeys = useRef(new Map<string, string>());
   async function saveSuggestions() {
     if (!suggestions || savingSuggestions) return;
     const { draftId } = suggestions;
@@ -886,13 +891,19 @@ export default function SupplementsSection() {
     for (const s of items) {
       let err: string | null = null;
       if (s.item.kind === "product") {
-        const d = s.item;
-        // One event key per suggestion, kept across its retries: a lost answer for an untimed earlier-day dose
-        // (which the duplicate check cannot recognise) is replayed by the server, not written twice.
+        // One attempt (event key + payload) per suggestion, kept across its retries, a remount and an unmount: a lost
+        // answer for an untimed earlier-day dose (which the duplicate check cannot recognise) is replayed by the server
+        // with the same key, not written twice. Created before the request is sent.
         const keyId = `${draftId}:${s.key}`;
-        let eventKey = suggestionKeys.current.get(keyId);
-        if (!eventKey) { eventKey = crypto.randomUUID(); suggestionKeys.current.set(keyId, eventKey); }
-        err = await logProduct({ product_id: d.product_id, name: d.name, amount: d.amount, unit: d.unit, times: d.times, date: d.date, event_key: eventKey });
+        let attempt = suggestionAttempts.get(keyId);
+        if (!attempt) {
+          const d = s.item;
+          attempt = { eventKey: crypto.randomUUID(), payload: { product_id: d.product_id, name: d.name, amount: d.amount, unit: d.unit, times: d.times, date: d.date } };
+          suggestionAttempts.set(keyId, attempt);
+        }
+        const outcome = await logProduct({ ...attempt.payload, event_key: attempt.eventKey });
+        err = outcome.error;
+        if (outcome.settled) suggestionAttempts.delete(keyId);
       } else {
         const d = s.item;
         const stack = findStack(stacks ?? [], d);
@@ -915,7 +926,6 @@ export default function SupplementsSection() {
       if (err) items = items.map((x) => (x.key === s.key ? { ...x, state: "failed", error: err } : x));
       else {
         done.push(s.key);
-        suggestionKeys.current.delete(`${draftId}:${s.key}`);
         const logged = loggedItems.get(draftId) ?? new Set<number>();
         logged.add(s.key);
         loggedItems.set(draftId, logged);
