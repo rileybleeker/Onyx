@@ -484,6 +484,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   // inbox-triage's "Urgent: ..." email questions are shown once, under Urgent email.
   const emailCards = cards.filter((item) => isEmailCard(item.card));
   const requests = cards.filter((item) => !isEmailCard(item.card));
+  // Open cards Riley cleared from Unread: not obligations to rank, but still open, so All open items names them.
+  const clearedOpen = inbox.state === "ready" ? (inbox.value.dismissedOpen ?? []).filter((item): item is RequestCard => item.kind === "card") : [];
   const pending = refreshing || inbox.state === "loading" || reading.state === "loading" || urgent.state === "loading" || calendar.state === "loading";
   const unavailable = inbox.state === "error" || reading.state === "error" || urgent.state === "error" || (inbox.state === "ready" && inbox.stale) || (reading.state === "ready" && reading.stale) || (urgent.state === "ready" && urgent.stale) || experiment.state === "error" || (experiment.state === "ready" && experiment.stale) || calendar.state === "error" || (calendar.state === "ready" && calendar.stale)
     || lifeChecks.orders.state === "failed" || lifeChecks.renewals.state === "failed" || lifeChecks.money.state === "failed"
@@ -763,6 +765,15 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
                 {state !== "open" && <button type="button" onClick={() => showAgain(item)} aria-label={`Show again: ${item.title}`} className={quietAction}>Show again</button>}
               </li>)}
             </ul>}
+          {clearedOpen.length > 0 && <div className="mt-3">
+            <p className="text-xs text-text-secondary">Cleared from Unread, still waiting for an answer ({clearedOpen.length})</p>
+            <ul aria-label="Cleared requests still open" className="mt-1 divide-y divide-border-subtle">
+              {clearedOpen.map((item) => <li key={`${item.thread}:${item.messageId}:${item.card.code}`} className="py-2">
+                <Link href={requestHref(item)} className="break-words text-sm text-text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-accent">{item.card.name}</Link>
+                <span className="ml-2 text-xs text-text-secondary">{item.card.agent || "Agent"}</span>
+              </li>)}
+            </ul>
+          </div>}
         </details>
         <details>
           <summary>Sources ({attention?.sources.length ?? 0})</summary>

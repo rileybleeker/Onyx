@@ -54,6 +54,8 @@ export interface InboxResponse {
   items: InboxItem[];
   badge: number;
   typing: string | null;
+  /** Open cards Riley cleared from Unread (Worker inbox, newest first, at most 50); absent on an older Worker. */
+  dismissedOpen?: InboxItem[];
 }
 
 export class AuthError extends Error {}
