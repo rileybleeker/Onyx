@@ -3,6 +3,7 @@ import clsx from "clsx";
 import type { ScreenSync } from "@/lib/screen-time-server";
 import { WINDOW_CHOICES, formatMinutes, type TopEntry } from "@/lib/screen-time";
 import type { ScreenTimeViewData } from "@/lib/screen-time-view";
+import type { AiSection, AiSync } from "@/lib/ai-usage";
 import { DailyTotalChart, LateNightChart, PickupsChart, SleepOnsetChart } from "./ScreenTimeCharts";
 import InfoHint from "@/components/InfoHint";
 import RetryButton from "./RetryButton";
@@ -89,6 +90,93 @@ function TopList({ title, entries, empty }: { title: string; entries: TopEntry[]
   );
 }
 
+function AiSyncLine({ sync, skippedRows = 0 }: { sync: AiSync | null; skippedRows?: number }) {
+  const skipped = skippedRows > 0 ? ` ${skippedRows} unreadable row(s) skipped.` : "";
+  if (!sync?.at) {
+    return <p className="text-[12px] text-text-tertiary">The PC has not reported an upload yet.{skipped}</p>;
+  }
+  const failed = sync.status === "failed";
+  return (
+    <p className={clsx("text-[12px]", failed ? "text-red-300" : "text-text-tertiary")}>
+      Last upload from the PC: {SYNC_TIME.format(new Date(sync.at))} ET
+      {failed ? " - it failed; see the AI Tool Usage card on Status." : ""}
+      {skipped}
+    </p>
+  );
+}
+
+const perDayCount = (n: number) => String(Math.round(n * 10) / 10);
+
+/** The "AI tools" section (pds.ai_tool_usage_daily): its own empty and error lines, whatever the phone data shows. */
+function aiToolsPart(ai: AiSection): PartSpec {
+  const header = <h2 className="text-[12px] font-semibold uppercase tracking-[0.07em] text-text-secondary">AI tools</h2>;
+  const base = { id: "ai-tools", title: "AI tools", node: header, gap: 12 };
+  if (ai.kind === "error") {
+    return {
+      ...base,
+      members: [{ id: "ai-status", title: "AI tools status", node: <p className="text-[13px] text-red-300">{ai.hint}</p> }],
+    };
+  }
+  const syncPart: PartSpec = { id: "ai-sync", title: "AI tools last upload", node: <AiSyncLine sync={ai.sync} skippedRows={ai.kind === "ok" ? ai.skippedRows : 0} /> };
+  if (ai.kind === "empty") {
+    return {
+      ...base,
+      members: [
+        { id: "ai-status", title: "AI tools status", node: <p className="text-[13px] text-text-tertiary">No AI tool sessions recorded in this window.</p> },
+        syncPart,
+      ],
+    };
+  }
+  const days = ai.spanDays === 1 ? "1 day" : `${ai.spanDays} days`;
+  const claude = ai.byTool.find((t) => t.tool === "claude_code");
+  const codex = ai.byTool.find((t) => t.tool === "codex");
+  const pct = (share: number | undefined) => `${Math.round((share ?? 0) * 100)}%`;
+  return {
+    ...base,
+    members: [
+      { id: "ai-active", title: "AI active minutes", width: "quarter", node: <Tile label="Active" value={formatMinutes(ai.activePerDay)} sub={`per day, over ${days}`} /> },
+      { id: "ai-late", title: "AI late minutes", width: "quarter", node: <Tile label="Late" value={formatMinutes(ai.latePerDay)} sub="9 PM to 6 AM, per day" /> },
+      { id: "ai-sessions", title: "AI sessions", width: "quarter", node: <Tile label="Sessions" value={perDayCount(ai.sessionsPerDay)} sub="per day" /> },
+      {
+        id: "ai-tools-split",
+        title: "Claude Code vs Codex",
+        width: "quarter",
+        node: (
+          <Tile
+            label="Claude Code vs Codex"
+            value={`${pct(claude?.share)} / ${pct(codex?.share)}`}
+            sub={ai.byTool.map((t) => `${t.label} ${formatMinutes(t.perDay)}`).join(", ") + " per day"}
+          />
+        ),
+      },
+      {
+        id: "ai-top-projects",
+        title: "Top projects",
+        width: "half",
+        node: <TopList title="Top projects" entries={ai.topProjects} empty="No active minutes in this window." />,
+      },
+      syncPart,
+    ],
+  };
+}
+
+/** The AI section without Personalize, under the phone's empty screen. */
+function AiToolsPlain({ ai }: { ai: AiSection }) {
+  const part = aiToolsPart(ai);
+  return (
+    <section aria-label="AI tools" className="space-y-3">
+      {part.node}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {(part.members ?? []).map((m) => (
+          <div key={m.id} className={m.width === "quarter" ? "col-span-1" : m.width === "half" ? "col-span-2" : "col-span-2 lg:col-span-4"}>
+            {m.node}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 type OkData = Extract<ScreenTimeViewData, { kind: "ok" }>;
 
 /** The page's parts in default order: sections (groups) of tiles, charts and lists. */
@@ -169,6 +257,8 @@ function screenTimeParts(data: OkData, s: OkData["summary"]): PartSpec[] {
         },
       ],
     },
+    // An answer cached before the field existed has no ai: the phone parts still draw.
+    ...(data.ai ? [aiToolsPart(data.ai)] : []),
   ];
 }
 
@@ -277,6 +367,12 @@ export default function ScreenTimeView({
             <SyncLine sync={data.sync} />
           </div>
         </section>
+      )}
+
+      {data?.kind === "empty" && data.ai && (
+        <div className={clsx(busy && "opacity-60")}>
+          <AiToolsPlain ai={data.ai} />
+        </div>
       )}
 
       {data?.kind === "ok" &&

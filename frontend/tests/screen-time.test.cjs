@@ -350,7 +350,8 @@ const fakeNext = { NextResponse: { json: (body, init = {}) => ({ status: init.st
 
 test("feed: the view data is what the screen shows, never the day rows", () => {
   const days = S.shapeScreenRows([row("2030-01-10"), row("2030-01-11"), row("2030-01-12", PARTIAL)]);
-  const v = V.screenTimeViewData({ kind: "ok", windowDays: 30, days, skippedRows: 1, sync: null });
+  const ai = { kind: "empty", sync: null };
+  const v = V.screenTimeViewData({ kind: "ok", windowDays: 30, days, skippedRows: 1, sync: null, ai });
   assert.equal(v.kind, "ok");
   assert.ok(!("days" in v));
   assert.equal(v.skippedRows, 1);
@@ -358,8 +359,10 @@ test("feed: the view data is what the screen shows, never the day rows", () => {
   assert.deepEqual(v.points, S.chartPoints(days));
   assert.deepEqual(v.topApps, S.topEntries(days, "byApp"));
   assert.deepEqual(v.topCategories, S.topEntries(days, "byCategory"));
-  const empty = { kind: "empty", windowDays: 14, sync: null };
+  assert.deepEqual(v.ai, ai);
+  const empty = { kind: "empty", windowDays: 14, sync: null, ai };
   assert.deepEqual(V.screenTimeViewData(empty), empty);
+  assert.deepEqual(V.readScreenTimeViewData(empty), empty);
   const roundTrip = JSON.parse(JSON.stringify(v));
   assert.deepEqual(V.readScreenTimeViewData(roundTrip), roundTrip);
   for (const bad of [null, [], {}, { kind: "ok" }, { kind: "empty" }, { kind: "error" }, { kind: "other", hint: "x" }]) {
