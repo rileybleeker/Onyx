@@ -286,6 +286,8 @@ export interface BalanceLine {
   contributionCents: number | null;
   /** Why a line is left out of the totals ('unclassified' | 'non-usd'), else null. */
   excluded: "unclassified" | "non-usd" | null;
+  /** The kind Riley's override saved for this account (pds.finance_account_kind_overrides), else null. */
+  overrideKind: BalanceKind | null;
 }
 export interface NetWorth {
   netWorthCents: number;
@@ -368,7 +370,8 @@ export function computeNetWorth(
     else if (!usd) excluded = "non-usd";
     else if (balance.kind === "asset") contribution = balance.balance_cents;
     else contribution = -Math.abs(balance.balance_cents);
-    const line: BalanceLine = { account, balance, stale, contributionCents: contribution, excluded };
+    const overrideKind = kindOverrides?.get(account.account_key) ?? null;
+    const line: BalanceLine = { account, balance, stale, contributionCents: contribution, excluded, overrideKind };
     if (!balance.kind) unclassified.push(line);
     else if (balance.kind === "asset") assets.push(line);
     else liabilities.push(line);

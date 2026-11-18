@@ -457,10 +457,11 @@ test("kind override control: Asset / Liability / Clear sit under every balance r
   // Static guard: one shared `kindOverride` renderer is passed as `extra` to each net-worth Group,
   // so an account keeps its correction control after an override moves it out of Unclassified.
   const ledger = read("app/financials/LedgerView.tsx");
-  assert.match(ledger, /const kindOverride = \(l: BalanceLine\) => <KindOverride accountId=\{l\.account\.account_key\} onSaved=\{onChanged\} \/>;/);
+  assert.match(ledger, /const kindOverride = \(l: BalanceLine\) => <KindOverride accountId=\{l\.account\.account_key\} current=\{l\.overrideKind\} onSaved=\{onChanged\} \/>;/);
+  assert.match(ledger, /const unclassifiedKind = \(l: BalanceLine\) => <KindOverride accountId=\{l\.account\.account_key\} current=\{null\} onSaved=\{onChanged\} \/>;/);
   assert.match(ledger, /<Group title="Assets" lines=\{nw\.assets\} now=\{now\} extra=\{kindOverride\} \/>/);
   assert.match(ledger, /<Group title="Liabilities" lines=\{nw\.liabilities\} now=\{now\} liability extra=\{kindOverride\} \/>/);
-  assert.match(ledger, /lines=\{nw\.unclassified\}\s+now=\{now\}\s+extra=\{kindOverride\}/);
+  assert.match(ledger, /lines=\{nw\.unclassified\}\s+now=\{now\}\s+extra=\{unclassifiedKind\}/);
   assert.match(ledger, /note="Not counted in net worth until the source labels them\."/);
 });
 const financeFiles = ["lib/finance-ledger.ts", "lib/finance-ledger-server.ts", "lib/finance-service-client.ts", "lib/finance-status.ts", "app/financials/page.tsx", "app/financials/LedgerView.tsx", "app/financials/FilterBar.tsx", "app/financials/SpendingTrendChart.tsx"];

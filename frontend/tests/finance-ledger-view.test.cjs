@@ -199,3 +199,54 @@ test("page states: empty ledger, query failure and data are three different thin
   assert.doesNotMatch(ok, /No ledger data yet|role="alert"/);
   assert.match(ok, /data-csv="true"/, "the CSV preview stays reachable alongside the ledger");
 });
+
+// KindOverride (Asset / Liability / Clear). The autosaver is stubbed to the rule that matters here: a value equal to
+// the baseline (the initial value, from `current`) is not saved. The stub hands back the component's change().
+function kindHarness() {
+  const log = { puts: [], change: null, baseline: null };
+  const stubs = {
+    "@/lib/use-autosave": {
+      useAutosave: (name, opts, baseline) => {
+        log.baseline = baseline;
+        const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        log.change = (value) => {
+          if (!same(value, log.baseline)) void opts.save(value);
+        };
+        return { state: { status: "idle", error: null, retrying: false, savedAt: null }, change: log.change, retry: async () => true };
+      },
+    },
+    "@/lib/autosave": {
+      saveRequest: async (url, init) => {
+        log.puts.push({ url, ...init });
+      },
+    },
+    "@/components/AutosaveStatus": { AutosaveStatus: () => null },
+  };
+  const KO = loadTs("app/financials/KindOverride.tsx", stubs);
+  return { KO, log };
+}
+test("kind override: Clear on a row that already has an override saves null; a fresh row with none sends nothing", () => {
+  const acctId = "acct-demo-1";
+  for (const current of ["liability", "asset"]) {
+    const { KO, log } = kindHarness();
+    renderToStaticMarkup(h(KO.default, { accountId: acctId, current }));
+    assert.deepEqual(log.baseline, { kind: current }, "the baseline is the row's own override, not null");
+    log.change({ kind: null }); // first tap on Clear
+    assert.deepEqual(log.puts, [{ url: "/api/finance/account-kind", method: "PUT", body: { account_id: acctId, kind: null } }]);
+  }
+  const fresh = kindHarness();
+  renderToStaticMarkup(h(fresh.KO.default, { accountId: acctId }));
+  assert.deepEqual(fresh.log.baseline, { kind: null });
+  fresh.log.change({ kind: null });
+  assert.equal(fresh.log.puts.length, 0, "no override and Clear: nothing to save");
+});
+test("kind override: Asset and Liability taps still save the chosen kind", () => {
+  const { KO, log } = kindHarness();
+  renderToStaticMarkup(h(KO.default, { accountId: "acct-demo-2", current: null }));
+  log.change({ kind: "asset" });
+  log.change({ kind: "liability" });
+  assert.deepEqual(
+    log.puts.map((p) => p.body.kind),
+    ["asset", "liability"],
+  );
+});
