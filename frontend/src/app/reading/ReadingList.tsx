@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, BookOpen, Pencil } from "lucide-react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
-import { AutosaveRefused } from "@/lib/autosave";
+import { AutosaveRefused, messageOf } from "@/lib/autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { clientCache } from "@/lib/client-cache";
 import { sameJson } from "@/lib/format";
@@ -477,7 +477,7 @@ function DraftBox({
     if (!draftSettled(draftRef.current)) throw new Error("More changes are waiting. Retry to finish saving them.");
   };
 
-  const autosave = useAutosave<Fields>(isAdd ? "reading-want-list-add" : `reading-want-list-${which}`, { delayMs: 1500, ready, save: () => drive() }, draftBaseline(initial));
+  const autosave = useAutosave<Fields>(isAdd ? "reading-want-list-add" : `reading-want-list-${which}`, { delayMs: 1500, ready, save: () => drive(), describeError: messageOf }, draftBaseline(initial));
 
   const edit = (patch: Partial<Fields>) => {
     const fields = { ...draftRef.current.fields, ...patch };

@@ -7,7 +7,7 @@ import { todayLocal } from '@/lib/care-planner';
 import type { Section } from '@/lib/medical-records-server';
 import InfoHint from '@/components/InfoHint';
 import { AutosaveStatus } from '@/components/AutosaveStatus';
-import { AutosaveRefused } from '@/lib/autosave';
+import { AutosaveRefused, messageOf } from '@/lib/autosave';
 import { useAutosave } from '@/lib/use-autosave';
 import { Part, PartGroup, PartGrid } from '@/components/personalize/PartGrid';
 import type { PageLayout } from '@/lib/personalize-layout';
@@ -453,6 +453,7 @@ function LabEditForm({ result, docs, onDone, onSaved }: { result: LabResult; doc
   const parse = (v: LabFields) => parseLabResult({ ...saved.current, test: v.test, ...parseLabValue(v.value), unit: v.unit, ...parseRange(v.range), collectedOn: v.collectedOn, lab: v.lab, documentId: v.documentId || null, notes: v.notes });
   const autosave = useAutosave<LabFields>('lab-edit', {
     delayMs: 1200,
+    describeError: messageOf,
     ready: v => { const next = parse(v); return next.ok ? null : next.error; },
     save: async v => {
       const next = parse(v);
@@ -638,6 +639,7 @@ function DocumentEditForm({ doc, onDone, onSaved }: { doc: MedicalDocument; onDo
   const [f, setF] = useState<DocFields>({ title: doc.title, kind: doc.kind, date: doc.date, provider: doc.provider, notes: doc.notes });
   const autosave = useAutosave<DocFields>('document-edit', {
     delayMs: 1200,
+    describeError: messageOf,
     ready: v => (v.title.trim() ? null : 'Give the document a title.'),
     save: async v => {
       const a = await call('PATCH', `/api/medical/documents/${doc.id}`, v);

@@ -164,7 +164,7 @@ test('a refusal is shown and not retried until the value changes', async () => {
   s.change('bad');
   await t.advance(10);
   assert.equal(s.state.status, 'error');
-  assert.equal(s.state.error, 'weight must be under 1000 lb');
+  assert.equal(s.state.error, "Couldn't save. Try again.");
   assert.equal(s.state.retrying, false);
   assert.equal(t.count(), 0);
   s.change('bad');
@@ -175,7 +175,7 @@ test('a refusal is shown and not retried until the value changes', async () => {
   assert.deepEqual(r.sent, ['good']);
 });
 
-test('describeError: the status shows its text, not the server words (default is the server words)', async () => {
+test('describeError: default is the fixed plain copy; server words only when a caller passes describeError', async () => {
   const t = fakeTimers();
   const r = recorder({ fail: () => new AutosaveRefused('synthetic server words') });
   const s = new Autosaver({ save: r.save, timers: t, delayMs: 10, describeError: () => 'Plain fixed sentence.' });
@@ -187,7 +187,12 @@ test('describeError: the status shows its text, not the server words (default is
   const d = new Autosaver({ save: recorder({ fail: () => new AutosaveRefused('synthetic server words') }).save, timers: t2, delayMs: 10 });
   d.change('b');
   await t2.advance(10);
-  assert.equal(d.state.error, 'synthetic server words');
+  assert.equal(d.state.error, "Couldn't save. Try again.");
+  const t3 = fakeTimers();
+  const o = new Autosaver({ save: recorder({ fail: () => new AutosaveRefused('synthetic server words') }).save, timers: t3, delayMs: 10, describeError: (e) => e.message });
+  o.change('c');
+  await t3.advance(10);
+  assert.equal(o.state.error, 'synthetic server words');
 });
 
 test('offline: retried with backoff until it goes through', async () => {
@@ -199,7 +204,7 @@ test('offline: retried with backoff until it goes through', async () => {
   await t.advance(10);
   assert.equal(s.state.status, 'error');
   assert.equal(s.state.retrying, true);
-  assert.equal(s.state.error, "Couldn't reach Onyx.");
+  assert.equal(s.state.error, "Couldn't save. Try again.");
   await t.advance(1000); // first retry fails
   assert.equal(s.state.status, 'error');
   await t.advance(2999);

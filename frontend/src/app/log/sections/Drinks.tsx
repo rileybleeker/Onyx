@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Re
 import { Check } from "lucide-react";
 import InfoHint from "@/components/InfoHint";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
+import { messageOf } from "@/lib/autosave";
 import { useAutosave } from "@/lib/use-autosave";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { shiftYmd } from "@/lib/delivery-portion";
@@ -400,6 +401,7 @@ function DrinkItem({
       },
       ready: (v) => (v ? null : reason.current ?? "Not ready."),
       delayMs: 600,
+      describeError: messageOf,
     },
     item.saved ?? undefined,
   );

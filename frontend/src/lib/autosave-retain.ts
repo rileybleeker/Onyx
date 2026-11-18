@@ -25,7 +25,7 @@
  *    got through in between) is taken back by that component (revive): it is never left holding a dead saver.
  * No React, no DOM; React side in lib/use-autosave.ts (useRetainedAutosave). Unit-tested in tests/autosave-retain.test.cjs.
  */
-import { Autosaver, type AutosaveState, type AutosaverOptions, type Timers } from "./autosave";
+import { Autosaver, plainSaveFailure, type AutosaveState, type AutosaverOptions, type Timers } from "./autosave";
 import { unsavedWork as defaultWork, type UnsavedWork } from "./unsaved-work";
 
 export const MAX_RETAINED = 8;
@@ -72,6 +72,7 @@ export class RetainedForm<T, D> {
         save: (v, ctx) => this.source().save(v, { keepalive: ctx.keepalive, cancelled: () => this.released }),
         ready: (v) => this.source().ready?.(v),
         same: (a, b) => (this.source().same ?? jsonSame)(a, b),
+        describeError: (e) => (this.source().describeError ?? plainSaveFailure)(e),
         unknownOutcome: (e) => this.source().unknownOutcome?.(e) ?? false,
         delayMs: opts.delayMs,
         retryDelaysMs: opts.retryDelaysMs,
