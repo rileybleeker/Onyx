@@ -131,7 +131,9 @@ test("two separate Say it drafts, each with one product at index 0, send differe
   assert.notEqual(second.event_key, first.event_key, "a new draft's item never reuses another draft's key");
 });
 
-test("a failed Say it item retried with Retry in the same draft sends the same event_key both times", async (t) => {
+// Since #773 a definite refusal (4xx) settles the attempt: nothing was written, so Retry sends a fresh key. A lost answer
+// keeps the key across Retry and a remount: tests/log-suggestion-key-remount.test.cjs (b) and (d).
+test("a refused Say it item retried with Retry in the same draft is sent again, with a fresh event_key", async (t) => {
   const { h, calls, setDraft, rerender } = mountWithDrafts(t, {
     post: ({ body, n }) => (n === 1 ? response({ ok: false, error: "Synthetic refusal" }, 400) : okFor(body, n)),
   });
@@ -149,14 +151,16 @@ test("a failed Say it item retried with Retry in the same draft sends the same e
   assert.equal(calls.writes.length, 2, "Retry sends the same item again");
   assert.equal(calls.writes[1].body.product_id, "p-gamma");
   assert.match(calls.writes[0].body.event_key, UUID_RE);
-  assert.equal(calls.writes[1].body.event_key, calls.writes[0].body.event_key, "the retry reuses the item's event_key");
+  assert.match(calls.writes[1].body.event_key, UUID_RE);
+  assert.notEqual(calls.writes[1].body.event_key, calls.writes[0].body.event_key, "a refusal drops the attempt (#773)");
 });
 
 test("source: the Say it event key map is namespaced by draft and item, and an item's entry is dropped once confirmed", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "src", "app", "log", "sections", "Supplements.tsx"), "utf8");
-  assert.match(src, /useRef\(new Map<string, string>\(\)\)/);
+  // Module scope since #773 (a remount keeps it); dropped on a settled outcome (confirmed or refused), not on done.push.
+  assert.match(src, /^const suggestionAttempts = new Map<string, \{ eventKey: string; payload: SuggestionPayload \}>\(\);/m);
   assert.match(src, /const keyId = `\$\{draftId\}:\$\{s\.key\}`;/);
-  assert.match(src, /suggestionKeys\.current\.get\(keyId\)/);
-  assert.match(src, /suggestionKeys\.current\.set\(keyId, eventKey\)/);
-  assert.match(src, /done\.push\(s\.key\);\s*suggestionKeys\.current\.delete\(`\$\{draftId\}:\$\{s\.key\}`\);/);
+  assert.match(src, /suggestionAttempts\.get\(keyId\)/);
+  assert.match(src, /suggestionAttempts\.set\(keyId, attempt\)/);
+  assert.match(src, /if \(outcome\.settled\) suggestionAttempts\.delete\(keyId\);/);
 });

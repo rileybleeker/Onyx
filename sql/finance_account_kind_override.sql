@@ -42,5 +42,16 @@ END $$;
 REVOKE ALL ON pds.finance_account_kind_overrides FROM anon, authenticated;
 GRANT ALL ON pds.finance_account_kind_overrides TO service_role;
 
+-- Stored finance results (sql/finance_result_cache.sql) must go stale when an override changes: the same
+-- statement trigger as every other finance input. Only when that file is applied (the function exists).
+DO $$
+BEGIN
+    IF to_regprocedure('pds.finance_inputs_changed()') IS NOT NULL THEN
+        CREATE OR REPLACE TRIGGER finance_account_kind_overrides_inputs_changed
+            AFTER INSERT OR UPDATE OR DELETE ON pds.finance_account_kind_overrides
+            FOR EACH STATEMENT EXECUTE FUNCTION pds.finance_inputs_changed();
+    END IF;
+END $$;
+
 -- Make PostgREST pick up the new table without waiting for a restart.
 NOTIFY pgrst, 'reload schema';

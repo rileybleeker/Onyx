@@ -319,7 +319,7 @@ test("client: a refused save is shown, not retried by itself, and Retry sends it
   const h = await mount(t, { onPost: async () => refuse ? response({ error: "Synthetic refusal" }, 400) : response({ success: true }) });
   h.click(`${DAY}: yes`); await h.flush();
   await h.tick();
-  assert.match(h.text(), /Not saved: Save failed \(400\)\. Your answers are still here\./);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./);
   assert.doesNotMatch(h.text(), /Synthetic refusal/, "the server's own error text is never shown");
   await h.tick(120_000);
   assert.equal(h.posts.length, 1, "a refusal waits for Riley");
@@ -436,7 +436,7 @@ test("client: ordinary night failure retains pending answers without resubmittin
   h.click(`${DAY}: yes`); await h.flush();
   h.click(`${SLEEP}: no`); await h.flush();
   await h.tick();
-  assert.match(h.text(), /Not saved: Save failed \(500\)\. Your answers are still here\./);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./);
   assert.doesNotMatch(h.text(), /Synthetic save failure/, "the server's own error text is never shown");
   assert.equal(h.storage.values.has(dayKey("2031-03-05")), false);
   assert.ok(h.storage.values.has(nightKey("2031-03-04")));
@@ -564,7 +564,7 @@ for (const stale of [false, true]) {
     if (stale) h.setPage(page("2031-03-06"));
     pending.resolve(response(stale ? { stale: true } : { error: "Synthetic save failure that must stay visible" }, stale ? 409 : 500));
     await h.flush();
-    assert.match(h.text(), stale ? /A new day started.*Unsaved answers are preserved/ : /Not saved: Save failed \(500\)\. Your answers are still here\./);
+    assert.match(h.text(), stale ? /A new day started.*Unsaved answers are preserved/ : /Not saved: Couldn't save\. Try again\./);
     if (!stale) assert.doesNotMatch(h.text(), /Synthetic save failure that must stay visible/, "the server's own error text is never shown");
     // A failed save stops the switch (#608): the day stays on screen under its normal label. A stale-day rejection
     // still turns the form into the dated review.
@@ -648,7 +648,7 @@ test("client: a day switch whose pending save is refused stays on the day, keeps
   assert.equal(h.gets.includes("2031-03-04"), false, "the other day is never fetched, so it never replaces the screen");
   assert.match(h.text(), /Daytime · TodayWed, Mar 5/, "the screen still shows the day the answer belongs to");
   assert.equal(h.button(`${DAY}: yes`).props["aria-pressed"], true, "the unsaved answer is still on screen");
-  assert.match(h.text(), /Not saved: Save failed \(400\)\. Your answers are still here\./);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./);
   assert.equal(h.posts.length, 1, "a refusal is not retried by the switch");
   assert.ok(h.button("Retry"), "Retry is offered");
 });

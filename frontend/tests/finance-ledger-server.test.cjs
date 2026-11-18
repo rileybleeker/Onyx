@@ -15,7 +15,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = SERVICE_KEY;
 /** Minimal PostgREST stand-in: eq / gte / lt / or(ilike, eq) / order / limit / range / count. */
 function makeDb({ accounts = [], txns = [], snaps = [], beats = [], maxRows = 1000, failTable = null, failCode = "57014" }) {
   const calls = [];
-  const tables = { finance_accounts: accounts, finance_transactions: txns, finance_balance_snapshots: snaps, sync_log: beats };
+  const tables = { finance_accounts: accounts, finance_transactions: txns, finance_balance_snapshots: snaps, sync_log: beats, finance_account_kind_overrides: [] };
   const created = [];
   const client = {
     from(table) {

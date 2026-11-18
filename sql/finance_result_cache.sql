@@ -61,8 +61,15 @@ begin
     'finance_goals',
     'finance_forecast_snapshots',
     'finance_holdings',
-    'finance_investment_activity'
+    'finance_investment_activity',
+    'finance_account_kind_overrides'
   ] loop
+    -- A table whose own migration is not applied yet is skipped here; its migration adds the same trigger itself
+    -- (sql/finance_account_kind_override.sql), so the order the two files are applied in does not matter.
+    if to_regclass('pds.' || t) is null then
+      raise notice 'finance_result_cache: pds.% does not exist yet, no trigger', t;
+      continue;
+    end if;
     execute format(
       'create or replace trigger %I after insert or update or delete on pds.%I for each statement execute function pds.finance_inputs_changed()',
       t || '_inputs_changed', t
