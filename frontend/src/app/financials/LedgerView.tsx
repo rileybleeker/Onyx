@@ -177,9 +177,11 @@ export default function LedgerView({
   const heading = "mb-3 text-[15px] font-semibold";
   const hasNotes = nw.unclassified.length + nw.nonUsdCount + nw.staleCount + nw.noBalance.length > 0;
   const noBalances = nw.assets.length + nw.liabilities.length + nw.unclassified.length === 0;
-  // Asset / Liability / Clear control under every balance row in the net-worth groups, so a wrong
-  // override can be corrected or cleared after the account has moved out of Unclassified.
-  const kindOverride = (l: BalanceLine) => <KindOverride accountId={l.account.account_key} current={l.overrideKind} onSaved={onChanged} />;
+  // Asset / Liability / Clear control under each Assets and Liabilities row the source left unlabelled, so a
+  // wrong override can be corrected or cleared after the account has moved out of Unclassified. A row the
+  // source already labelled gets no control: an override cannot change it, so the control would do nothing.
+  const kindOverride = (l: BalanceLine) =>
+    l.sourceKind !== null ? null : <KindOverride accountId={l.account.account_key} current={l.overrideKind} onSaved={onChanged} />;
   // An Unclassified row has no override (an override would have classified it), so its control starts from null.
   const unclassifiedKind = (l: BalanceLine) => <KindOverride accountId={l.account.account_key} current={null} onSaved={onChanged} />;
 

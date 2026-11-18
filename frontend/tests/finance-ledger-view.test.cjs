@@ -200,6 +200,19 @@ test("page states: empty ledger, query failure and data are three different thin
   assert.match(ok, /data-csv="true"/, "the CSV preview stays reachable alongside the ledger");
 });
 
+test("kind override control: rendered only on rows the source left unlabelled (sourceKind null)", () => {
+  // s1: source labelled asset (no control). o1: blank source, override liability (control, Clear reachable).
+  // u1: blank source, no override (control, in Unclassified). Expect exactly two controls.
+  const accounts = [acct("s1", { account_name: "Labelled" }), acct("o1", { account_name: "Overridden" }), acct("u1", { account_name: "Blank" })];
+  const balances = [bal("s1", 90000, "asset"), bal("o1", 20000, null), bal("u1", 3000, null)];
+  const nw = L.computeNetWorth(accounts, balances, NOW, new Map([["o1", "liability"], ["s1", "liability"]]));
+  assert.equal(nw.assets.length, 1, "the source-labelled asset is in Assets");
+  assert.equal(nw.liabilities.length, 1, "the override-classified row is in Liabilities");
+  const markup = html(ledgerData({ netWorth: nw }));
+  assert.equal(markup.split(">Clear</button>").length - 1, 2, "one control per blank-source row, none on the labelled row");
+  assert.match(markup, /Liability<\/button>/);
+});
+
 // KindOverride (Asset / Liability / Clear). The autosaver is stubbed to the rule that matters here: a value equal to
 // the baseline (the initial value, from `current`) is not saved. The stub hands back the component's change().
 function kindHarness() {
