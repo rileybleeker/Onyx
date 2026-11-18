@@ -11,6 +11,8 @@ Onyx is Riley's personal health-data platform: root-level Python ETL scripts loa
 - **Still write tests.** Add or update tests when behavior changes, with synthetic data only. The "Tests:" lists in `docs/agents/` name what covers an area so you know what to update. They are not steps to run.
 - Automatic tests never write real user data. CI and smoke: [ops-ci.md](docs/agents/ops-ci.md), `docs/ci-cd.md`.
 
+Every credential (token, session, key, certificate) has an entry in the sign-in registry and follows [docs/signins.md](docs/signins.md).
+
 ## Find your domain rules
 
 Read the file below for the paths you touch, and its source. Dated notes, counts and schedules there are history: the source wins; if they disagree, raise it. Path table, old `AGENTS.md "<name>"` citations and edits to the old file: [docs/agents/README.md](docs/agents/README.md). Change a rule in its file; a new section needs an index row (`tests/test_agents_docs.py`).

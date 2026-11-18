@@ -12,6 +12,7 @@ import { clientCache } from "@/lib/client-cache";
 import { earlyFetchScript, earlyOr } from "@/lib/early-fetch";
 import SpotifyReconnect from "@/components/SpotifyReconnect";
 import KindleRunNow from "@/components/KindleRunNow";
+import SigninsCard from "@/components/SigninsCard";
 import { needsSpotifyReconnect } from "@/lib/spotify-reconnect";
 import type { DriftAlert, SourceStatus, StatusResponse, TzGapRow } from "@/app/api/status/route";
 
@@ -666,6 +667,9 @@ function StatusView({ early }: { early: boolean }) {
           within their section and into any other section of the page. */}
       <PartGrid page="/status" title="System Status">
       <PartGroup id="kpis" title="Overview">
+      <Part id="signins" title="Sign-ins">
+        <SigninsCard signins={data?.signins ?? []} />
+      </Part>
       {/* tz_log_gaps banner — per ADR-0001 drastic-TZ-abroad gap #3. WHOOP
           cycles whose offset disagrees with pds.tz_for_instant — Riley
           likely traveled but forgot to add a user_tz_log entry. */}
