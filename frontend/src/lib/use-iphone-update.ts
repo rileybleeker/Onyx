@@ -10,12 +10,15 @@ export interface EverythingUpdate {
   status: UpdateStatus | null;
   /** The live Onyx deployment is newer than the one this page runs. */
   webBehind: boolean;
+  /** The web version was read at least once (so webBehind=false is a fact, not "not loaded yet"). */
+  webChecked: boolean;
 }
 
 /** Today's update read: two GETs on mount (read-only). status is null while loading or when it could not be read. */
 export function useIphoneUpdate(): EverythingUpdate {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [behind, setBehind] = useState(false);
+  const [checked, setChecked] = useState(false);
   useEffect(() => {
     let live = true;
     fetch("/api/iphone/update-status", { cache: "no-store" })
@@ -24,11 +27,11 @@ export function useIphoneUpdate(): EverythingUpdate {
       .catch(() => {});
     fetch("/api/version", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : null))
-      .then((j) => { if (live && j) setBehind(webBehind(RUNNING, (j as { version?: string | null }).version)); })
+      .then((j) => { if (live && j) setBehind(webBehind(RUNNING, (j as { version?: string | null }).version)); if (live && j) setChecked(true); })
       .catch(() => {});
     return () => { live = false; };
   }, []);
-  return { status, webBehind: behind };
+  return { status, webBehind: behind, webChecked: checked };
 }
 
 /** True inside the installed home-screen app. Read after mount so server and first client render agree. */

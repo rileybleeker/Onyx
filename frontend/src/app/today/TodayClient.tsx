@@ -45,6 +45,8 @@ import HomeResetPanel from "@/components/HomeResetPanel";
 import { useHomeResetToday } from "@/lib/use-home-reset";
 import { useIphoneUpdate, useStandaloneApp } from "@/lib/use-iphone-update";
 import { showUpdateCard, updateHref } from "@/lib/iphone-update";
+import { useUpdateFlow } from "@/lib/use-update-flow";
+import UpdateFlowPanel from "@/components/UpdateFlowPanel";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -570,6 +572,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const standaloneApp = useStandaloneApp();
   const iphoneUpdate = showUpdateCard(everything.status) ? everything.status : null;
   const [updateTapped, setUpdateTapped] = useState(false);
+  const flowHref = updateHref(iphoneUpdate?.installUrl ?? null, standaloneApp && !!iphoneUpdate, typeof window === "undefined" ? "" : window.location.origin);
+  const updateFlow = useUpdateFlow({ status: everything.status, webChecked: everything.webChecked, webBehind: everything.webBehind, retryHref: standaloneApp ? flowHref ?? "" : iphoneUpdate?.installUrl ?? "" });
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
   // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
   const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, homeReset.show ? "home-reset" : null, "reading", "check-in"]
@@ -738,15 +742,19 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       <p role="status" aria-live="polite" className="sr-only">{pending ? "Refreshing Today" : unavailable ? "Some information could not be refreshed. Check the section messages." : "Today refresh finished"}</p>
       {/* iPhone app update (Riley 2026-11-18: "I should be able to see that there is a new build to install"): a banner at
           the top of Today with one filled Install button, shown only when the phone is behind or has not reported. */}
-      {(iphoneUpdate || everything.webBehind) && (() => {
+      {updateFlow.view.active && <UpdateFlowPanel view={updateFlow.view} onAction={(a) => { if (a.label === "Tap Install again") updateFlow.restart(); }} />}
+      {!updateFlow.view.active && (iphoneUpdate || everything.webBehind) && (() => {
         const parts = [iphoneUpdate ? `iPhone app ${iphoneUpdate.available ?? ""}`.trim() : null, everything.webBehind ? "Onyx web" : null].filter(Boolean).join(" · ");
         // Inside the home-screen app iOS ignores itms-services, so the button hands off to Safari (/install?auto=1 installs by itself).
-        const url = updateHref(iphoneUpdate?.installUrl ?? null, standaloneApp && !!iphoneUpdate, window.location.origin);
+        const url = flowHref;
         const needsTrust = !!iphoneUpdate?.needsTrust;
         // One tap: the install link opens iOS's own install prompt (no re-trust, Developer Mode stays on, because every
         // build is signed with the same certificate and bundle id). The web app reloads onto the newest deployment behind it.
         const onTap = () => {
           setUpdateTapped(true);
+          updateFlow.begin(!!iphoneUpdate, everything.webBehind, iphoneUpdate?.available ?? null);
+          // Straight to the install link (Safari): the prompt opens now. From the home-screen app Safari does it.
+          if (url && !standaloneApp) updateFlow.markPrompt();
           if (everything.webBehind) window.setTimeout(() => window.location.reload(), url ? 2500 : 0);
         };
         const cls = "min-h-11 inline-flex items-center rounded-full bg-accent px-5 text-sm font-medium text-on-accent";
