@@ -337,7 +337,9 @@ test("stack editor: a refused create is shown with Retry and not sent again on i
   const h = await mountStack(t, { answer: (call) => (refuse ? response({ error: "Synthetic refusal" }, 400) : server.answer(call)) });
   await nameAndProduct(h);
   await h.tick(400);
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  // The stack editor shows its fixed sentence for a refusal, never the server's own words (lib/autosave.ts).
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./);
+  assert.doesNotMatch(h.text(), /Synthetic refusal/, "the server's own error text is never shown");
   assert.doesNotMatch(h.text(), /Trying again/);
   await h.tick(120_000);
   assert.equal(h.net.writes().length, 1, "a refusal waits for Riley");
@@ -377,7 +379,8 @@ test("stack editor: Close with a change that could not be saved stays open; once
   await h.flush();
   assert.equal(h.net.writes().length, 1, "Close sent what was waiting");
   assert.deepEqual(h.events, { closed: 0, saved: 0 }, "the editor stays open with the unsaved change");
-  assert.match(h.text(), /Not confirmed: Synthetic outage Trying again…/);
+  assert.match(h.text(), /Not confirmed: No clear answer came back[\s\S]*Trying again…/);
+  assert.doesNotMatch(h.text(), /Synthetic outage/, "the server's own error text is never shown");
   down = false;
   await h.tick(2000);
   assert.match(h.text(), /Saved/);

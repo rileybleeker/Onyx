@@ -2,8 +2,9 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
-import { AutosaveRefused } from "@/lib/autosave";
+import { AutosaveRefused, plainSaveFailure } from "@/lib/autosave";
 import {
+  STACK_UNCONFIRMED_TEXT,
   StackConflict,
   StackSaveChain,
   StackSaveUnconfirmed,
@@ -75,6 +76,17 @@ async function readVersion(stackId: number): Promise<number | null> {
 
 const STACK_CHANGED_ELSEWHERE = "This stack was changed somewhere else. Load the latest version, then make your change again.";
 
+/**
+ * The status line's words for a failed stack save. The two failures this editor explains itself keep their own copy: a
+ * conflict (load the latest version) and "no clear answer" (the change may or may not be saved). Every other failure,
+ * including the server's own words, shows the fixed sentence (lib/autosave.ts), so no server text reaches the screen.
+ */
+function stackSaveMessage(e: unknown): string {
+  if (e instanceof StackConflict) return STACK_CHANGED_ELSEWHERE;
+  if (e instanceof StackSaveUnconfirmed) return STACK_UNCONFIRMED_TEXT;
+  return plainSaveFailure(e);
+}
+
 /** One random id per new stack: a retried create (lost answer) then returns the same stack instead of a second. */
 function newClientKey(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -126,6 +138,7 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
   const autosave = useAutosave<StackForm>("stack-editor", {
     delayMs: 500,
     ready: notReady,
+    describeError: stackSaveMessage,
     // After an unconfirmed save the stack may hold that value: changing back to the loaded values is then sent (as a
     // newer save after the unanswered one), never dropped as "unchanged" with the unwanted change left stored.
     unknownOutcome: stackSaveUnknownOutcome,

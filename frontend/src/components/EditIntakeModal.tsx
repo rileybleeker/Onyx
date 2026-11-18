@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
-import { saveRequest } from "@/lib/autosave";
+import { messageOf, saveRequest } from "@/lib/autosave";
 import { useAutosave } from "@/lib/use-autosave";
 
 /**
@@ -79,6 +79,8 @@ export default function EditIntakeModal({ intake, onClose, onSaved }: Props) {
   const autosave = useAutosave<IntakeForm>("edit-intake", {
     delayMs: 1000,
     ready: notReady,
+    // The intake route's own validation sentences (e.g. "doses must be a non-negative number") are shown as the reason.
+    describeError: messageOf,
     save: async (f, { keepalive }) => {
       await saveRequest("/api/supplements/log-intake", {
         method: "PATCH",

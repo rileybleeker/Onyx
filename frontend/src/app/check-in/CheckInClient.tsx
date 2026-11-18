@@ -26,7 +26,7 @@ import {
   type JournalMood,
   type JournalSource,
 } from "@/lib/journal-entry";
-import { AutosaveRefused } from "@/lib/autosave";
+import { AutosaveRefused, messageOf } from "@/lib/autosave";
 import { useAutosave, type UseAutosave } from "@/lib/use-autosave";
 import { AutosaveStatus } from "@/components/AutosaveStatus";
 import { DeliveryDishList, LeftoverList, useDeliveryDishes } from "@/components/DeliveryPortions";
@@ -223,6 +223,8 @@ export default function CheckInClient({ feed = false, embedded = false, omitPart
   const settledDays = useRef(new Set<string>());
   const autosave = useAutosave<number>("checkin", {
     delayMs: AUTOSAVE_DELAY_MS,
+    // The check-in's own sentences ("Save failed (400). Your answers are still here."); no server text is thrown.
+    describeError: messageOf,
     save: (_rev, { keepalive }) => save(keepalive),
   });
   const autosaveRef = useRef<UseAutosave<number>>(autosave);
