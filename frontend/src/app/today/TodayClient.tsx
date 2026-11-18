@@ -570,7 +570,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const iphoneUpdate = showUpdateCard(iphone) ? iphone : null;
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
   // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
-  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, homeReset.show ? "home-reset" : null, iphoneUpdate ? "iphone-update" : null, "reading", "check-in"]
+  const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, homeReset.show ? "home-reset" : null, "reading", "check-in"]
     .filter((id): id is string => id !== null);
   const renderedParts = TODAY_HEAD_PARTS.concat(experiment.state === "error" || trial ? ["experiment"] : [], TODAY_MID_PARTS, lifeParts);
   const lifeW = lifeLayout(usePartOrder("/today", renderedParts), lifeParts);
@@ -731,6 +731,14 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         </div>
       </header>
       <p role="status" aria-live="polite" className="sr-only">{pending ? "Refreshing Today" : unavailable ? "Some information could not be refreshed. Check the section messages." : "Today refresh finished"}</p>
+      {/* iPhone app update (Riley 2026-11-18: "I should be able to see that there is a new build to install"): a banner at
+          the top of Today with one filled Install button, shown only when the phone is behind or has not reported. */}
+      {iphoneUpdate && <section aria-labelledby="iphone-update-heading" className={`${panelStyle} flex flex-wrap items-center justify-between gap-3`}>
+        <div className="flex items-center gap-2 min-w-0"><TabletSmartphone aria-hidden="true" className={iconStyle} />
+          <div className="min-w-0"><h2 id="iphone-update-heading" className={titleStyle}>{iphoneUpdate.verdict === "update" ? "iPhone app update ready" : "New iPhone app build"}</h2>
+          <p className="text-sm text-text-secondary">{iphoneUpdate.verdict === "update" ? `${iphoneUpdate.installed} on your phone; ${iphoneUpdate.available} is ready.` : `${iphoneUpdate.available} is ready to install.`}</p></div></div>
+        <Link href="/install" className="min-h-11 inline-flex items-center rounded-full bg-accent px-5 text-sm font-medium text-on-accent">Install iPhone app</Link>
+      </section>}
       {quietSave === "failed" && !quiet.on && <p className="text-xs text-mid">Couldn&apos;t save the quiet view setting to your account; it is kept on this device. <button type="button" onClick={retryQuiet} className="underline underline-offset-4">Retry</button></p>}
       {selection ? <section data-today-quiet="" aria-labelledby="quiet-heading" aria-busy={pending} className={`${panelStyle} ${styles.quiet}`}>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
@@ -1043,20 +1051,6 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       </Part>}
       {homeReset.show && <Part id="home-reset" title="Apartment reset" width={lifeWidth("home-reset")}>
       <HomeResetPanel view={homeReset} now={now} className={panelStyle} titleClassName={titleStyle} />
-      </Part>}
-      {iphoneUpdate && <Part id="iphone-update" title="iPhone app update" width={lifeWidth("iphone-update")}>
-      <section className={panelStyle} aria-labelledby="iphone-update-heading">
-        <div className="flex items-center gap-2"><TabletSmartphone aria-hidden="true" className={iconStyle} />
-          <h3 id="iphone-update-heading" className={titleStyle}>{iphoneUpdate.verdict === "update" ? "iPhone app update ready" : "Check the iPhone app"}</h3></div>
-        <p className="mt-3 text-sm text-text-primary">
-          {iphoneUpdate.verdict === "update"
-            ? `Your phone has ${iphoneUpdate.installed}; ${iphoneUpdate.available} is ready.`
-            : iphoneUpdate.installed
-              ? `Your phone last reported ${iphoneUpdate.installed} more than a week ago; the newest is ${iphoneUpdate.available}.`
-              : `The phone has not reported its version yet; the newest is ${iphoneUpdate.available}.`}
-        </p>
-        <Link href="/install" className={`${linkStyle} mt-4 inline-block`}>{iphoneUpdate.verdict === "update" ? "Install" : "Open install page"}</Link>
-      </section>
       </Part>}
       <Part id="reading" title="Keep reading" width={lifeWidth("reading")}>
       <section className={panelStyle} aria-labelledby="reading-heading" aria-busy={reading.state === "loading"}>
