@@ -668,7 +668,7 @@ function StatusView({ early }: { early: boolean }) {
       <PartGrid page="/status" title="System Status">
       <PartGroup id="kpis" title="Overview">
       <Part id="signins" title="Sign-ins">
-        <SigninsCard signins={data?.signins ?? []} />
+        <SigninsCard signins={data?.signins} />
       </Part>
       {/* tz_log_gaps banner — per ADR-0001 drastic-TZ-abroad gap #3. WHOOP
           cycles whose offset disagrees with pds.tz_for_instant — Riley
