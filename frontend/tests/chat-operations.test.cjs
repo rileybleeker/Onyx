@@ -286,6 +286,62 @@ test("the same request id with another conversation is a conflict", async () => 
   assert.equal(opened.kind, "conflict");
 });
 
+/** What pds.chat_ledger_purge does to one request (sql/chat_ledger_retention.sql): marker first, then the rows. */
+async function purgeRequest(db, owner = OWNER, request = REQUEST) {
+  const row = db.rows("chat_requests").find((r) => r.owner_id === owner && r.request_id === request);
+  db.seed("chat_retired_requests", [{ owner_id: owner, request_id: request, conversation_sha: row.conversation_sha, retired_at: db.now() }]);
+  await db.from("chat_operations").delete().eq("owner_id", owner).eq("request_id", request);
+  await db.from("chat_requests").delete().eq("owner_id", owner).eq("request_id", request);
+}
+
+test("CHAT795-1: a send whose ledger rows retention removed is refused on retry, never written again", async () => {
+  const { db, store, open } = setup();
+  const write = keyedWrite();
+  const first = await open();
+  await first.run(STACK, input(), write.execute());
+  await first.release();
+  assert.equal(write.effects.size, 1);
+
+  await purgeRequest(db);
+  assert.equal(db.rows("chat_requests").length, 0);
+
+  const opened = await ops.openLedger(store, { ownerId: OWNER, requestId: REQUEST, conversationSha: CONVERSATION, buildReceipt: receipts.buildWriteReceipt });
+  assert.equal(opened.kind, "retired", "the old id is not taken as a new request");
+  assert.equal(write.effects.size, 1, "one domain effect: nothing ran again");
+  assert.equal(db.rows("chat_requests").length, 0, "no new ledger row under the retired id");
+  // Another owner's same id is unaffected by this owner's marker.
+  assert.equal(await store.claimRequest(OTHER_OWNER, REQUEST, CONVERSATION, randomUUID()), "new");
+});
+
+test("CHAT795-1: a purge that retires the id between the check and the insert still refuses it", async () => {
+  let racing = true;
+  const { db, store } = setup();
+  db.setFailure(({ table, op }) => {
+    // The purge commits right before this try's insert: the old row is gone (so the insert succeeds) and its marker
+    // is in place. The fake runs each call alone, so only the marker is staged here; the id has no row.
+    if (racing && table === "chat_requests" && op === "insert") {
+      racing = false;
+      db.seed("chat_retired_requests", [{ owner_id: OWNER, request_id: REQUEST, conversation_sha: CONVERSATION, retired_at: db.now() }]);
+    }
+    return null;
+  });
+  const b = randomUUID();
+  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION, b), "retired", "refused, not run as new");
+  assert.equal(db.rows("chat_requests").length, 0, "the new row was taken back");
+  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID()), "retired", "and stays refused");
+});
+
+test("CHAT795-1: before the marker table exists, claims work exactly as before", async () => {
+  const { store } = setup({ fail: ({ table }) => (table === "chat_retired_requests" ? { code: "PGRST205" } : null) });
+  const a = randomUUID();
+  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION, a), "new");
+  await store.releaseRequest(OWNER, REQUEST, a);
+  assert.equal(await store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID()), "retry");
+  const broken = setup({ fail: ({ table }) => (table === "chat_retired_requests" ? { code: "08006" } : null) });
+  await assert.rejects(broken.store.claimRequest(OWNER, REQUEST, CONVERSATION, randomUUID()), (e) => e instanceof ops.LedgerFailure);
+  assert.equal(broken.db.rows("chat_requests").length, 0, "an unreadable marker writes nothing (fails closed)");
+});
+
 test("a retry where the model did not repeat a call still lists what the first try saved", async () => {
   const { open } = setup();
   const write = keyedWrite();

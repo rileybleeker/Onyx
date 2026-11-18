@@ -90,7 +90,12 @@ export interface OperationRow extends OperationKey {
   created_at: string;
 }
 
-export type RequestClaim = "new" | "retry" | "conflict" | "busy";
+/**
+ * "retired" = the ledger once held this id and the 180-day retention removed it (sql/chat_ledger_retention.sql keeps
+ * a pds.chat_retired_requests marker): its writes may still exist under keys a new request would not reuse, so it
+ * is refused, never run as new (Codex #817 CHAT795-1).
+ */
+export type RequestClaim = "new" | "retry" | "conflict" | "busy" | "retired";
 
 /**
  * How long one try holds its request (one try at a time). It MUST be longer than the chat route's maxDuration
@@ -103,8 +108,8 @@ export const REQUEST_LEASE_MS = 6 * 60 * 1000;
 export interface LedgerStore {
   /**
    * "new" = first time this id is seen; "retry" = seen with the same conversation and no other try is running it;
-   * "busy" = another try of it holds the lease; "conflict" = seen with another conversation. "new" and "retry" give
-   * this try (attempt_id) the lease.
+   * "busy" = another try of it holds the lease; "conflict" = seen with another conversation; "retired" = its ledger
+   * rows were removed by retention (nothing runs). "new" and "retry" give this try (attempt_id) the lease.
    */
   claimRequest(
     owner_id: string, request_id: string, conversation_sha: string, attempt_id: string, context?: OperationContext | null,
@@ -797,6 +802,8 @@ export class ChatLedger {
 export type OpenedLedger =
   | { kind: "ledger"; ledger: ChatLedger }
   | { kind: "conflict" }
+  /** The id's ledger rows were removed by retention: an old send replayed. Nothing runs (it could write twice). */
+  | { kind: "retired" }
   /** Another try of this request is still running (it holds the lease): nothing runs now. */
   | { kind: "busy" }
   | { kind: "unavailable"; code: string }
@@ -815,6 +822,7 @@ export async function openLedger(
   try {
     const claim = await store.claimRequest(opts.ownerId, opts.requestId, opts.conversationSha, attemptId, opts.requestContext ?? null);
     if (claim === "conflict") return { kind: "conflict" };
+    if (claim === "retired") return { kind: "retired" };
     if (claim === "busy") return { kind: "busy" };
     const retry = claim === "retry";
     // A retry runs with what the FIRST try ran with (its local time and behavioral day), never this moment's: a first
@@ -920,13 +928,42 @@ export function supabaseLedgerStore(supabase: Pds): LedgerStore {
   const ops = () => supabase.from("chat_operations");
   const requests = () => supabase.from("chat_requests");
   const leaseUntil = () => new Date(Date.now() + REQUEST_LEASE_MS).toISOString();
+  /**
+   * Whether retention retired this id (pds.chat_retired_requests, written by pds.chat_ledger_purge in the same
+   * transaction as the delete). A missing marker table means the marker-writing purge is not applied either, so
+   * nothing was retired by it: false, as before the table existed. Any other read error fails closed.
+   */
+  const retired = async (owner_id: string, request_id: string): Promise<boolean> => {
+    const { data, error } = await supabase
+      .from("chat_retired_requests")
+      .select("request_id")
+      .eq("owner_id", owner_id)
+      .eq("request_id", request_id)
+      .maybeSingle();
+    if (error) {
+      if (typeof error.code === "string" && MISSING_CODES.has(error.code)) return false;
+      fail(error);
+    }
+    return data !== null && data !== undefined;
+  };
   return {
     async claimRequest(owner_id, request_id, conversation_sha, attempt_id, context) {
+      // A retired id is refused before anything is written (Codex #817 CHAT795-1): its first try's writes may exist
+      // under operation ids a new ledger row would not reuse, so running it as new could write them again.
+      if (await retired(owner_id, request_id)) return "retired";
       // The context goes in with the row (one insert): a first try that stops right after it still leaves it pinned.
       const { error } = await requests().insert({
         owner_id, request_id, conversation_sha, lease_id: attempt_id, lease_until: leaseUntil(), context: context ?? null,
       });
-      if (!error) return "new";
+      if (!error) {
+        // The purge may have retired the old row between the check above and this insert (the insert then waited
+        // for it and found the id free). The marker commits with the delete, so it is visible now: take the new row
+        // back and refuse. Our row holds a live lease, so no later purge removes it in between.
+        if (!(await retired(owner_id, request_id))) return "new";
+        const undo = await requests().delete().eq("owner_id", owner_id).eq("request_id", request_id).eq("lease_id", attempt_id);
+        if (undo.error) fail(undo.error);
+        return "retired";
+      }
       if (error.code !== "23505") fail(error);
       const { data, error: readError } = await requests()
         .select("conversation_sha")

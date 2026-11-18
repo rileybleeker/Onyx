@@ -2488,6 +2488,10 @@ export async function POST(req: NextRequest) {
     if (opened?.kind === "conflict") {
       return Response.json({ error: "This retry does not match the message it was first sent with, so nothing was run. Send your message again.", code: "request_conflict" }, { status: 409 });
     }
+    if (opened?.kind === "retired") {
+      // The page handles it like a conflict (code request_conflict): it forgets the id and the next send is new.
+      return Response.json({ error: "This message was first sent too long ago to retry safely, so nothing was run. Check whether it was saved, then send it again if it was not.", code: "request_conflict", reason: "request_retired" }, { status: 409 });
+    }
     if (opened?.kind === "busy") {
       // Another try of this same message is still running: one try at a time, so nothing runs now.
       return Response.json({ error: "An earlier try of this message is still running. Wait a moment, then send it again unchanged.", code: "request_in_progress" }, { status: 409 });
