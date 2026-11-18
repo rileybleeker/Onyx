@@ -72,6 +72,10 @@ component = component.replace(/require\("@\/components\/HomeResetPanel"\)/g, '({
 const iphoneLib = ids.size; ids.set('frontend/src/lib/iphone-update.ts', iphoneLib); modules[iphoneLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/iphone-update.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/iphone-update"\)/g, `require(${iphoneLib})`)
   .replace(/require\("@\/lib\/use-iphone-update"\)/g, '({__esModule:true,useIphoneUpdate:()=>({status:null,webBehind:false}),useStandaloneApp:()=>false})');
+// The guided update flow (lib/use-update-flow + components/UpdateFlowPanel, added in #809) only shows once an update
+// was started: here none was, so the flow is inactive, the panel renders nothing and Today requests what it did before.
+component = component.replace(/require\("@\/lib\/use-update-flow"\)/g, '({__esModule:true,useUpdateFlow:()=>({view:{active:false},flow:null,status:null,begin:()=>{},restart:()=>{},markPrompt:()=>{}})})')
+  .replace(/require\("@\/components\/UpdateFlowPanel"\)/g, '({__esModule:true,default:()=>null})');
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },
