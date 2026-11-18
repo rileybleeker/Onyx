@@ -466,43 +466,49 @@ export async function respondToReminder(
   }
 
   // action === "log"
-  if (reminder.status === "logged") return alreadyLogged(await countIntake());
+  // 'logged' only counts as done when intake rows exist. A row left 'logged' with no rows (a first attempt whose
+  // write failed without writing) is retried below through the same keyed write, which is replay-safe.
+  const retry = reminder.status === "logged";
+  if (retry) {
+    const existing = await countIntake();
+    if (existing > 0) return alreadyLogged(existing);
+  }
   if (!stack.is_active) {
     return { httpStatus: 409, body: { ok: false, error: `${name} is archived, so it cannot be logged` } };
   }
   const previous = reminder.status as ReminderStatus;
-  const won = await transition("logged", ["prompted", "skipped"], nowIso);
-  if (!won) return alreadyLogged(await countIntake());
-
-  const revert = () => transition(previous, ["logged"], (reminder.responded_at as string | null) ?? null);
-  try {
-    const existing = await countIntake(); // logged some other way since the card went out
-    if (existing > 0) return alreadyLogged(existing);
-
-    const result = await logStackIntake(db, stack_id, {
-      intake_date: behavioral_date,
-      // A clock instant is only truthful for the current behavioral day; a
-      // late tap on yesterday's card records "time unspecified" instead.
-      intake_time: behavioral_date === currentDay ? nowIso : null,
-      event_key: reminderEventKey(stack_id, behavioral_date),
-    });
-    if (!result.ok) {
-      // The insert may have committed: keep the row "logged" (a tap now answers already-logged, and
-      // the stable event key makes any later log a replay). Only a definite refusal reverts.
-      if (result.incomplete) {
-        return { httpStatus: 502, body: { ok: false, error: result.error ?? "the stack may be logged; check /supplements" } };
-      }
-      await revert();
-      return { httpStatus: 400, body: { ok: false, error: result.error ?? "could not log the stack" } };
-    }
-    const count = result.count ?? 0;
-    return {
-      httpStatus: 200,
-      body: { ok: true, status: "logged", message: `Logged ${name}: ${plural(count, "item")}`, intake_count: count },
-    };
-  } catch (e) {
-    // A thrown error does not prove nothing was written; the event key makes a retry safe, so revert is still fine.
-    await revert().catch(() => undefined);
-    throw e;
+  if (!retry) {
+    const won = await transition("logged", ["prompted", "skipped"], nowIso);
+    if (!won) return alreadyLogged(await countIntake());
   }
+
+  // Only a definite refusal (nothing written) puts the row back. An unknown outcome never reverts: the write may have landed.
+  const revert = () =>
+    transition(retry ? "prompted" : previous, ["logged"], retry ? null : ((reminder.responded_at as string | null) ?? null));
+  // A thrown error is an unknown outcome too: it propagates and the row stays 'logged'; a retry finds no rows and writes again (keyed).
+  const existing = await countIntake(); // logged some other way since the card went out
+  if (existing > 0) return alreadyLogged(existing);
+
+  const result = await logStackIntake(db, stack_id, {
+    intake_date: behavioral_date,
+    // A clock instant is only truthful for the current behavioral day; a
+    // late tap on yesterday's card records "time unspecified" instead.
+    intake_time: behavioral_date === currentDay ? nowIso : null,
+    event_key: reminderEventKey(stack_id, behavioral_date),
+  });
+  if (!result.ok) {
+    // The insert may have committed: keep the row "logged" (a tap now answers already-logged, and
+    // the stable event key makes any later log a replay). Only a definite refusal reverts.
+    if (result.incomplete) {
+      return { httpStatus: 502, body: { ok: false, error: result.error ?? "the stack may be logged; check /supplements" } };
+    }
+    await revert();
+    return { httpStatus: 400, body: { ok: false, error: result.error ?? "could not log the stack" } };
+  }
+  // Success: the row is 'logged' (set above, or already set on a retry).
+  const count = result.count ?? 0;
+  return {
+    httpStatus: 200,
+    body: { ok: true, status: "logged", message: `Logged ${name}: ${plural(count, "item")}`, intake_count: count },
+  };
 }
