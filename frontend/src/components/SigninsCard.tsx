@@ -28,15 +28,23 @@ const STATE_COLOR: Record<SigninState, string> = {
  * Sign-ins card at the top of /status: how many credentials renew themselves, how many need Riley,
  * and the one short checklist of what is due. The registry (lib/signin-registry.ts) holds the
  * how-to text; /api/status supplies only each entry's state and renew-by date.
+ *
+ * `signins` is undefined while the status data has not loaded. A live entry whose state is unknown
+ * (or whose status row is missing) is listed, so "Nothing due" only shows when every credential is known.
  */
-export default function SigninsCard({ signins }: { signins: SigninStatus[] }) {
-  const byId = new Map(signins.map((s) => [s.id, s]));
+export default function SigninsCard({ signins }: { signins: SigninStatus[] | undefined }) {
   const live = SIGNIN_REGISTRY.filter((e) => e.live !== false);
   const selfCount = live.filter((e) => e.renewal === "self").length;
   const rileyCount = live.length - selfCount;
 
-  const items = checklistFromStatuses(SIGNIN_REGISTRY, signins, Date.now()).items;
+  const byId = new Map((signins ?? []).map((s) => [s.id, s]));
+  const unknown = live.filter((e) => (byId.get(e.id)?.state ?? "unknown") === "unknown");
+
+  const items = signins ? checklistFromStatuses(SIGNIN_REGISTRY, signins, Date.now()).items : [];
   const problems = live.filter((e) => e.renewal === "self" && (byId.get(e.id)?.state === "due_soon" || byId.get(e.id)?.state === "needs_riley"));
+
+  const nothingDue = signins !== undefined && unknown.length === 0 && items.length === 0 && problems.length === 0;
+  const hasLines = items.length > 0 || problems.length > 0 || unknown.length > 0;
 
   return (
     <section data-testid="signins-card" className="rounded-card bg-surface-card shadow-card p-4">
@@ -50,9 +58,12 @@ export default function SigninsCard({ signins }: { signins: SigninStatus[] }) {
       <p className="mt-1 font-mono text-[13px] text-text-secondary">
         {selfCount} renew themselves · {rileyCount} need you
       </p>
-      {items.length === 0 && problems.length === 0 ? (
+      {signins === undefined ? (
+        <p className="mt-2 text-[13px] text-text-tertiary">Sign-in status is not available yet. Reload to try again.</p>
+      ) : nothingDue ? (
         <p className="mt-2 text-[13px] text-up">Nothing due in the next 45 days</p>
-      ) : (
+      ) : null}
+      {signins !== undefined && hasLines && (
         <ul className="mt-3 space-y-2">
           {items.map((it) => (
             <li key={it.id} className="text-[13px]">
@@ -67,6 +78,13 @@ export default function SigninsCard({ signins }: { signins: SigninStatus[] }) {
           {problems.map((e) => (
             <li key={e.id} className="text-[13px]">
               <span className="text-mid">Check</span>
+              <span className="text-text-primary"> · {e.label}</span>
+              <div className="text-text-secondary">{e.howTo}</div>
+            </li>
+          ))}
+          {unknown.map((e) => (
+            <li key={e.id} className="text-[13px]">
+              <span className={STATE_COLOR.unknown}>{STATE_WORD.unknown}</span>
               <span className="text-text-primary"> · {e.label}</span>
               <div className="text-text-secondary">{e.howTo}</div>
             </li>
