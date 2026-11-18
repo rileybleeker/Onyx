@@ -20,6 +20,11 @@ name: Focus iOS signed build
 # or install links.
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - "tools/screentime_ios/**"
+      - ".github/workflows/focus-ios-signed.yml"
   workflow_dispatch:
     inputs:
       publish:
@@ -321,7 +326,7 @@ jobs:
       # Private bucket, folder screentime-focus/ (never screentime/latest.json, which
       # is the export app's /install entry). No artifact, no links in the log.
       - name: Publish for over-the-air install
-        if: ${{ inputs.publish }}
+        if: ${{ github.event_name == 'push' || inputs.publish }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
