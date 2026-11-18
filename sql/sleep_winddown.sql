@@ -103,6 +103,9 @@ CREATE TABLE IF NOT EXISTS pds.sleep_winddown_starts (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Tables created before habit_page_id was added to this file lack the column (idempotent).
+ALTER TABLE pds.sleep_winddown_starts ADD COLUMN IF NOT EXISTS habit_page_id TEXT;
+
 -- One row per tap, keyed by the id the screen made for it. A tap is retried with
 -- the SAME id until the server answers, so a lost answer never writes twice and a
 -- replay returns what the first request returned. Riley's Cancel on a tap whose
