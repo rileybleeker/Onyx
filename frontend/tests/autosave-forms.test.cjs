@@ -308,7 +308,7 @@ test("stack editor: a create whose answer is lost is shown, retried with the sam
   await nameAndProduct(h);
   await h.tick(400);
   // No answer came back, so the create may have gone through: shown as not confirmed, never as "not saved".
-  assert.match(h.text(), /Not confirmed: No clear answer came back[\s\S]*Trying again…/, "the failure is visible");
+  assert.match(h.text(), /Not confirmed: Couldn't save\. Try again\.[\s\S]*Trying again…/, "the failure is visible");
   assert.doesNotMatch(h.text(), /Not saved/);
   await h.tick(1999);
   assert.equal(h.net.writes().length, 1, "retried after the backoff, not at once");
@@ -337,7 +337,8 @@ test("stack editor: a refused create is shown with Retry and not sent again on i
   const h = await mountStack(t, { answer: (call) => (refuse ? response({ error: "Synthetic refusal" }, 400) : server.answer(call)) });
   await nameAndProduct(h);
   await h.tick(400);
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./);
+  assert.doesNotMatch(h.text(), /Synthetic refusal/, "the server's own words are not shown (#772)");
   assert.doesNotMatch(h.text(), /Trying again/);
   await h.tick(120_000);
   assert.equal(h.net.writes().length, 1, "a refusal waits for Riley");
@@ -377,7 +378,7 @@ test("stack editor: Close with a change that could not be saved stays open; once
   await h.flush();
   assert.equal(h.net.writes().length, 1, "Close sent what was waiting");
   assert.deepEqual(h.events, { closed: 0, saved: 0 }, "the editor stays open with the unsaved change");
-  assert.match(h.text(), /Not confirmed: Synthetic outage Trying again…/);
+  assert.match(h.text(), /Not confirmed: Couldn't save\. Try again\. Trying again…/);
   down = false;
   await h.tick(2000);
   assert.match(h.text(), /Saved/);
@@ -516,7 +517,8 @@ test("intake editor: Done with a refused edit keeps the editor open and says why
   await h.flush();
   h.click("Done");
   await h.flush();
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./);
+  assert.doesNotMatch(h.text(), /Synthetic refusal/, "the server's own words are not shown (#772)");
   assert.deepEqual(h.events, { closed: 0, saved: 0 });
   await h.tick(120_000);
   assert.equal(h.net.writes().length, 1, "not retried on its own");

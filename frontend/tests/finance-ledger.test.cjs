@@ -151,9 +151,9 @@ test("kind overrides: a per-account override labels an unclassified balance, and
   assert.equal(nw.unclassified.length, 0);
   assert.equal(nw.assets.length, 2);
   assert.equal(nw.liabilities.length, 1);
-  assert.equal(nw.assetsCents, 10000);
+  assert.equal(nw.assetsCents, 10000 + 9990000, "a (override) and c (source-labelled) are both assets");
   assert.equal(nw.liabilitiesCents, 5000);
-  assert.equal(nw.netWorthCents, 5000);
+  assert.equal(nw.netWorthCents, 10000 + 9990000 - 5000);
 });
 
 test("kind override rows parse only clean (account_id, asset|liability); malformed rows are dropped", () => {

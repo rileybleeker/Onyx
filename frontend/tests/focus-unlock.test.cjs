@@ -566,7 +566,7 @@ test("settings card: a refusal is shown with Retry and not retried on its own", 
   pick(h, "Synthetic habit A", "checkbox");
   await h.flush();
   await h.tick(700);
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./);
   assert.doesNotMatch(h.text(), /Trying again/);
   await h.tick(120_000);
   assert.equal(puts(h).length, 1, "a refusal waits for Riley");
@@ -583,7 +583,7 @@ test("settings card: an outage is shown and retried with backoff until it is sav
   pick(h, "Synthetic habit A", "checkbox");
   await h.flush();
   await h.tick(700);
-  assert.match(h.text(), /Not saved: Synthetic outage Trying again…/);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\. Trying again…/);
   down = false;
   await h.tick(1999);
   assert.equal(puts(h).length, 1, "retried after the backoff, not at once");
