@@ -157,6 +157,24 @@ function fakeCache(store, registered = new Map(), hang = new Set(), disk = new M
   return { clientCache, cachedJson, fetchJsonValue, GONE };
 }
 
+// One scope per test. Its single t.after unmounts every section mounted in the test (last first) and is registered
+// before the stand-in globals' restore hook: node runs t.after hooks first-in-first-out, and each section's cleanup
+// removes its listener from `document`, so the unmounts must run while the stand-in globals are still set.
+const testScopes = new WeakMap();
+function testScope(t) {
+  let scope = testScopes.get(t);
+  if (!scope) {
+    scope = { handles: [], current: null };
+    testScopes.set(t, scope);
+    t.after(() => { while (scope.handles.length) scope.handles.pop().unmount(); });
+    withGlobals(t, {
+      document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {} },
+      fetch: (url, init) => scope.current.fetch(url, init),
+    });
+  }
+  return scope;
+}
+
 function mountSection(t, { cache = new Map(), registered = new Map(), hang = new Set(), disk = new Map(), answers = {}, post, draft = null } = {}) {
   const calls = { writes: [], gets: [] };
   const defaults = {
@@ -165,12 +183,9 @@ function mountSection(t, { cache = new Map(), registered = new Map(), hang = new
     [URL.stacks]: () => response({ stacks: [STACK] }),
     [URL.history]: () => response({ rows: HISTORY_ROWS }),
   };
-  // Registered before withGlobals: node runs t.after hooks first-in-first-out, and the section's cleanup removes its
-  // visibilitychange listener from `document`, so the unmount has to run while the stand-in globals are still set.
-  let h;
-  t.after(() => h?.unmount());
-  withGlobals(t, {
-    document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {} },
+  const scope = testScope(t);
+  // This section's fetch stand-in; the global `fetch` installed by testScope forwards to whichever section mounted last.
+  scope.current = {
     fetch: async (url, init = {}) => {
       const method = init.method ?? "GET";
       if (method !== "GET") {
@@ -182,11 +197,11 @@ function mountSection(t, { cache = new Map(), registered = new Map(), hang = new
       if (!answer) throw new Error(`unexpected request ${method} ${url}`);
       return answer();
     },
-  });
+  };
   const drafts = { current: null };
   const clear = (id) => { if (drafts.current.draft && (id == null || drafts.current.draft.id === id)) drafts.current = { draft: null, clear }; };
   drafts.current = { draft, clear };
-  h = mountClient("app/log/sections/Supplements.tsx", {
+  const h = mountClient("app/log/sections/Supplements.tsx", {
     stubs: {
       "@/components/FeedContext": { useInFeed: () => false },
       "lucide-react": { Check: () => null, Plus: () => null, X: () => null },
@@ -201,6 +216,7 @@ function mountSection(t, { cache = new Map(), registered = new Map(), hang = new
       "@/lib/log-drafts": { useLogDrafts: () => drafts.current },
     },
   });
+  scope.handles.push(h);
   const options = () => h.find((n) => n.type === "button" && n.props.role === "checkbox");
   const optionNames = () => options().map((n) => h.text(n));
   const option = (name) => {
