@@ -6,9 +6,9 @@ import { saveRequest } from "@/lib/autosave";
 import { useAutosave } from "@/lib/use-autosave";
 
 /**
- * One-tap asset/liability label for one unclassified balance (/financials, "Unclassified" group).
- * The tap IS the action, so it saves at once (autosave); after a save the page is re-read so the
- * account moves into the Assets or Liabilities group. Clear removes the override, so the source's
+ * One-tap asset/liability label for one balance (/financials: Unclassified, Assets and Liabilities
+ * groups). The tap IS the action, so it saves at once (autosave); after a save the page is re-read so
+ * the account moves to the group its new kind implies. Clear removes the override, so the source's
  * own label (or its absence) applies again.
  */
 export default function KindOverride({ accountId, onSaved }: { accountId: string; onSaved?: () => void }) {

@@ -452,6 +452,17 @@ test("the status page lists the card and labels its history", () => {
 // ─── privacy and architecture guards ─────────────────────────────────────────
 
 const read = (rel) => fs.readFileSync(path.join(SRC, rel), "utf8");
+
+test("kind override control: Asset / Liability / Clear sit under every balance row in Assets, Liabilities and Unclassified", () => {
+  // Static guard: one shared `kindOverride` renderer is passed as `extra` to each net-worth Group,
+  // so an account keeps its correction control after an override moves it out of Unclassified.
+  const ledger = read("app/financials/LedgerView.tsx");
+  assert.match(ledger, /const kindOverride = \(l: BalanceLine\) => <KindOverride accountId=\{l\.account\.account_key\} onSaved=\{onChanged\} \/>;/);
+  assert.match(ledger, /<Group title="Assets" lines=\{nw\.assets\} now=\{now\} extra=\{kindOverride\} \/>/);
+  assert.match(ledger, /<Group title="Liabilities" lines=\{nw\.liabilities\} now=\{now\} liability extra=\{kindOverride\} \/>/);
+  assert.match(ledger, /lines=\{nw\.unclassified\}\s+now=\{now\}\s+extra=\{kindOverride\}/);
+  assert.match(ledger, /note="Not counted in net worth until the source labels them\."/);
+});
 const financeFiles = ["lib/finance-ledger.ts", "lib/finance-ledger-server.ts", "lib/finance-service-client.ts", "lib/finance-status.ts", "app/financials/page.tsx", "app/financials/LedgerView.tsx", "app/financials/FilterBar.tsx", "app/financials/SpendingTrendChart.tsx"];
 
 test("the page is rendered per request: force-dynamic, no ISR, no client fetching of ledger data", () => {
