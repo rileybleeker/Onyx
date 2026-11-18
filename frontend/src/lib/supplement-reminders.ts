@@ -477,9 +477,18 @@ export async function respondToReminder(
     return { httpStatus: 409, body: { ok: false, error: `${name} is archived, so it cannot be logged` } };
   }
   const previous = reminder.status as ReminderStatus;
+  // A lost claim proves only that another tap moved the row, not that its write committed (Codex #817 SUP803-1):
+  // the winner can still be writing, or its insert can have failed with nothing saved. So a loser never answers
+  // already_logged on zero rows; it reconciles through the same keyed write, which the unique index on
+  // (client_event_key, client_event_line) makes replay-safe (a second concurrent insert gets 23505 and reads back).
+  let lostClaim = false;
   if (!retry) {
     const won = await transition("logged", ["prompted", "skipped"], nowIso);
-    if (!won) return alreadyLogged(await countIntake());
+    if (!won) {
+      const now = await countIntake();
+      if (now > 0) return alreadyLogged(now);
+      lostClaim = true;
+    }
   }
 
   // Only a definite refusal (nothing written) puts the row back. An unknown outcome never reverts: the write may have landed.
@@ -502,11 +511,14 @@ export async function respondToReminder(
     if (result.incomplete) {
       return { httpStatus: 502, body: { ok: false, error: result.error ?? "the stack may be logged; check /supplements" } };
     }
-    await revert();
+    // Only the call that moved the row puts it back; a loser leaves the winner's state alone.
+    if (!lostClaim) await revert();
     return { httpStatus: 400, body: { ok: false, error: result.error ?? "could not log the stack" } };
   }
   // Success: the row is 'logged' (set above, or already set on a retry).
   const count = result.count ?? 0;
+  // A loser whose keyed write found the winner's rows reports them, with the real count.
+  if (lostClaim && result.replayed) return alreadyLogged(count);
   return {
     httpStatus: 200,
     body: { ok: true, status: "logged", message: `Logged ${name}: ${plural(count, "item")}`, intake_count: count },
