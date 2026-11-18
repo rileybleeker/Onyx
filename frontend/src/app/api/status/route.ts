@@ -6,7 +6,8 @@ import { createClient } from "@supabase/supabase-js";
 import { getUrgentEmailStatusCard } from "@/lib/urgent-email-query";
 import { getPhoneMessagesStatusCard } from "@/lib/phone-messages-status";
 import { simplefinLedgerCard, withSafeSimplefinNote } from "@/lib/finance-status";
-import { spotifyReconnectBy } from "@/lib/spotify-reconnect";
+import { authorizedAtFromTokenData, reconnectByDate, spotifyReconnectBy } from "@/lib/spotify-reconnect";
+import { SIGNIN_REGISTRY, signinStatuses, type SigninStatus } from "@/lib/signin-registry";
 import { CARE_CALENDAR_SYNC_COLUMNS, careCalendarCard, careCalendarConfigured, type CareCalendarSyncRow } from "@/lib/care-calendar-status";
 import { readingBankCard, type ReadingBankHeartbeat, type ReadingBankStatusCounts } from "@/lib/reading-bank-status";
 import { monthlyCapCents } from "@/lib/reading-bank";
@@ -197,6 +198,8 @@ export interface StatusResponse {
   }>;
   driftAlerts: DriftAlert[];
   tzGaps: TzGapRow[];
+  /** Sign-in registry (lib/signin-registry.ts): state + renew-by date + label only. Never a token, id or account. */
+  signins: SigninStatus[];
   fetchedAt: string;
 }
 
@@ -1753,8 +1756,20 @@ export async function GET() {
       deltaMinutes: (r.delta_minutes as number) ?? 0,
     }));
 
+    // Sign-ins: derived from the cards above and, for Spotify, the authorization date. Only the
+    // derived last-day-to-renew leaves this function, never token_data or authorized_at itself.
+    const spotifyAuthAt = authorizedAtFromTokenData(spotifyTokenRes?.data?.[0]?.token_data);
+    const signins = signinStatuses(
+      SIGNIN_REGISTRY,
+      {
+        sourceStatus: Object.fromEntries(Object.entries(sources).map(([k, v]) => [k, v.status])),
+        expiry: { spotify: spotifyAuthAt === null ? null : reconnectByDate(spotifyAuthAt) },
+      },
+      Date.now(),
+    );
+
     return NextResponse.json(
-      { sources, recentHistory, driftAlerts, tzGaps, fetchedAt: new Date().toISOString() } satisfies StatusResponse,
+      { sources, recentHistory, driftAlerts, tzGaps, signins, fetchedAt: new Date().toISOString() } satisfies StatusResponse,
       {
         headers: STATUS_CACHE_HEADERS,
       }
