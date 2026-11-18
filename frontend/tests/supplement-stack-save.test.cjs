@@ -840,7 +840,7 @@ test("the route saves only through the function; the editor sends versions and h
   assert.match(read("lib/use-autosave.ts"), /unknownOutcome: \(e\) => optsRef\.current\.unknownOutcome\?\.\(e\) \?\? false,/);
   assert.match(modal, /chain\.current\.accepted\(json\.version\)/);
   // An existing stack with no version reads it first, so an update with a save id never goes out without one.
-  assert.match(modal, /chain\.current\.knownVersion === null\) \{\s+chain\.current\.learnVersion\(await readVersion\(stackIdRef\.current\)\)/);
+  assert.match(modal, /chain\.current\.knownVersion === null\) \{\s+const latest = await readVersion\(stackIdRef\.current\);\s+if \(latest !== null\) \{\s+setConflict\(true\);\s+throw new StackConflict\(/, "a version the server now has means changed elsewhere: refused, not attached to the old body");
   assert.match(modal, /fetch\("\/api\/supplements\/stacks\?include_archived=1"/);
   assert.match(modal, /new StackSaveChain\(stack\.stack_id \? \(stack\.version \?\? null\) : null, newClientKey\)/);
   assert.match(modal, /Load the latest version/);

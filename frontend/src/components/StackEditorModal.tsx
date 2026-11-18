@@ -73,6 +73,8 @@ async function readVersion(stackId: number): Promise<number | null> {
   return json?.stacks?.find((s) => s.stack_id === stackId)?.version ?? null;
 }
 
+const STACK_CHANGED_ELSEWHERE = "This stack was changed somewhere else. Load the latest version, then make your change again.";
+
 /** One random id per new stack: a retried create (lost answer) then returns the same stack instead of a second. */
 function newClientKey(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -135,10 +137,16 @@ export default function StackEditorModal({ open, stack, products, onClose, onSav
         remind_time: f.remind_time || null,
         items: f.items,
       };
-      // An existing stack with no version yet (loaded before versions existed): read it first, so the save carries a
-      // version instead of none (the server refuses a save without one).
+      // An existing stack loaded with no version (before versions existed). If the server has a version for it now, the
+      // stack was changed after this editor loaded it, and this form still holds the old values: attaching that version
+      // to the old body would overwrite the other change. So nothing is sent; the editor offers the latest version.
+      // No version on the server either: the save goes as before (the server refuses it with "reload").
       if (stackIdRef.current !== null && chain.current.knownVersion === null) {
-        chain.current.learnVersion(await readVersion(stackIdRef.current));
+        const latest = await readVersion(stackIdRef.current);
+        if (latest !== null) {
+          setConflict(true);
+          throw new StackConflict(STACK_CHANGED_ELSEWHERE);
+        }
       }
       const fields = chain.current.next(body);
       const creating = stackIdRef.current === null;
