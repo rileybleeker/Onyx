@@ -151,9 +151,13 @@ test("kind overrides: a per-account override labels an unclassified balance, and
   assert.equal(nw.unclassified.length, 0);
   assert.equal(nw.assets.length, 2);
   assert.equal(nw.liabilities.length, 1);
-  assert.equal(nw.assetsCents, 10000);
+  // Hand-computed: assets a (10,000) + c (9,990,000, source-labelled) = 10,000,000; liability b = 5,000.
+  assert.equal(nw.assetsCents, 10000000);
   assert.equal(nw.liabilitiesCents, 5000);
-  assert.equal(nw.netWorthCents, 5000);
+  assert.equal(nw.netWorthCents, 9995000);
+  // Only the override-filled lines are flagged; the source-labelled asset c is not.
+  const flagged = Object.fromEntries([...nw.assets, ...nw.liabilities].map((l) => [l.account.account_key, l.kindOverridden]));
+  assert.deepEqual(flagged, { a: true, c: false, b: true });
 });
 
 test("kind override rows parse only clean (account_id, asset|liability); malformed rows are dropped", () => {

@@ -241,6 +241,10 @@ export default function LedgerView({
       ),
     });
   }
+  // Asset/Liability lines carry the override control only when their kind came from an override
+  // (Clear undoes it); lines the source labelled keep their layout.
+  const overrideControl = (l: BalanceLine) =>
+    l.kindOverridden ? <KindOverride accountId={l.account.account_key} onSaved={onChanged} /> : null;
   if (nw.assets.length > 0) {
     netWorthParts.push({
       id: "bal-assets",
@@ -248,7 +252,7 @@ export default function LedgerView({
       width: "half",
       node: (
         <div className={box}>
-          <Group title="Assets" lines={nw.assets} now={now} />
+          <Group title="Assets" lines={nw.assets} now={now} extra={overrideControl} />
         </div>
       ),
     });
@@ -260,7 +264,7 @@ export default function LedgerView({
       width: "half",
       node: (
         <div className={box}>
-          <Group title="Liabilities" lines={nw.liabilities} now={now} liability />
+          <Group title="Liabilities" lines={nw.liabilities} now={now} liability extra={overrideControl} />
         </div>
       ),
     });

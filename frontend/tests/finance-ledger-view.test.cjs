@@ -81,6 +81,24 @@ function ledgerData(over = {}) {
 }
 const html = (data) => renderToStaticMarkup(h(View.default, { data, now: NOW }));
 
+test("an overridden account in Assets or Liabilities shows Clear beside Asset and Liability; a source-labelled one does not", () => {
+  const data = ledgerData();
+  // a1 is source-labelled asset, a2 source-labelled liability; a3 (no source kind) is overridden to asset.
+  data.netWorth = L.computeNetWorth(data.accounts, [bal("a1", 250000, "asset"), bal("a2", 40000, "liability"), bal("a3", 7700, null)], NOW, new Map([["a3", "asset"], ["a2", "liability"]]));
+  const out = html(data);
+  // One balance row: the <li> whose title reads "Demo Bank · <name>".
+  const rowFor = (name) => out.match(new RegExp(`<li[^>]*>(?:(?!<li)[\\s\\S])*?· ${name}(?:(?!<li)[\\s\\S])*?</li>`))?.[0] ?? "";
+  const mystery = rowFor("Mystery");
+  assert.match(mystery, />Asset</, "overridden line keeps the Asset button");
+  assert.match(mystery, />Liability</, "overridden line keeps the Liability button");
+  assert.match(mystery, />Clear</, "overridden line shows Clear so the wrong label can be undone");
+  const card = rowFor("Card");
+  assert.match(card, />Clear</, "overridden liability shows Clear too");
+  const everyday = rowFor("Everyday");
+  assert.doesNotMatch(everyday, />Clear</, "a source-labelled account keeps its current layout (no override control)");
+  assert.doesNotMatch(everyday, />Asset</);
+});
+
 test("net worth: liabilities subtract, unclassified is surfaced not counted, stale balance is badged", () => {
   const out = html(ledgerData());
   assert.match(out, /data-stat="Net worth"><b>\$2,100\.00<\/b>/, "2,500 asset minus 400 owed; the unclassified 77 is left out");

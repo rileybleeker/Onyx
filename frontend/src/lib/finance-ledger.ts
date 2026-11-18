@@ -286,6 +286,8 @@ export interface BalanceLine {
   contributionCents: number | null;
   /** Why a line is left out of the totals ('unclassified' | 'non-usd'), else null. */
   excluded: "unclassified" | "non-usd" | null;
+  /** True when the line's kind came from Riley's override (the source left it null), so the page can offer to change or clear it. */
+  kindOverridden: boolean;
 }
 export interface NetWorth {
   netWorthCents: number;
@@ -341,7 +343,8 @@ export function computeNetWorth(
   now: Date,
   kindOverrides?: ReadonlyMap<string, BalanceKind>,
 ): NetWorth {
-  const latest = latestBalances(kindOverrides ? applyKindOverrides(balances, kindOverrides) : balances);
+  const source = latestBalances(balances); // the source's own newest snapshot, before any override
+  const latest = kindOverrides ? latestBalances(applyKindOverrides(balances, kindOverrides)) : source;
   const assets: BalanceLine[] = [];
   const liabilities: BalanceLine[] = [];
   const unclassified: BalanceLine[] = [];
@@ -368,7 +371,8 @@ export function computeNetWorth(
     else if (!usd) excluded = "non-usd";
     else if (balance.kind === "asset") contribution = balance.balance_cents;
     else contribution = -Math.abs(balance.balance_cents);
-    const line: BalanceLine = { account, balance, stale, contributionCents: contribution, excluded };
+    const kindOverridden = balance.kind !== null && source.get(account.account_key)?.kind === null;
+    const line: BalanceLine = { account, balance, stale, contributionCents: contribution, excluded, kindOverridden };
     if (!balance.kind) unclassified.push(line);
     else if (balance.kind === "asset") assets.push(line);
     else liabilities.push(line);
