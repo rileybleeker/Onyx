@@ -482,23 +482,25 @@ pwsh -File tools\medical_recovery\register-task.ps1               # the weekly t
   touches OneDrive or the repo. A run counts as off-site only when the ciphertext itself is confirmed in
   the OneDrive cloud. First the folder must be under an existing OneDrive folder with the client running
   (else `offsite_unsynced`, nothing pruned; a cheap negative pre-check only); then the job polls the new
-  file's own cloud-files state for up to `--sync-wait` seconds (default 300). The state is read with
-  `GetFileAttributesW` — the cfapi placeholder bits `attrib` prints: `FILE_ATTRIBUTE_OFFLINE` (0x1000),
-  `FILE_ATTRIBUTE_RECALL_ON_OPEN` (0x40000), `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (0x400000),
-  `FILE_ATTRIBUTE_PINNED` (0x80000), `FILE_ATTRIBUTE_UNPINNED` (0x100000) and
-  `FILE_ATTRIBUTE_REPARSE_POINT` (0x400). OneDrive takes a local file into the cloud by converting it into
-  a cloud-files placeholder, so one of those bits is the cloud's receipt for the upload; a plain local
-  file, an unreadable one, a path outside OneDrive or a non-Windows host reads `pending_upload` (a
+  file's own cloud-files state for up to `--sync-wait` seconds (default 300). The state is read from the cloud
+  filter itself (`FindFirstFileW` + `CfGetPlaceholderStateFromFindData`, cldapi): the file counts as
+  uploaded only when it is a placeholder (`CF_PLACEHOLDER_STATE_PLACEHOLDER`) that is explicitly in sync
+  (`CF_PLACEHOLDER_STATE_IN_SYNC`). Placeholder and pin attribute bits alone (`attrib` +p/+u, offline,
+  recall, reparse point) are not evidence: a pin is user intent and a placeholder can exist while its
+  contents are still uploading (Codex BACKUP449-1 on #484). A plain local file, a placeholder not in sync,
+  an unreadable or invalid state, a path outside OneDrive or a non-Windows host reads `pending_upload` (a
   **partial** run, nothing pruned). Only then does the one writer of the remote record
-  (`record_remote_confirmation`: backup name, size and time in
-  `%LOCALAPPDATA%\Onyxackup-stateemote-confirmations.json`, never under OneDrive or in the repo)
+  (`record_remote_confirmation`: backup name, size, the evidence `cfapi_in_sync` and time in
+  `%LOCALAPPDATA%\Onyx\backup-state\remote-confirmations.json`, never under OneDrive or in the repo)
   store the confirmation. Elapsed time is not evidence of upload. `keygen` refuses one path for both key
   files.
 - **Retention**, applied after every run whose ciphertext is confirmed in the cloud (an unconfirmed run
   prunes nothing): the newest 8 backups, plus the first backup of each of the 3 most recent months, plus
   the newest backup whose completeness marker verifies, plus the newest backup the remote record
   confirms, wherever they fall. When no backup is confirmed off-site at all, nothing is pruned
-  (`offsite_unconfirmed`); a confirmation whose file changed size no longer counts. A fully successful run commits `onyx-backup-<UTC time>.ok` next to its backup (the backup's name
+  (`offsite_unconfirmed`); a confirmation whose file changed size no longer counts, and neither does one without the
+  `cfapi_in_sync` evidence (recorded by the old attribute-bit check before 2026-11-18; the next confirmed run
+  replaces it). A fully successful run commits `onyx-backup-<UTC time>.ok` next to its backup (the backup's name
   and size, nothing else; written under a hidden name, renamed, read back); a backup counts as complete
   only when that marker reads back and matches the file. If the marker cannot be committed the run is
   **failed** (`marker_unwritable`, failed heartbeat, exit 1) and nothing is pruned. Every marker is

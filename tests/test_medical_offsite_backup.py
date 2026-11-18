@@ -342,7 +342,8 @@ class Base(unittest.TestCase):
             if self.dest.is_dir():
                 for p in self.dest.iterdir():
                     if ob.NAME_RE.match(p.name) and p.is_file():
-                        recs[p.name] = {"size": p.stat().st_size, "confirmed_at": NOW.isoformat(timespec="seconds")}
+                        recs[p.name] = {"size": p.stat().st_size, "evidence": ob.CONFIRMATION_EVIDENCE,
+                                       "confirmed_at": NOW.isoformat(timespec="seconds")}
             return recs
 
         load = mock.patch.object(ob, "load_remote_confirmations", confirm_all)
@@ -914,24 +915,38 @@ class Retention(Base):
                          "an older complete backup is not kept on age alone")
         self.assertIn("onyx-backup-20261112T000000Z.tar.age", keep, "the newest complete backup is kept")
 
-    def test_cloud_state_reads_the_placeholder_attribute_bits(self):
-        # State: the REAL onedrive_cloud_state (Base stubs it to in_sync). The file attributes are a synthetic
-        # fixture, and the path counts as under a OneDrive root; only the attribute bits vary.
+    def test_cloud_state_needs_the_explicit_in_sync_state(self):
+        # State: the REAL onedrive_cloud_state (Base stubs it to in_sync). The cloud-filter placeholder state
+        # is a synthetic fixture, and the path counts as under a OneDrive root. A pin, a placeholder or any
+        # other attribute alone is not evidence: only PLACEHOLDER + IN_SYNC reads in sync (BACKUP449-1).
         real = mock.patch.object(ob, "onedrive_cloud_state", self.real_cloud)
         real.start()
         self.addCleanup(real.stop)
+        PH, SYNC, PARTIAL = 0x1, 0x8, 0x10
+        cases = {
+            "pinned but not in sync (placeholder, essential props, no IN_SYNC)": (PH | 0x4, "pending_upload"),
+            "unpinned but not in sync (online-only placeholder still uploading)": (PH | PARTIAL, "pending_upload"),
+            "placeholder not in sync": (PH, "pending_upload"),
+            "IN_SYNC without being a placeholder": (SYNC, "pending_upload"),
+            "a plain local file": (0, "pending_upload"),
+            "unreadable or invalid state": (None, "pending_upload"),
+            "positively in sync": (PH | SYNC, "in_sync"),
+            "positively in sync, online-only": (PH | SYNC | PARTIAL, "in_sync"),
+        }
         with mock.patch.object(ob.os, "name", "nt"), mock.patch.object(ob, "under_onedrive", lambda p: True):
-            for bit in (0x00001000, 0x00040000, 0x00400000, 0x00080000, 0x00100000, 0x00000400):
-                with mock.patch.object(ob, "file_attributes", return_value=bit):
-                    self.assertEqual(ob.onedrive_cloud_state(self.dest), "in_sync", f"bit {bit:#x}")
-            with mock.patch.object(ob, "file_attributes", return_value=0):  # a plain local file
-                self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
-            with mock.patch.object(ob, "file_attributes", return_value=0x00000020):  # just "archive"
-                self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
-            with mock.patch.object(ob, "file_attributes", return_value=None):  # unreadable
-                self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
-        with mock.patch.object(ob, "under_onedrive", lambda p: False):  # outside every OneDrive root
+            for label, (state, want) in cases.items():
+                with mock.patch.object(ob, "placeholder_state", return_value=state):
+                    self.assertEqual(ob.onedrive_cloud_state(self.dest), want, label)
+        with mock.patch.object(ob, "under_onedrive", lambda p: False), \
+                mock.patch.object(ob, "placeholder_state", return_value=PH | SYNC):  # outside every OneDrive root
             self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
+        with mock.patch.object(ob.os, "name", "posix"), mock.patch.object(ob, "under_onedrive", lambda p: True), \
+                mock.patch.object(ob, "placeholder_state", return_value=PH | SYNC):  # off Windows
+            self.assertEqual(ob.onedrive_cloud_state(self.dest), "pending_upload")
+
+    def test_placeholder_state_is_unreadable_off_windows(self):
+        with mock.patch.object(ob.os, "name", "posix"):
+            self.assertIsNone(ob.placeholder_state(self.dest))
 
     def test_offsite_confirmed_polls_until_the_cloud_takes_the_file(self):
         reads = iter(["pending_upload", "pending_upload", "in_sync"])
@@ -1113,12 +1128,27 @@ class OffsiteConfirmation(Base):
         self.assertEqual((result.status, result.code), ("partial", "offsite_unconfirmed"))
         self.assertEqual(len(self.backups_here()), len(made) + 1, "a failed confirmation never deletes anything")
 
+    def test_a_confirmation_from_the_old_attribute_predicate_is_not_trusted(self):
+        # State: a record shaped like the ones the old attribute-bit predicate wrote (name, size, time, no
+        # evidence) matches its file exactly; it must not count as a remote copy, so nothing is pruned.
+        made = self.seed([datetime(2025, m, 1, tzinfo=timezone.utc) for m in range(1, 13)])
+        state = ob.remote_state_file()
+        state.parent.mkdir(parents=True, exist_ok=True)
+        legacy = {made[0].name: {"size": made[0].stat().st_size, "confirmed_at": NOW.isoformat(timespec="seconds")}}
+        state.write_bytes(ob._dump({"backups": legacy}))
+        self.assertEqual(ob.remote_confirmed_names(self.dest, ob.load_remote_confirmations()), set())
+        with self.assertRaises(ob.BackupError) as cm:
+            ob.prune(self.dest, NOW)
+        self.assertEqual(cm.exception.code, "offsite_unconfirmed")
+        self.assertTrue(all(p.exists() for p in made), "an untrusted old confirmation never deletes anything")
+
     def test_the_record_holds_name_size_and_time_only_and_stays_local(self):
         made = self.seed([datetime(2026, 3, 1, tzinfo=timezone.utc)])
         ob.record_remote_confirmation(self.dest, made[0].name, now=NOW)
         recs = self.real_load()
         self.assertEqual(set(recs), {made[0].name})
-        self.assertEqual(set(recs[made[0].name]), {"size", "confirmed_at"})
+        self.assertEqual(set(recs[made[0].name]), {"size", "evidence", "confirmed_at"})
+        self.assertEqual(recs[made[0].name]["evidence"], ob.CONFIRMATION_EVIDENCE)
         self.assertEqual(recs[made[0].name]["size"], made[0].stat().st_size)
         state = ob.remote_state_file()
         self.assertFalse(ob.under_onedrive(state), "the record never lives under OneDrive")
