@@ -9,9 +9,18 @@ import { useAutosave } from "@/lib/use-autosave";
  * One-tap asset/liability label for one balance (/financials: Unclassified, Assets and Liabilities
  * groups). The tap IS the action, so it saves at once (autosave); after a save the page is re-read so
  * the account moves to the group its new kind implies. Clear removes the override, so the source's
- * own label (or its absence) applies again.
+ * own label (or its absence) applies again. `current` is the override the row already has: the autosaver's
+ * baseline, so Clear on a row that was classified earlier (or before a refresh) is a change and is saved.
  */
-export default function KindOverride({ accountId, onSaved }: { accountId: string; onSaved?: () => void }) {
+export default function KindOverride({
+  accountId,
+  current,
+  onSaved,
+}: {
+  accountId: string;
+  current?: "asset" | "liability" | null;
+  onSaved?: () => void;
+}) {
   const { state, change, retry } = useAutosave<{ kind: "asset" | "liability" | null }>(
     `finance-kind:${accountId}`,
     {
@@ -21,7 +30,7 @@ export default function KindOverride({ accountId, onSaved }: { accountId: string
       // A tap saves at once; the value only ever changes by a tap, so there is nothing to debounce.
       delayMs: 0,
     },
-    { kind: null },
+    { kind: current ?? null },
   );
   const savedAt = state.savedAt;
   const lastSavedAt = useRef<number | null>(null);
