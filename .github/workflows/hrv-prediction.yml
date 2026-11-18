@@ -98,6 +98,15 @@ jobs:
             analysis_output/xgboost_hrv_model.manifest.json
           key: ${{ steps.select.outputs.key }}
 
+      - name: Restore the selected model from durable storage (cache entry evicted)
+        # PIPE-08-R4: the Actions cache drops entries after 7 days unused. The artifact is also
+        # in the private hrv-models bucket under its checksum; hrv_model_artifact.py checks the
+        # bytes against the selected checksum before writing them. A failure here leaves no model
+        # on disk, and the forecast is skipped by the artifact check below.
+        id: durable
+        if: steps.select.outputs.found == 'true' && steps.model-cache.outputs.cache-hit != 'true'
+        run: python hrv_model_artifact.py fetch --sha "${{ steps.select.outputs.sha }}"
+
       - name: Restore the newest cached training (registry not applied yet)
         # Rollout window only (sql/hrv_model_artifacts.sql not applied yet, so nothing can be
         # pinned or retired): the most recently saved TRAINING artifact. hrv_predict.py checks it
@@ -182,7 +191,7 @@ jobs:
           HRV_MODEL_PINNED: ${{ steps.select.outputs.pinned }}
           HRV_MODEL_PIN_BLOCKED: ${{ steps.select.outputs.pin_blocked }}
           HRV_MODEL_PIN_REASON: ${{ steps.select.outputs.pin_reason }}
-          HRV_MODEL_RESTORED: ${{ steps.model-cache.outputs.cache-hit }}
+          HRV_MODEL_RESTORED: ${{ (steps.model-cache.outputs.cache-hit == 'true' || steps.durable.outcome == 'success') && 'true' || '' }}
           # The publish step failed or wrote no output (continue-on-error) and a model was
           # trained in this run -> not_published; no training -> not_attempted (the served
           # model then came from the registry, which publishing cannot affect).
