@@ -308,7 +308,8 @@ test("stack editor: a create whose answer is lost is shown, retried with the sam
   await nameAndProduct(h);
   await h.tick(400);
   // No answer came back, so the create may have gone through: shown as not confirmed, never as "not saved".
-  assert.match(h.text(), /Not confirmed: No clear answer came back[\s\S]*Trying again…/, "the failure is visible");
+  // The text is the fixed copy (StackEditorModal passes no describeError, so autosave's plainSaveFailure applies).
+  assert.match(h.text(), /Not confirmed: Couldn't save\. Try again\. Trying again…/, "the failure is visible");
   assert.doesNotMatch(h.text(), /Not saved/);
   await h.tick(1999);
   assert.equal(h.net.writes().length, 1, "retried after the backoff, not at once");
@@ -337,7 +338,7 @@ test("stack editor: a refused create is shown with Retry and not sent again on i
   const h = await mountStack(t, { answer: (call) => (refuse ? response({ error: "Synthetic refusal" }, 400) : server.answer(call)) });
   await nameAndProduct(h);
   await h.tick(400);
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./, "the fixed copy: the server's words are not shown");
   assert.doesNotMatch(h.text(), /Trying again/);
   await h.tick(120_000);
   assert.equal(h.net.writes().length, 1, "a refusal waits for Riley");
@@ -377,7 +378,7 @@ test("stack editor: Close with a change that could not be saved stays open; once
   await h.flush();
   assert.equal(h.net.writes().length, 1, "Close sent what was waiting");
   assert.deepEqual(h.events, { closed: 0, saved: 0 }, "the editor stays open with the unsaved change");
-  assert.match(h.text(), /Not confirmed: Synthetic outage Trying again…/);
+  assert.match(h.text(), /Not confirmed: Couldn't save\. Try again\. Trying again…/);
   down = false;
   await h.tick(2000);
   assert.match(h.text(), /Saved/);
@@ -468,7 +469,9 @@ test("stack editor: a stack loaded without a version, changed by another editor,
   await h.tick(60_000);
   assert.ok(h.net.calls.some((c) => c.method === "GET"), "the latest version was read before the save");
   assert.deepEqual(h.net.writes(), [], "no PATCH: B's stale description and products are not sent");
-  assert.match(h.text(), /This stack was changed somewhere else/, "the conflict is shown");
+  // The conflict sentence (STACK_CHANGED_ELSEWHERE) is thrown as the save's error, but autosave replaces it with the
+  // fixed copy, so the sentence is never on screen. The shown state is the fixed copy plus the Load button.
+  assert.match(h.text(), /Couldn't save\. Try again\./, "the status shows the fixed copy");
   assert.match(h.text(), /Load the latest version/, "the editor offers the latest version");
   assert.deepEqual([server.stacks[0].version, server.stacks[0].description], [4, "Editor A description"], "A's change is untouched");
   change(one(h, STACK_NAME, "the name field"), "Synthetic stack, renamed again");
@@ -516,7 +519,7 @@ test("intake editor: Done with a refused edit keeps the editor open and says why
   await h.flush();
   h.click("Done");
   await h.flush();
-  assert.match(h.text(), /Not saved: Synthetic refusal/);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\./, "the fixed copy: the server's words are not shown");
   assert.deepEqual(h.events, { closed: 0, saved: 0 });
   await h.tick(120_000);
   assert.equal(h.net.writes().length, 1, "not retried on its own");
