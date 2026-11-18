@@ -31,3 +31,8 @@ export function isBusy(doc: { activeElement: Element | null; querySelector(s: st
   if (tag === "input" || tag === "textarea" || tag === "select" || el?.isContentEditable) return true;
   return !!doc.querySelector('[role="dialog"][aria-modal="true"], dialog[open]');
 }
+
+/** The web app is behind when the live deployment's commit differs from the one this page was built from. */
+export function webBehind(running: string | undefined | null, live: string | undefined | null): boolean {
+  return !!running && !!live && running !== live;
+}

@@ -26,3 +26,28 @@ test('stale report with an older build still says update; card shows for update 
 test('newestBuild picks the highest', () => {
   assert.deepEqual(u.newestBuild([null, { version: '1.4', build: '9' }, { version: '1.4', build: '10' }]), { version: '1.4', build: '10' });
 });
+
+test('the Focus build (superset) is the one to install when published', () => {
+  const d = { version: '0.1.0', build: '500' }, f = { version: '0.1.0', build: '480' };
+  assert.equal(u.installTarget(d, f), f);
+  assert.equal(u.installTarget(d, null), d);
+  assert.equal(u.installTarget(null, null), null);
+});
+test('only itms-services download links are install URLs', () => {
+  assert.equal(u.isInstallUrl('itms-services://?action=download-manifest&url=https%3A%2F%2Fx'), true);
+  assert.equal(u.isInstallUrl('https://evil.example/x'), false);
+  assert.equal(u.isInstallUrl(null), false);
+});
+test('hello validation', () => {
+  assert.deepEqual(u.parseHello({ variant: 'focus', app_version: '0.1.0', build: '465123' }), { variant: 'focus', app_version: '0.1.0', build: '465123' });
+  assert.equal(u.parseHello({ variant: 'x', app_version: '0.1.0', build: '1' }), null);
+  assert.equal(u.parseHello({ variant: 'default', app_version: '1; drop', build: '1' }), null);
+  assert.equal(u.parseHello({ variant: 'default', app_version: '1.0', build: 5 }), null);
+  assert.equal(u.parseHello(null), null);
+});
+test('trust step only when the installed build predates the current certificate', () => {
+  assert.equal(u.needsTrustStep({ version: '0.1.0', build: '100' }, '200'), true);
+  assert.equal(u.needsTrustStep({ version: '0.1.0', build: '300' }, '200'), false);
+  assert.equal(u.needsTrustStep(null, '200'), false);
+  assert.equal(u.needsTrustStep({ version: '0.1.0', build: '100' }, null), false);
+});

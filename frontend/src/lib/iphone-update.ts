@@ -21,6 +21,10 @@ export interface UpdateStatus {
   available: string | null;
   /** When the phone last reported (ISO), null when never. */
   reportedAt: string | null;
+  /** Over-the-air install link (itms-services) of the build to install; null when none is published. */
+  installUrl?: string | null;
+  /** True only when the build is signed with a new certificate: iOS then needs a trust step in Settings. */
+  needsTrust?: boolean;
 }
 
 /** A phone that has not synced for this long may have been updated (or broken) without Onyx knowing. */
@@ -85,4 +89,44 @@ export function newestBuild(builds: Array<(AppBuildId & { built_at?: string | nu
 /** Today shows the card for "update" and "check"; hidden when current or unknown. */
 export function showUpdateCard(s: UpdateStatus | null): boolean {
   return !!s && (s.verdict === "update" || s.verdict === "check");
+}
+
+/**
+ * The one build to install. The Focus build is a superset of the Screen Time build (same sources, same bundle id,
+ * plus the Focus extension), so it wins whenever it is published; otherwise the Screen Time build.
+ */
+export function installTarget<T extends AppBuildId>(defaultBuild: T | null, focusBuild: T | null): T | null {
+  return focusBuild ?? defaultBuild;
+}
+
+/** Only an over-the-air install link may be handed to the phone. */
+export function isInstallUrl(u: unknown): u is string {
+  return typeof u === "string" && u.length < 4096 && u.startsWith("itms-services://?action=download-manifest&url=");
+}
+
+export interface Hello {
+  variant: "default" | "focus";
+  app_version: string;
+  build: string;
+}
+
+/** Validates the app's launch hello (POST /api/screen-time/latest-build); null = reject with 400. */
+export function parseHello(body: unknown): Hello | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as Record<string, unknown>;
+  const ok = (v: unknown): v is string => typeof v === "string" && /^[0-9][0-9.]{0,31}$/.test(v);
+  if (b.variant !== "default" && b.variant !== "focus") return null;
+  if (!ok(b.app_version) || !ok(b.build)) return null;
+  return { variant: b.variant, app_version: b.app_version, build: b.build };
+}
+
+/**
+ * iOS asks for a trust step in Settings only when the new build is signed with a different certificate than the
+ * installed one. publish_build.py records signing_since_build (the first build signed with the current certificate,
+ * carried forward while the certificate stays the same). The installed build is older than that = a new certificate.
+ * Unknown on either side = no extra step shown.
+ */
+export function needsTrustStep(installed: AppBuildId | null, signingSinceBuild: string | null): boolean {
+  if (!installed || !signingSinceBuild || !/^[0-9][0-9.]*$/.test(signingSinceBuild)) return false;
+  return compareBuilds({ version: "0", build: installed.build }, { version: "0", build: signingSinceBuild }) < 0;
 }

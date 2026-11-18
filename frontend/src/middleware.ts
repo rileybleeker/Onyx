@@ -27,6 +27,8 @@ function isCiRoute(pathname: string): boolean {
     pathname === "/api/reading/highlights/import" ||
     // Onyx Screen Time iPhone app (tools/screentime_ios, 2026-11-09)
     pathname === "/api/screen-time/usage" ||
+    // The app's hello + newest-build answer on every open (2026-11-17): records the installed version, returns the install link. Exact path.
+    pathname === "/api/screen-time/latest-build" ||
     // Apple Health upload from the same iPhone app (HealthKit, 2026-11-17). Exact path.
     pathname === "/api/apple-health/import" ||
     pathname === "/api/delivery/items/import" ||
