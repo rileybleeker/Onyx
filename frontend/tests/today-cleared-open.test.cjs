@@ -43,6 +43,37 @@ test('the cleared list renders only when clearedOpen has items, and its heading 
   assert.match(source, /\{clearedOpen\.map\(\(item\) => </, 'list items come from clearedOpen');
 });
 
+test('the All open items count and empty state include the cleared-but-open collection', () => {
+  const countDefinition = source.split('\n').find((line) => line.includes('const openRowCount ='));
+  assert.ok(countDefinition, 'openRowCount definition exists');
+  assert.match(
+    countDefinition,
+    /const openRowCount = listed\.length \+ clearedOpen\.length;/,
+    'row count is the ranked list plus the cleared-but-open cards',
+  );
+  assert.match(
+    source,
+    /<summary>All open items \(\{openRowCount\}\)<\/summary>/,
+    'summary shows openRowCount, not listed.length alone',
+  );
+  assert.match(
+    source,
+    /\{openRowCount === 0 \? <p className="mt-1 text-sm text-text-secondary">Nothing open from the sources that answered\.<\/p>/,
+    'the empty message is gated on openRowCount === 0 (both collections empty)',
+  );
+  assert.doesNotMatch(source, /<summary>All open items \(\{listed\.length\}\)<\/summary>/, 'summary no longer counts listed alone');
+  assert.doesNotMatch(source, /\{listed\.length === 0 \? <p/, 'empty state no longer checks listed alone');
+});
+
+test('cleared-only case: no rows in the ranked list and one cleared-but-open request gives count 1 and no empty message', () => {
+  // Mirrors the render logic with synthetic data: the same expressions as TodayClient.tsx.
+  const listed = [];
+  const clearedOpen = [{ thread: 't-1', messageId: 7, kind: 'card', card: { code: 'A1', name: 'Synthetic request' } }];
+  const openRowCount = listed.length + clearedOpen.length;
+  assert.equal(openRowCount, 1, 'summary reads 1');
+  assert.equal(openRowCount === 0, false, 'empty message is not shown');
+});
+
 test('the React key for each cleared row includes thread, messageId and card.code', () => {
   assert.match(
     source,

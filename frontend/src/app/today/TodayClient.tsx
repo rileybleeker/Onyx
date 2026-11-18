@@ -627,6 +627,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   }) : null;
   const selection = attention ? selectQuiet(attention.obligations, attention.sources, { budget: quiet.budget, learning: quiet.learning, marks, nowMs }) : null;
   const listed = attention ? fullList(attention.obligations, marks, nowMs) : [];
+  // Every row the All open items disclosure renders: the ranked list plus the cleared-but-open cards. The two come from
+  // different inbox fields (items vs dismissedOpen) and the ranked list is keyed by `agents:<CODE>`, so no row is counted twice.
+  const openRowCount = listed.length + clearedOpen.length;
   // Render again when the selection changes by itself (a snooze ends, an item becomes due): a set-aside item comes
   // back on time even while Today stays open between refreshes. Only a render: nothing is read or written.
   const nextChange = selection?.nextChange ?? null;
@@ -765,8 +768,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
         {selection.unknown.length > 0 && <p className="mt-3 break-words text-sm text-mid">Not confirmed: {sourceList(selection.unknown)}. Something from {selection.unknown.length === 1 ? "it" : "them"} may be missing.</p>}
         {selection.notConnected.length > 0 && <p className="mt-1 break-words text-xs text-text-secondary">Not connected yet: {selection.notConnected.map((st) => st.label).join(", ")}.</p>}
         <details className="mt-4">
-          <summary>All open items ({listed.length})</summary>
-          {listed.length === 0 ? <p className="mt-1 text-sm text-text-secondary">Nothing open from the sources that answered.</p>
+          <summary>All open items ({openRowCount})</summary>
+          {openRowCount === 0 ? <p className="mt-1 text-sm text-text-secondary">Nothing open from the sources that answered.</p>
             : <ul aria-label="All open items" className="mt-1 divide-y divide-border-subtle">
               {listed.map(({ item, state, until }) => <li key={item.id} className="flex items-start gap-2 py-3">
                 <div className="min-w-0 flex-1">
