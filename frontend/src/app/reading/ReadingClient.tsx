@@ -22,7 +22,6 @@ import ReviewCard from "./ReviewCard";
 import PacingCard from "./PacingCard";
 import { useLearningPrefs } from "@/lib/use-learning-prefs";
 import PracticePart from "./PracticePart";
-import RetrievalSession from "./RetrievalSession";
 import ChapterMap from "./ChapterMap";
 import CheckpointQuiz from "./CheckpointQuiz";
 import ConceptPicker from "./ConceptPicker";
@@ -339,10 +338,6 @@ export default function ReadingClient({ feed = false }: { feed?: boolean } = {})
             onChanged={() => load(slug, true)}
             review={<ReviewCard o={o} onGraded={(xp) => { if (xp && incentives) showToast({ text: `+${xp} XP · review day`, kind: "xp" }); load(slug, true); }} onRefresh={() => load(slug, true)} />}
           />
-        </Part>
-
-        <Part id="retrieval" title="Practice from memory">
-          <RetrievalSession key={o.book.slug} o={o} />
         </Part>
 
         {/* Sessions are logged on Log (one place to enter data); the Session log below lists them. */}
