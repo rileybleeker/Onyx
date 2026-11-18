@@ -334,7 +334,7 @@ test("client: an outage is retried on its own", async (t) => {
   const h = await mount(t, { onPost: async () => down ? response({ error: "Synthetic outage" }, 503) : response({ success: true }) });
   h.click(`${DAY}: yes`); await h.flush();
   await h.tick();
-  assert.match(h.text(), /Not saved: Save failed \(503\)\. Your answers are still here\. Trying again…/);
+  assert.match(h.text(), /Not saved: Couldn't save\. Try again\. Trying again…/);
   assert.doesNotMatch(h.text(), /Synthetic outage/, "the server's own error text is never shown");
   down = false;
   await h.tick(2000);
