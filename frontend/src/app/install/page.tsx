@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import FocusUnlockSettings from "@/components/FocusUnlockSettings";
+import { installTarget } from "@/lib/iphone-update";
 import { BUILD_VARIANTS, buildApiUrl, type BuildVariant } from "@/lib/install-builds";
 
 /**
@@ -256,9 +257,40 @@ function FocusBuildCard() {
   );
 }
 
+/**
+ * /install?auto=1 (opened in Safari by Today's Update everything button): as soon as the newest build is known
+ * (Focus when published, else Screen Time) go straight to its install link so iOS shows its Install prompt. A big
+ * button stays as the fallback in case the automatic navigation is blocked.
+ */
+function AutoInstall() {
+  const d = useBuild("default");
+  const f = useBuild("focus");
+  const ready = (b: ReturnType<typeof useBuild>) => (b.state === "ready" && b.build && !b.expired ? b.build : null);
+  const target = installTarget(ready(f), ready(d));
+  const settled = d.state !== "loading" && f.state !== "loading";
+  const link = target?.link_a ?? null;
+  useEffect(() => {
+    if (link) window.location.href = link;
+  }, [link]);
+  if (!settled) return <p className="text-text-tertiary text-sm">Preparing the install…</p>;
+  if (!link) return <p className="text-down text-sm">No installable build is available right now.</p>;
+  return (
+    <a
+      href={link}
+      className="block w-full text-center bg-accent hover:bg-accent/90 text-on-accent font-medium py-4 rounded-full text-lg transition-colors"
+    >
+      Install
+    </a>
+  );
+}
+
 export default function InstallPage() {
   const { build, state, reason, expired } = useBuild("default");
   const standalone = useStandalone();
+  const [auto, setAuto] = useState(false);
+  useEffect(() => {
+    setAuto(new URLSearchParams(window.location.search).get("auto") === "1");
+  }, []);
 
   return (
     <div className="min-h-screen bg-surface px-4 py-12">
@@ -269,6 +301,7 @@ export default function InstallPage() {
         </div>
 
         {standalone && <SafariHandoff />}
+        {auto && !standalone && <AutoInstall />}
 
         {state === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
 

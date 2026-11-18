@@ -130,3 +130,16 @@ export function needsTrustStep(installed: AppBuildId | null, signingSinceBuild: 
   if (!installed || !signingSinceBuild || !/^[0-9][0-9.]*$/.test(signingSinceBuild)) return false;
   return compareBuilds({ version: "0", build: installed.build }, { version: "0", build: signingSinceBuild }) < 0;
 }
+
+/**
+ * Where Today's "Update everything" button points. iOS blocks itms-services links inside the home-screen (standalone)
+ * app, so there the button opens /install?auto=1 in Safari through the x-safari-https scheme; /install then starts
+ * the install on its own. In Safari the direct install link is kept. Null = no link (caller falls back).
+ */
+export function updateHref(installUrl: string | null, standalone: boolean, origin: string): string | null {
+  if (standalone) {
+    const m = /^https:\/\/([^/]+)$/.exec(origin);
+    return m ? `x-safari-https://${m[1]}/install?auto=1` : null;
+  }
+  return installUrl;
+}

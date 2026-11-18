@@ -43,8 +43,8 @@ import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid"
 import WindDownPanel, { useWindDownToday } from "@/components/sleep/WindDownPanel";
 import HomeResetPanel from "@/components/HomeResetPanel";
 import { useHomeResetToday } from "@/lib/use-home-reset";
-import { useIphoneUpdate } from "@/lib/use-iphone-update";
-import { showUpdateCard } from "@/lib/iphone-update";
+import { useIphoneUpdate, useStandaloneApp } from "@/lib/use-iphone-update";
+import { showUpdateCard, updateHref } from "@/lib/iphone-update";
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;
@@ -567,6 +567,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const windDown = useWindDownToday();
   const homeReset = useHomeResetToday();
   const everything = useIphoneUpdate();
+  const standaloneApp = useStandaloneApp();
   const iphoneUpdate = showUpdateCard(everything.status) ? everything.status : null;
   const [updateTapped, setUpdateTapped] = useState(false);
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
@@ -739,7 +740,8 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
           the top of Today with one filled Install button, shown only when the phone is behind or has not reported. */}
       {(iphoneUpdate || everything.webBehind) && (() => {
         const parts = [iphoneUpdate ? `iPhone app ${iphoneUpdate.available ?? ""}`.trim() : null, everything.webBehind ? "Onyx web" : null].filter(Boolean).join(" · ");
-        const url = iphoneUpdate?.installUrl ?? null;
+        // Inside the home-screen app iOS ignores itms-services, so the button hands off to Safari (/install?auto=1 installs by itself).
+        const url = updateHref(iphoneUpdate?.installUrl ?? null, standaloneApp && !!iphoneUpdate, window.location.origin);
         const needsTrust = !!iphoneUpdate?.needsTrust;
         // One tap: the install link opens iOS's own install prompt (no re-trust, Developer Mode stays on, because every
         // build is signed with the same certificate and bundle id). The web app reloads onto the newest deployment behind it.
