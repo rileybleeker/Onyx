@@ -35,6 +35,10 @@ class FakeStorage:
     def public_url(self, bucket, path):
         return f"https://example.invalid/public/{bucket}/{path}"
 
+    def call(self, method, route, body=None, headers=None, ok_statuses=(200, 201)):
+        # publish_build reads the previous latest.json (signing continuity, #804); none exists here.
+        raise RuntimeError(f"{method} {route} -> HTTP 404: not found")
+
 
 class PublishPrefix(unittest.TestCase):
     def publish(self, prefix):

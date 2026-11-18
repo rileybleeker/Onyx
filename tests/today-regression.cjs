@@ -67,6 +67,11 @@ component = component.replace(/require\("@\/lib\/today-lapse"\)/g, `require(${la
 // set up, so Today renders and requests exactly what it did before (same approach as the wind-down panel above).
 component = component.replace(/require\("@\/components\/HomeResetPanel"\)/g, '({__esModule:true,default:()=>null})')
   .replace(/require\("@\/lib\/use-home-reset"\)/g, '({__esModule:true,useHomeResetToday:()=>({show:false})})');
+// The update card (lib/iphone-update, import-free, bundled by name; lib/use-iphone-update, added in #797/#804) needs a
+// phone report and a deployment version: here neither exists, so the hook reports nothing and Today renders as before.
+const iphoneLib = ids.size; ids.set('frontend/src/lib/iphone-update.ts', iphoneLib); modules[iphoneLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/iphone-update.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
+component = component.replace(/require\("@\/lib\/iphone-update"\)/g, `require(${iphoneLib})`)
+  .replace(/require\("@\/lib\/use-iphone-update"\)/g, '({__esModule:true,useIphoneUpdate:()=>({status:null,webBehind:false}),useStandaloneApp:()=>false})');
 // GET /api/experiments/today answers (synthetic). "none" is the usual case: no trial registered.
 const experimentFixtures = {
     none: { status: 'none' },
