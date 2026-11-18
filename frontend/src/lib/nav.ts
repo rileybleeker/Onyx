@@ -26,6 +26,7 @@ import {
   BookMarked,
   Smartphone,
   NotebookPen,
+  TabletSmartphone,
 } from "lucide-react";
 
 /**
@@ -96,6 +97,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { href: "/financials/forecast", label: "Cash forecast", shortcut: "4", icon: Wallet, keywords: ["forecast", "cash flow", "projection", "bonus", "taxes", "0%", "promo", "balance transfer", "what if", "safe to move"] },
       { href: "/nyc", label: "NYC Search", shortcut: "Y", icon: Building2, keywords: ["apartment", "move", "new york", "listings", "leads", "rent", "scout", "manhattan"] },
       { href: "/chat", label: "Onyx Chat", shortcut: "C", icon: MessageSquare, keywords: ["ask", "claude", "assistant", "query", "chat", "health", "writing", "planning"] },
+      { href: "/install", label: "iPhone app", shortcut: "2", icon: TabletSmartphone, keywords: ["install", "update", "ios", "screen time", "focus", "build", "phone app", "testflight", "download"] },
       { href: "/status", label: "Status", shortcut: "U", icon: ShieldCheck, keywords: ["system", "sync", "etl", "health", "freshness"] },
     ],
   },

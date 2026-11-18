@@ -10,7 +10,7 @@ import { BUILD_VARIANTS, buildApiUrl, type BuildVariant } from "@/lib/install-bu
  * /api/screen-time/build and shows its two install links, plus a second card
  * for the Focus development build (/api/screen-time/build?variant=focus).
  * Open this page in Safari on the iPhone itself: the itms-services links only
- * work there. Deliberately not in the nav — it is a setup utility, used a few
+ * work there. In the nav as "iPhone app" (not in the continuous scroll); inside the home-screen app it shows an Open in Safari hand-off. Formerly not in the nav — it is a setup utility, used a few
  * times a year.
  */
 
@@ -118,6 +118,63 @@ function CopyTokenButton() {
   );
 }
 
+/**
+ * True inside the installed home-screen Onyx app (iOS sets navigator.standalone; other browsers report the
+ * display-mode media query). Read after mount so the server render and first client render agree.
+ */
+function useStandalone(): boolean {
+  const [standalone, setStandalone] = useState(false);
+  useEffect(() => {
+    const nav = navigator as Navigator & { standalone?: boolean };
+    setStandalone(nav.standalone === true || window.matchMedia("(display-mode: standalone)").matches);
+  }, []);
+  return standalone;
+}
+
+/**
+ * itms-services:// links (the over-the-air install) only work in Safari proper; the home-screen app is a
+ * separate web-content view that ignores them. Inside it, offer a hand-off to Safari.
+ *
+ * How: the `x-safari-https://` scheme. iOS routes it to Safari for any https page and, unlike window.open or
+ * target="_blank", it also works for an address inside the app's own scope (/install is in scope, so
+ * window.open would just navigate within the standalone window). It is a long-stable but undocumented iOS
+ * behavior (in-app browsers use it to escape to Safari) and has not been confirmed on iOS 26 from this page,
+ * so the card also keeps a Copy link fallback to paste into Safari by hand.
+ */
+function SafariHandoff() {
+  const [copied, setCopied] = useState(false);
+  const here = typeof window === "undefined" ? "" : `${window.location.origin}/install`;
+  return (
+    <div className="bg-surface-card border border-border-subtle rounded-card shadow-card p-6 space-y-3">
+      <h2 className="text-base font-medium text-text-primary">Install from Safari</h2>
+      <p className="text-text-secondary text-sm">
+        The install buttons only work in Safari, not inside this app. Open this page in Safari, then tap Install there.
+      </p>
+      <a
+        href={`x-safari-${here}`}
+        className="block w-full text-center bg-accent hover:bg-accent/90 text-on-accent font-medium py-2.5 rounded-full text-sm transition-colors"
+      >
+        Open in Safari
+      </a>
+      <button
+        type="button"
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(here);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          } catch {
+            setCopied(false);
+          }
+        }}
+        className="text-text-tertiary hover:text-text-secondary text-xs transition-colors"
+      >
+        {copied ? "Copied. Paste it in Safari." : "Nothing happened? Copy the link and paste it in Safari"}
+      </button>
+    </div>
+  );
+}
+
 type LoadState = "loading" | "ready" | "none" | "error";
 
 function useBuild(variant: BuildVariant) {
@@ -201,6 +258,7 @@ function FocusBuildCard() {
 
 export default function InstallPage() {
   const { build, state, reason, expired } = useBuild("default");
+  const standalone = useStandalone();
 
   return (
     <div className="min-h-screen bg-surface px-4 py-12">
@@ -209,6 +267,8 @@ export default function InstallPage() {
           <h1 className="text-2xl font-semibold text-text-primary mb-1">Onyx Screen Time</h1>
           <p className="text-text-tertiary text-sm">Open this page in Safari on the iPhone.</p>
         </div>
+
+        {standalone && <SafariHandoff />}
 
         {state === "loading" && <p className="text-text-tertiary text-sm">Loading…</p>}
 
