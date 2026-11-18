@@ -448,7 +448,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           EXPECT_BUNDLE_ID: ${{ env.BUNDLE_ID }}
-        IDENTITY_SHA1: ${{ env.IDENTITY_SHA1 }}
+          IDENTITY_SHA1: ${{ env.IDENTITY_SHA1 }}
         run: python3 tools/screentime_ios/ci/publish_build.py
 
       - name: Clean up keychain and profile

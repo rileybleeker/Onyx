@@ -738,7 +738,7 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       {/* iPhone app update (Riley 2026-11-18: "I should be able to see that there is a new build to install"): a banner at
           the top of Today with one filled Install button, shown only when the phone is behind or has not reported. */}
       {(iphoneUpdate || everything.webBehind) && (() => {
-        const parts = [iphoneUpdate ? `iPhone app ${iphoneUpdate.available ?? ""}`.trim() : null, everything.webBehind ? "Onyx web" : null].filter(Boolean).join(" · ");
+        const parts = [iphoneUpdate ? `iPhone app ${iphoneUpdate.available ?? ""}`.trim() : null, everything.webBehind ? "Onyx web" : null].filter(Boolean).join(" Â· ");
         const url = iphoneUpdate?.installUrl ?? null;
         const needsTrust = !!iphoneUpdate?.needsTrust;
         // One tap: the install link opens iOS's own install prompt (no re-trust, Developer Mode stays on, because every
