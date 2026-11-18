@@ -436,7 +436,8 @@ function QuestCard({ o, incentives }: { o: ReadingOverview; incentives: boolean 
 
   return (
     <section className="bg-surface-card border border-border-subtle rounded-card shadow-card p-4" data-testid="reading-quest">
-      <div className="flex gap-4 items-center">
+      {/* Phone width: the ring sits above and the level / stats take the full card width; from sm up they sit beside it. */}
+      <div className="flex flex-col sm:flex-row gap-4 sm:items-center">
         <MetricRing
           value={o.chaptersDone}
           max={Math.max(1, o.totalChapters)}
@@ -447,7 +448,7 @@ function QuestCard({ o, incentives }: { o: ReadingOverview; incentives: boolean 
           centerUnit={`/ ${o.totalChapters || "?"}`}
           sublabel="chapters"
         />
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 w-full">
           <div className="flex items-baseline justify-between gap-2">
             <div className="text-[11px] font-mono uppercase tracking-wider text-text-tertiary">
               Level {o.level.n} · {o.level.title}
@@ -503,8 +504,8 @@ function Stat({ icon, label, value, sub, valueClass, subClass }: { icon?: React.
         {icon}
         {label}
       </div>
-      <div className={`mt-0.5 font-mono text-[15px] text-text-primary truncate ${valueClass ?? ""}`}>{value}</div>
-      {sub ? <div className={`text-[10px] font-mono truncate ${subClass ?? "text-text-tertiary"}`}>{sub}</div> : null}
+      <div className={`mt-0.5 font-mono text-[15px] text-text-primary break-words ${valueClass ?? ""}`}>{value}</div>
+      {sub ? <div className={`text-[10px] font-mono break-words ${subClass ?? "text-text-tertiary"}`}>{sub}</div> : null}
     </div>
   );
 }
@@ -783,7 +784,7 @@ function HighlightForm({ o, onAdded, onSaved, onError }: { o: ReadingOverview; o
             placeholder="Your comment. Why it matters, or where it shows up in BC."
             className="mt-2 w-full bg-white/[0.03] border border-border-subtle rounded-control px-3 py-2 text-[14px] text-text-primary italic"
           />
-          <div className="mt-2 grid grid-cols-[88px_1fr] gap-2">
+          <div className="mt-2 grid grid-cols-[88px_minmax(0,1fr)] gap-2">
             <input
               type="number"
               inputMode="numeric"
