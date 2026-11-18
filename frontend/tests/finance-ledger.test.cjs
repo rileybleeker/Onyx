@@ -151,9 +151,11 @@ test("kind overrides: a per-account override labels an unclassified balance, and
   assert.equal(nw.unclassified.length, 0);
   assert.equal(nw.assets.length, 2);
   assert.equal(nw.liabilities.length, 1);
-  assert.equal(nw.assetsCents, 10000);
+  // Hand-derived: assets = a 10000 + c 9990000 = 10000000 (c is an asset in the fixture, so it counts); liabilities = b 5000.
+  assert.equal(nw.assetsCents, 10000000);
   assert.equal(nw.liabilitiesCents, 5000);
-  assert.equal(nw.netWorthCents, 5000);
+  // Hand-derived: 10000000 - 5000 = 9995000.
+  assert.equal(nw.netWorthCents, 9995000);
 });
 
 test("kind override rows parse only clean (account_id, asset|liability); malformed rows are dropped", () => {
