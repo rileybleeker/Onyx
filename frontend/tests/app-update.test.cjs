@@ -38,3 +38,11 @@ test('typing in a field or an open dialog counts as busy', () => {
   assert.equal(isBusy(doc('BUTTON')), false);
   assert.equal(isBusy(doc(null)), false);
 });
+
+test('webBehind: only when both commits are known and differ', () => {
+  const { webBehind } = require(path.join(out, 'app-update.js'));
+  assert.equal(webBehind('a', 'b'), true);
+  assert.equal(webBehind('a', 'a'), false);
+  assert.equal(webBehind(undefined, 'b'), false);
+  assert.equal(webBehind('a', null), false);
+});

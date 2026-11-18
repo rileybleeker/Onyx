@@ -566,8 +566,9 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
   const lifeFailed = (key: keyof LifeChecks) => lifeChecks[key].state === "failed";
   const windDown = useWindDownToday();
   const homeReset = useHomeResetToday();
-  const iphone = useIphoneUpdate();
-  const iphoneUpdate = showUpdateCard(iphone) ? iphone : null;
+  const everything = useIphoneUpdate();
+  const iphoneUpdate = showUpdateCard(everything.status) ? everything.status : null;
+  const [updateTapped, setUpdateTapped] = useState(false);
   // "Keep life moving" shows a different number of panels each day: widths that fill whole rows (lib/today-view.ts),
   // counted over the panels Riley's layout shows (a part hidden in Personalize leaves no empty track).
   const lifeParts = [checkLines.length > 0 ? "also-checked" : null, packages ? "packages" : null, money && moneyPanel ? "money" : null, renewing ? "renewals" : null, windDown.show ? "wind-down" : null, homeReset.show ? "home-reset" : null, "reading", "check-in"]
@@ -736,12 +737,27 @@ export default function TodayClient({ headingTestId = "page-heading", feed = fal
       <p role="status" aria-live="polite" className="sr-only">{pending ? "Refreshing Today" : unavailable ? "Some information could not be refreshed. Check the section messages." : "Today refresh finished"}</p>
       {/* iPhone app update (Riley 2026-11-18: "I should be able to see that there is a new build to install"): a banner at
           the top of Today with one filled Install button, shown only when the phone is behind or has not reported. */}
-      {iphoneUpdate && <section aria-labelledby="iphone-update-heading" className={`${panelStyle} flex flex-wrap items-center justify-between gap-3`}>
-        <div className="flex items-center gap-2 min-w-0"><TabletSmartphone aria-hidden="true" className={iconStyle} />
-          <div className="min-w-0"><h2 id="iphone-update-heading" className={titleStyle}>{iphoneUpdate.verdict === "update" ? "iPhone app update ready" : "New iPhone app build"}</h2>
-          <p className="text-sm text-text-secondary">{iphoneUpdate.verdict === "update" ? `${iphoneUpdate.installed} on your phone; ${iphoneUpdate.available} is ready.` : `${iphoneUpdate.available} is ready to install.`}</p></div></div>
-        <Link href="/install" className="min-h-11 inline-flex items-center rounded-full bg-accent px-5 text-sm font-medium text-on-accent">Install iPhone app</Link>
-      </section>}
+      {(iphoneUpdate || everything.webBehind) && (() => {
+        const parts = [iphoneUpdate ? `iPhone app ${iphoneUpdate.available ?? ""}`.trim() : null, everything.webBehind ? "Onyx web" : null].filter(Boolean).join(" · ");
+        const url = iphoneUpdate?.installUrl ?? null;
+        const needsTrust = !!iphoneUpdate?.needsTrust;
+        // One tap: the install link opens iOS's own install prompt (no re-trust, Developer Mode stays on, because every
+        // build is signed with the same certificate and bundle id). The web app reloads onto the newest deployment behind it.
+        const onTap = () => {
+          setUpdateTapped(true);
+          if (everything.webBehind) window.setTimeout(() => window.location.reload(), url ? 2500 : 0);
+        };
+        const cls = "min-h-11 inline-flex items-center rounded-full bg-accent px-5 text-sm font-medium text-on-accent";
+        return <section aria-labelledby="iphone-update-heading" className={`${panelStyle} flex flex-wrap items-center justify-between gap-3`}>
+          <div className="flex items-center gap-2 min-w-0"><TabletSmartphone aria-hidden="true" className={iconStyle} />
+            <div className="min-w-0"><h2 id="iphone-update-heading" className={titleStyle}>Update available</h2>
+            <p className="text-sm text-text-secondary">{parts}</p>
+            {updateTapped && needsTrust && <p className="text-sm text-mid">New signing certificate: after the install, open Settings, General, VPN &amp; Device Management and trust the developer. <a href="App-Prefs:General&path=ManagedConfigurationList" className="underline underline-offset-4">Open that Settings page</a></p>}</div></div>
+          {url ? <a href={url} onClick={onTap} className={cls}>Update everything</a>
+            : iphoneUpdate ? <Link href="/install" onClick={onTap} className={cls}>Update everything</Link>
+            : <button type="button" onClick={onTap} className={cls}>Update everything</button>}
+        </section>;
+      })()}
       {quietSave === "failed" && !quiet.on && <p className="text-xs text-mid">Couldn&apos;t save the quiet view setting to your account; it is kept on this device. <button type="button" onClick={retryQuiet} className="underline underline-offset-4">Retry</button></p>}
       {selection ? <section data-today-quiet="" aria-labelledby="quiet-heading" aria-busy={pending} className={`${panelStyle} ${styles.quiet}`}>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">

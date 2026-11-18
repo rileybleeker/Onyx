@@ -223,7 +223,26 @@ def main():
         fetch_like_the_phone("ipa HEAD", ipa_url, "application/octet-stream", method="HEAD", fatal=False)
         fetch_like_the_phone("ipa GET", ipa_url, "application/octet-stream")
 
+        # Signing continuity (so the app and Today only show a Settings trust step when it is really needed):
+        # `signing` is a hash of the certificate's SHA-1 (never the SHA-1 itself); `signing_since_build` is the first
+        # build signed with it, carried forward from the previous latest.json while the certificate stays the same.
+        signing = ""
+        if env.get("IDENTITY_SHA1"):
+            import hashlib
+            signing = hashlib.sha256(env["IDENTITY_SHA1"].encode()).hexdigest()[:16]
+        build_no = str(info.get("CFBundleVersion", ""))
+        since = build_no
+        try:
+            _, old_raw = storage.call("GET", f"/object/authenticated/{private_bucket}/{urllib.parse.quote(folder)}/latest.json")
+            old = json.loads(old_raw)
+            if signing and old.get("signing") == signing and str(old.get("signing_since_build", "")).strip():
+                since = str(old["signing_since_build"])
+        except (RuntimeError, ValueError):
+            pass
+
         latest = {
+            "signing": signing or None,
+            "signing_since_build": since,
             "run_number": int(run) if run.isdigit() else run,
             "sha": sha,
             "built_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

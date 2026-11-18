@@ -135,10 +135,26 @@ final class AppModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var update = AppUpdateModel.shared
 
     var body: some View {
         NavigationStack {
             Form {
+                if let label = update.availableLabel {
+                    Section {
+                        Button {
+                            update.install()
+                        } label: {
+                            Text("Update to \(label)").font(.headline).frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        if update.tapped && update.needsTrust {
+                            Text("New signing certificate: after the install, trust the developer in Settings.")
+                                .font(.footnote)
+                            Button("Open Settings: VPN & Device Management") { update.openTrustSettings() }
+                        }
+                    }
+                }
 #if ONYX_FOCUS
                 Section("Focus") {
                     NavigationLink("Configure social media rules") { FocusSettingsView() }
@@ -213,6 +229,8 @@ struct ContentView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     model.refreshStatus()
+                    Task { await update.check() }
+                    Task { await AutoScreenTimeSync.runIfDue() }
 #if !ONYX_FOCUS
                     Task { await HealthSync.syncIfDue() }
 #endif
@@ -230,6 +248,9 @@ struct ContentView: View {
             .task {
                 _ = await ScreenTimeExporter.restoreDataAccess()
                 model.refreshStatus()
+                // onChange(of: scenePhase) does not fire for the first launch, so the same two steps run here too.
+                await update.check()
+                await AutoScreenTimeSync.runIfDue()
 #if ONYX_FOCUS
                 FocusEnforcement.reconcile()
                 await FocusHabitModel.shared.refresh()

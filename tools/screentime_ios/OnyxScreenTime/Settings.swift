@@ -27,6 +27,12 @@ enum Settings {
     }
 
     // Apple Health (HealthSync.swift): when it last synced, what it said, and whether it was set up once.
+    /// The build number this app last ran its open-time Screen Time sync for (AppUpdate.swift).
+    static var lastSeenBuild: String? {
+        get { defaults.string(forKey: "lastSeenBuild") }
+        set { defaults.set(newValue, forKey: "lastSeenBuild") }
+    }
+
     static var lastHealthSync: Date? {
         get { defaults.object(forKey: "lastHealthSync") as? Date }
         set { defaults.set(newValue, forKey: "lastHealthSync") }
