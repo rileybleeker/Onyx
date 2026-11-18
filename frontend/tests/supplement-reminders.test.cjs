@@ -88,6 +88,12 @@ function makeDb({ tz = 'America/New_York', failOn = null, seed = {} } = {}) {
       assert.ok(rows, `unknown table ${this.table}`);
       let affected;
       if (this.op === 'insert') {
+        // Mirrors the live unique index uq_supplement_intake_client_event (client_event_key, client_event_line)
+        // WHERE client_event_key IS NOT NULL: a duplicate key fails the whole statement with 23505, nothing written.
+        if (this.table === 'supplement_intake' && this.payload.some((r) => r.client_event_key != null
+          && rows.some((x) => x.client_event_key === r.client_event_key && x.client_event_line === r.client_event_line))) {
+          return { data: null, error: { message: 'duplicate key value violates unique constraint', code: '23505' } };
+        }
         affected = this.payload.map((r) => {
           const row = { ...r };
           if (this.table === 'supplement_intake') row.intake_id = ++db.intakeSeq;
@@ -512,6 +518,32 @@ test('respond log: two simultaneous taps write the stack once', async () => {
   assert.deepEqual([a.body.status, b.body.status].sort(), ['already_logged', 'logged']);
   assert.equal(intakeRows(db, 4).length, 2);
   assert.equal(reminders(db)[0].status, 'logged');
+});
+
+test('respond log: a tap that loses the claim while the winner saves nothing does not say already_logged (Codex #817 SUP803-1)', async () => {
+  const db = await claimed(makeDb());
+  // The first insert attempt fails with an unknown outcome before writing (08006); later inserts work.
+  let failures = 1;
+  db.failOn = (table, op) => (table === 'supplement_intake' && op === 'insert' && failures-- > 0
+    ? { message: 'connection lost', code: '08006' } : null);
+  const [a, b] = await Promise.all([respond(db, LOG), respond(db, LOG)]);
+  const ok = [a, b].filter((r) => r.body.ok);
+  // Never success with zero saved rows: every ok answer is backed by intake rows that exist.
+  for (const r of ok) {
+    assert.ok(r.body.intake_count > 0, `ok answer with intake_count ${r.body.intake_count}`);
+  }
+  assert.equal(intakeRows(db, 4).length, ok.length > 0 ? 2 : 0, 'a success means the stack is saved, once');
+  assert.ok(ok.length > 0, 'the losing tap reconciles through the keyed write and saves the stack');
+  assert.equal(reminders(db)[0].status, 'logged');
+});
+
+test('respond log: three simultaneous taps still write the stack once (keyed write, unique index)', async () => {
+  const db = await claimed(makeDb());
+  const res = await Promise.all([respond(db, LOG), respond(db, LOG), respond(db, LOG)]);
+  assert.ok(res.every((r) => r.body.ok), JSON.stringify(res.map((r) => r.body)));
+  assert.equal(res.filter((r) => r.body.status === 'logged').length, 1);
+  assert.ok(res.every((r) => r.body.intake_count === 2));
+  assert.equal(intakeRows(db, 4).length, 2);
 });
 
 test('respond log: a stack already logged another way is reported, not duplicated, and the row is settled', async () => {
