@@ -40,13 +40,17 @@ import InfoHint from "@/components/InfoHint";
 // One container holds every panel and the three section headings, so a panel can be moved into another section.
 import { Part, PartGrid, usePartOrder } from "@/components/personalize/PartGrid";
 // The wind-down streak (PROD-SLEEP-01, set up on Log): the same panel as on Log, and one quiet-view source once set up.
-import WindDownPanel, { useWindDownToday } from "@/components/sleep/WindDownPanel";
-import HomeResetPanel from "@/components/HomeResetPanel";
+import { useWindDownToday } from "@/lib/use-winddown-today";
 import { useHomeResetToday } from "@/lib/use-home-reset";
 import { useIphoneUpdate, useStandaloneApp } from "@/lib/use-iphone-update";
 import { showUpdateCard, updateHref } from "@/lib/iphone-update";
 import { useUpdateFlow } from "@/lib/use-update-flow";
-import UpdateFlowPanel from "@/components/UpdateFlowPanel";
+import dynamic from "next/dynamic";
+// Panels shown only on some days load as their own chunks (fixed-height placeholder, so nothing shifts).
+const panelHold = (h: number) => function PanelHold() { return <div aria-hidden style={{ minHeight: h }} />; };
+const WindDownPanel = dynamic(() => import("@/components/sleep/WindDownPanel"), { ssr: false, loading: panelHold(150) });
+const HomeResetPanel = dynamic(() => import("@/components/HomeResetPanel"), { ssr: false, loading: panelHold(150) });
+const UpdateFlowPanel = dynamic(() => import("@/components/UpdateFlowPanel"), { ssr: false, loading: panelHold(60) });
 
 type Load<T> = { state: "loading" } | { state: "error" } | { state: "ready"; value: T; stale?: boolean };
 type RequestCard = Extract<InboxItem, { kind: "card" }>;

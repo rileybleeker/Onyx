@@ -59,7 +59,9 @@ component = component.replace(/require\("@\/components\/InfoHint"\)/g, '({__esMo
 // settings read is stubbed to 'nothing saved' (Today only ever reads it; the suggestion line is covered by its own test).
 const pacingLib = ids.size; ids.set('frontend/src/lib/learning-pacing.ts', pacingLib); modules[pacingLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/learning-pacing.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/learning-pacing"\)/g, `require(${pacingLib})`).replace(/require\("@\/lib\/use-learning-prefs"\)/g, '({__esModule:true,useLearningPrefs:()=>({load:"ready",prefs:{v:1,goal:"",weeklySessions:2,sessionMinutes:20,pauseUntil:null,showIncentives:true},configured:false,accept:()=>{}})})');
-component = component.replace(/require\("@\/components\/sleep\/WindDownPanel"\)/g, '({__esModule:true,default:()=>null,useWindDownToday:()=>({show:false,source:null})})');
+component = component.replace(/require\("@\/components\/sleep\/WindDownPanel"\)/g, '({__esModule:true,default:()=>null})')
+  .replace(/require\("@\/lib\/use-winddown-today"\)/g, '({__esModule:true,useWindDownToday:()=>({show:false,source:null})})')
+  .replace(/require\("next\/dynamic"\)/g, '({__esModule:true,default:()=>()=>null})'); // lazy panels render nothing here
 // The quiet view's lapse timer (lib/today-lapse.ts, import-free; tested in frontend/tests/today-lapse.test.cjs) is bundled by name.
 const lapseLib = ids.size; ids.set('frontend/src/lib/today-lapse.ts', lapseLib); modules[lapseLib] = ts.transpileModule(fs.readFileSync('frontend/src/lib/today-lapse.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
 component = component.replace(/require\("@\/lib\/today-lapse"\)/g, `require(${lapseLib})`);
