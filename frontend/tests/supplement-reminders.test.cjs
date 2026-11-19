@@ -142,6 +142,14 @@ function makeDb({ tz = 'America/New_York', failOn = null, seed = {} } = {}) {
       db.calls.push(`rpc:${name}`);
       if (name === 'tz_for_instant') return { data: db.tz, error: null };
       if (name === 'behavioral_date_for') return { data: dayIn(db.tz, args.ts), error: null };
+      if (name === 'revert_supplement_reminder') {
+        // Mirrors sql/supplement_reminder_safe_revert.sql: lock row, revert only if still 'logged' with no intake.
+        const row = tables.supplement_stack_reminder.find((r) => r.stack_id === args.p_stack_id && r.behavioral_date === args.p_date);
+        if (!row || row.status !== 'logged') return { data: false, error: null };
+        if (tables.supplement_intake.some((r) => r.stack_id === args.p_stack_id && r.intake_date === args.p_date)) return { data: false, error: null };
+        row.status = args.p_status; row.responded_at = args.p_responded_at;
+        return { data: true, error: null };
+      }
       return { data: null, error: { message: `unexpected rpc ${name}` } };
     }),
   });
@@ -573,6 +581,48 @@ test('respond log: a definite refusal (check violation) says not saved, puts the
   broken = false;
   const retry = await respond(db, LOG);
   assert.equal(retry.body.status, 'logged');
+  assert.equal(intakeRows(db, 4).length, 2);
+});
+
+test('respond log: refused insert plus a concurrent success leaves the reminder logged (two-tap race)', async () => {
+  const db = await claimed(makeDb());
+  // Tap A's insert is refused; tap B's insert committed in the meantime (simulated inside A's failing call).
+  db.failOn = (table, op) => {
+    if (table === 'supplement_intake' && op === 'insert') {
+      db.failOn = null;
+      db.tables.supplement_intake.push(
+        { intake_id: 901, stack_id: 4, intake_date: '2026-11-11', client_event_key: 'other', client_event_line: 0 },
+        { intake_id: 902, stack_id: 4, intake_date: '2026-11-11', client_event_key: 'other', client_event_line: 1 },
+      );
+      return { message: 'insert failed', code: '23514' };
+    }
+    return null;
+  };
+  const a = await respond(db, LOG);
+  assert.equal(a.httpStatus, 400);
+  assert.equal(reminders(db)[0].status, 'logged', 'the revert saw a successful intake and did nothing');
+  assert.equal(intakeRows(db, 4).length, 2);
+});
+
+test('respond log: a refused insert alone reverts the reminder to prompted (guarded revert)', async () => {
+  const db = await claimed(makeDb());
+  db.failOn = (table, op) => (table === 'supplement_intake' && op === 'insert' ? { message: 'insert failed', code: '23514' } : null);
+  const res = await respond(db, LOG);
+  assert.equal(res.httpStatus, 400);
+  assert.ok(db.calls.includes('rpc:revert_supplement_reminder'));
+  assert.equal(reminders(db)[0].status, 'prompted');
+  assert.equal(reminders(db)[0].responded_at, null);
+});
+
+test('revert_supplement_reminder: a delayed revert after a success changes nothing', async () => {
+  const db = await claimed(makeDb());
+  const ok = await respond(db, LOG);
+  assert.equal(ok.body.status, 'logged');
+  const before = JSON.stringify(reminders(db));
+  const r = await db.rpc('revert_supplement_reminder', { p_stack_id: 4, p_date: '2026-11-11', p_status: 'prompted', p_responded_at: null });
+  assert.equal(r.data, false);
+  assert.equal(JSON.stringify(reminders(db)), before);
+  assert.equal(reminders(db)[0].status, 'logged');
   assert.equal(intakeRows(db, 4).length, 2);
 });
 

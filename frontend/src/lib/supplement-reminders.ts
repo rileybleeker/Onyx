@@ -492,8 +492,17 @@ export async function respondToReminder(
   }
 
   // Only a definite refusal (nothing written) puts the row back. An unknown outcome never reverts: the write may have landed.
-  const revert = () =>
-    transition(retry ? "prompted" : previous, ["logged"], retry ? null : ((reminder.responded_at as string | null) ?? null));
+  // Atomic in the database (pds.revert_supplement_reminder): locks the reminder row, and reverts only when no intake
+  // exists for the (stack, day), so a refused call can never undo another tap's successful write.
+  const revert = async () => {
+    const { error } = await db.rpc("revert_supplement_reminder", {
+      p_stack_id: stack_id,
+      p_date: behavioral_date,
+      p_status: retry ? "prompted" : previous,
+      p_responded_at: retry ? null : ((reminder.responded_at as string | null) ?? null),
+    });
+    if (error) throw fail("reminder revert", error);
+  };
   // A thrown error is an unknown outcome too: it propagates and the row stays 'logged'; a retry finds no rows and writes again (keyed).
   const existing = await countIntake(); // logged some other way since the card went out
   if (existing > 0) return alreadyLogged(existing);
@@ -515,7 +524,9 @@ export async function respondToReminder(
     if (!lostClaim) await revert();
     return { httpStatus: 400, body: { ok: false, error: result.error ?? "could not log the stack" } };
   }
-  // Success: the row is 'logged' (set above, or already set on a retry).
+  // Success: rows exist now. A refused concurrent caller may have reverted the row in the window before this
+  // write committed (its revert saw no intake yet), so re-assert 'logged'; a no-op when it already is.
+  await transition("logged", ["prompted", "skipped"], nowIso);
   const count = result.count ?? 0;
   // A loser whose keyed write found the winner's rows reports them, with the real count.
   if (lostClaim && result.replayed) return alreadyLogged(count);
