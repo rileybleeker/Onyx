@@ -441,12 +441,14 @@ const MONEY_REASON: Readonly<Record<MoneyAlert["kind"], string>> = {
   budget: "A budget is over or heading over",
   promo: "A 0% promo is ending",
   tax: "A tax payment is due",
+  rewards: "Points are expiring or a card credit is unused",
 };
 /** The urgent reason of a dated money alert whose date is today or tomorrow (`when`); budgets carry no date. */
 const MONEY_URGENT_REASON: Readonly<Record<Exclude<MoneyAlert["kind"], "budget">, (when: string) => string>> = {
   "low-cash": (when) => `Cash may drop below your line ${when}`,
   promo: (when) => `A 0% promo ends ${when}`,
   tax: (when) => `A tax payment is due ${when}`,
+  rewards: (when) => `A rewards deadline is ${when}`,
 };
 /**
  * Money alerts. They carry no id of their own, so the identity is the alert kind plus what it names (the text

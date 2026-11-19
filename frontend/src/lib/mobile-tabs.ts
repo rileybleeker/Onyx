@@ -22,6 +22,7 @@ const SHORT: Record<string, string> = {
   "/financials": "Financials",
   "/financials/budgets": "Budgets",
   "/financials/forecast": "Forecast",
+  "/rewards": "Rewards",
   "/nyc": "NYC",
   "/screen-time": "Screen",
   "/procurement": "Procure",

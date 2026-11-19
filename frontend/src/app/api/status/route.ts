@@ -94,6 +94,7 @@ const CADENCE: Record<string, string> = {
   ai_usage: "Every 3h (the collector PC, while signed in)",
   apple_health: "When the Onyx app is opened on the iPhone (Shortcuts automation)",
   youtube: "Daily look on the collector PC; new data every 2 months (scheduled Google Takeout)",
+  rewards: "Daily read of loyalty balances on the collector PC",
   medical_backup: "Weekly (the collector PC, while signed in)",
   nyc_scout: "Daily 6:10am ET",
   simplefin: "Every 6h :30 (GitHub Actions); banks refresh about daily, Apple Card monthly",
@@ -158,6 +159,7 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   ai_usage:       { method: "automated",      label: "Local log harvest" },
   apple_health:   { method: "automated",      label: "iPhone app (HealthKit)" },
   youtube:        { method: "semi-automated", label: "Scheduled Takeout in OneDrive" },
+  rewards:        { method: "automated",      label: "PC reader, signed-in browser" },
   medical_backup: { method: "automated",      label: "Encrypted PC backup" },
   nyc_scout:      { method: "automated",      label: "Agent → Notion" },
   simplefin:      { method: "automated",      label: "Bank feed API" },
@@ -528,6 +530,8 @@ export async function GET() {
         ["apple_health", "samples"],
         // YouTube watch history importer (Riley's PC, one heartbeat a day).
         ["youtube", "history"],
+        // Rewards balances reader (Riley's PC, daily): its own read.
+        ["rewards", "balances"],
         // Encrypted off-site backup of /health/records (Riley's PC, weekly): one row a week.
         ["backup", "medical_records"],
         // N-of-1 trial report job: one heartbeat a day.
@@ -1499,6 +1503,35 @@ export async function GET() {
           cadence: CADENCE.youtube,
           integrationMethod: METHOD.youtube.method,
           methodLabel: METHOD.youtube.label,
+        };
+      })(),
+      // Rewards balances (tools/rewards_harvest on Riley's PC): a signed-in browser reads each loyalty program's
+      // balance, tier and expiry into pds.rewards_balances. Heartbeat only (no balances are read here). Never run
+      // yet = unknown. >36h degraded, >96h or a failed row red; 'partial' carries the per-program sign-in problems
+      // the reader reports (program names and a short code, never a number or a credential).
+      rewards: (() => {
+        const entry = latestBySrcType["rewards|balances"] ?? null;
+        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
+        const status: SourceStatus["status"] = !entry
+          ? "unknown"
+          : entry.status === "failed" || ageH > 96
+            ? "failed"
+            : entry.status === "partial" || ageH > 36
+              ? "partial"
+              : "success";
+        return {
+          label: "Rewards",
+          lastSync: (entry?.sync_start as string) ?? null,
+          status,
+          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
+          recordsSynced: (entry?.records_synced as number) ?? 0,
+          durationSeconds: (entry?.duration_seconds as number) ?? null,
+          errorMessage: (entry?.error_message as string)
+            ?? (!entry ? "No read yet. Next: run tools/rewards_harvest/register-task.ps1 on the PC and sign in to each program once (tools/rewards_harvest/README.md)." : null),
+          cadence: CADENCE.rewards,
+          integrationMethod: METHOD.rewards.method,
+          methodLabel: METHOD.rewards.label,
         };
       })(),
       // Body weight via Tanita Health Planet (tanita_etl.py): scale → phone

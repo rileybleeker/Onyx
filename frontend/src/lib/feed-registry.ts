@@ -36,6 +36,7 @@ export const FEED_SECTIONS: Record<string, () => Promise<FeedSectionModule>> = {
   "/orders": () => import("@/app/orders/FeedSection"),
   "/procurement": () => import("@/app/procurement/FeedSection"),
   "/financials": () => import("@/app/financials/FeedSection"),
+  "/rewards": () => import("@/app/rewards/FeedSection"),
   "/financials/budgets": () => import("@/app/financials/budgets/FeedSection"),
   "/financials/forecast": () => import("@/app/financials/forecast/FeedSection"),
   "/nyc": () => import("@/app/nyc/FeedSection"),

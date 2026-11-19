@@ -40,7 +40,7 @@ export const OVERVIEW_CARDS: readonly OverviewCardDef[] = [
   { id: "nutrition", title: "Nutrition & caffeine", href: "/nutrition", covers: ["/nutrition", "/caffeine"], links: ["/caffeine"] },
   { id: "supplements", title: "Supplements", href: "/supplements", covers: ["/supplements"] },
   { id: "habits", title: "Habits & reading", href: "/habits", covers: ["/habits", "/check-in", "/reading"], links: ["/check-in", "/reading"] },
-  { id: "money", title: "Money", href: "/financials", covers: ["/financials", "/financials/budgets", "/financials/forecast", "/procurement"], links: ["/financials/budgets", "/financials/forecast", "/procurement"] },
+  { id: "money", title: "Money", href: "/financials", covers: ["/financials", "/financials/budgets", "/financials/forecast", "/rewards", "/procurement"], links: ["/financials/budgets", "/financials/forecast", "/rewards", "/procurement"] },
   { id: "orders", title: "Orders", href: "/orders", covers: ["/orders"] },
   { id: "calendar", title: "Calendar & care", href: "/health", covers: ["/health"] },
   { id: "screen-time", title: "Screen time", href: "/screen-time", covers: ["/screen-time"] },
