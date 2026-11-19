@@ -28,6 +28,5 @@ books or pays.
   and is shown as not tracked from the card.
 - Valuations (cents per point) are Riley's to edit; defaults are estimates.
 
-## Not built yet
-The PC reader that writes `pds.rewards_balances` (`tools/rewards_harvest`) is another build. Until it runs, balances
-read "Not connected yet" and only the card-derived parts (earn, credits, hotel-based expiry estimates) have data.
+## PC reader
+Built separately in `tools/rewards_harvest` (README there): it writes `pds.rewards_balances` and the `rewards|balances` heartbeat. Until it has signed in to a program once, that program reads "Not connected yet" and only the card-derived parts (earn, credits, hotel-based expiry estimates) have data.

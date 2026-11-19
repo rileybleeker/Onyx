@@ -1528,7 +1528,7 @@ export async function GET() {
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
           errorMessage: (entry?.error_message as string)
-            ?? (!entry ? "No read yet. Next: run tools/rewards_harvest on the PC and sign in to each program once (docs/rewards.md)." : null),
+            ?? (!entry ? "No read yet. Next: run tools/rewards_harvest/register-task.ps1 on the PC and sign in to each program once (tools/rewards_harvest/README.md)." : null),
           cadence: CADENCE.rewards,
           integrationMethod: METHOD.rewards.method,
           methodLabel: METHOD.rewards.label,

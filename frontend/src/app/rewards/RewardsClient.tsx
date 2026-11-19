@@ -96,10 +96,15 @@ function ProgramCard({ p, cpp, onSaved }: { p: ProgramView; cpp: number; onSaved
       </div>
       {b ? (
         <>
-          <p className="mt-2 font-mono text-3xl">
-            {p.unit === "usd" ? usd2(Math.round(b.balance * 100)) : num(b.balance)}
-            {p.unit !== "usd" && <span className="ml-1 text-[12px] text-text-tertiary">{p.unit}</span>}
-          </p>
+          {p.id === "uber_one" ? (
+            // The reader stores membership as a flag (1 = member, 0 = not a member), never as points.
+            <p className="mt-2 text-xl font-semibold">{b.balance > 0 ? "Member" : "Not a member"}</p>
+          ) : (
+            <p className="mt-2 font-mono text-3xl">
+              {p.unit === "usd" ? usd2(Math.round(b.balance * 100)) : num(b.balance)}
+              {p.unit !== "usd" && <span className="ml-1 text-[12px] text-text-tertiary">{b.unit}</span>}
+            </p>
+          )}
           {value !== null && p.unit !== "usd" && <p className="text-[13px] text-text-secondary">about {usd(value)}</p>}
           {bars.map((x) => (
             <div key={x.label} className="mt-2">

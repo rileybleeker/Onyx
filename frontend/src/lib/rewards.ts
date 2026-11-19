@@ -622,7 +622,7 @@ export function buildRewards(i: RewardsInput): RewardsData {
       balance,
       stale: age !== null && age > STALE_BALANCE_DAYS,
       ageDays: age,
-      valueCents: balance ? Math.round(def.unit === "usd" ? balance.balance * 100 : (balance.balance * cpp)) : null,
+      valueCents: balance && def.id !== "uber_one" ? Math.round(def.unit === "usd" ? balance.balance * 100 : (balance.balance * cpp)) : null,
       expiry: expiryOf(def, balance, activity, i.today, i.earliest),
     };
   });
