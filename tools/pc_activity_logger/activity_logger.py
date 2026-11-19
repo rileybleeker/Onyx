@@ -366,6 +366,20 @@ class Rest:
         for i in range(0, len(rows), chunk):
             self.post(table, rows[i:i + chunk], "resolution=merge-duplicates,return=minimal", on_conflict)
 
+    def get_json(self, table: str, query: str) -> list:
+        """GET rows from a pds table; `query` is an already URL-encoded PostgREST query string."""
+        req = urllib.request.Request(f"{self.url}/rest/v1/{table}?{query}", method="GET", headers={
+            "apikey": self._key, "Authorization": f"Bearer {self._key}", "Accept-Profile": "pds",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise HttpError(f"read {table}: HTTP {e.code}") from None
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise HttpError(f"read {table}: network error ({type(getattr(e, 'reason', e)).__name__})") from None
+        return data if isinstance(data, list) else []
+
     # sync_log_helper.log_sync() speaks the supabase-py shape: supa.schema("pds").table(t).insert(row).execute()
     def schema(self, _name: str) -> "Rest":
         return self
