@@ -56,7 +56,7 @@ Paths under `app/`, `lib/` and `components/` are in `frontend/src/`.
 | `app/today/`, `app/page.tsx`, `components/HomeResetPanel.tsx`, `lib/home-reset.ts`, `app/api/home-reset/`, `sql/home_reset.sql`, `components/overview/`, `lib/overview-*.ts`, `lib/today-*.ts`, `lib/urgent-email*.ts`, `lib/money-alerts-view.ts`, `urgent_email_etl.py`, `sql/inbox_emails_schema.sql`, `sql/today_cleared_emails.sql` | [today.md](today.md) |
 | `app/chat/`, `app/api/chat/`, `lib/chat-*.ts`, `app/agents/`, `lib/agents-api.ts`, `app/nyc/`, `lib/nyc.ts` | [chat-agents.md](chat-agents.md) |
 | `app/status/`, `app/api/status/`, `lib/status-*.ts`; any new data source | [status-page.md](status-page.md) |
-| `simplefin_etl.py`, `sql/finance_*.sql`, `app/financials/`, `app/api/finance/`, `lib/finance-*.ts`, `lib/cash-forecast*.ts`, `lib/tax-*.ts`, `tools/rocketmoney_harvest/` | [finance.md](finance.md) |
+| `simplefin_etl.py`, `sql/finance_*.sql`, `app/financials/`, `app/api/finance/`, `app/rewards/`, `lib/rewards*.ts`, `sql/rewards_schema.sql`, `lib/finance-*.ts`, `lib/cash-forecast*.ts`, `lib/tax-*.ts`, `tools/rocketmoney_harvest/` | [finance.md](finance.md) |
 | `app/procurement/`, `app/api/procurement/`, `lib/procurement-*.ts`, `sql/procurement_*.sql` | [procurement.md](procurement.md) |
 | `app/health/`, `app/api/care/`, `app/api/medical/`, `lib/care-*.ts`, `lib/medical-records*.ts`, `tools/medical_recovery/`, `sql/care_*.sql`, `sql/medical_records_schema.sql` | [health-records.md](health-records.md) |
 | repository layout, the command list, environment variable names | [orientation.md](orientation.md) |
@@ -94,6 +94,7 @@ Every heading of the old root `AGENTS.md`. A section that was split lists each p
 | Medical records (2026-11-14) | [health-records.md › Medical records (2026-11-14)](health-records.md#medical-records-2026-11-14) |
 | Financials (2026-11-12; SimpleFIN feed since 2026-11-14) | [finance.md › Financials (2026-11-12; SimpleFIN feed since 2026-11-14)](finance.md#financials-2026-11-12-simplefin-feed-since-2026-11-14) |
 | Cash forecast, budgets and taxes (2026-11-14) | [finance.md › Cash forecast, budgets and taxes (2026-11-14)](finance.md#cash-forecast-budgets-and-taxes-2026-11-14) |
+| Rewards (2026-11-18) | [finance.md › Rewards (2026-11-18)](finance.md#rewards-2026-11-18) |
 | Focus habit unlock (2026-11-13) | [devices.md › Focus habit unlock (2026-11-13)](devices.md#focus-habit-unlock-2026-11-13) |
 
 ## Cited names

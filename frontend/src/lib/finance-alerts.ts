@@ -7,7 +7,7 @@ import { EXPIRED_REASON, eligibilityOf, leftOutCentsOf } from "./cash-forecast-e
 import type { BudgetsResult } from "./finance-budgets";
 
 export interface MoneyAlert {
-  kind: "low-cash" | "budget" | "promo" | "tax";
+  kind: "low-cash" | "budget" | "promo" | "tax" | "rewards";
   severity: "high" | "medium";
   title: string;
   detail: string;

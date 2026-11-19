@@ -40,14 +40,14 @@ export const APP_STORAGE_PREFIXES = ["onyx", "chartCard."];
 const SENSITIVE: RegExp[] = [
   // journal: the personal journal's titles, moods and snippets (the /log Journal section's read).
   // care: the /health care planner's items (every caller already passes persist: false; enforced here too).
-  /^\/api\/(finance|procurement|medical|care|screen-time|spotify|focus|experiments|journal)(\/|\?|$)/,
+  /^\/api\/(finance|rewards|procurement|medical|care|screen-time|spotify|focus|experiments|journal)(\/|\?|$)/,
   // reading questions: raw quiz answers and grading feedback (PROD-T07, sql/reading_learning_questions.sql).
   /^\/api\/reading\/questions(\/|\?|$)/,
   // reading practice (READ-QUIZ-01): a round's attempts (grader feedback on Riley's answers) and the bank export.
   /^\/api\/reading\/practice\/round(\/|\?|$)/,
   /^\/api\/reading\/bank\/export(\/|\?|$)/,
-  /^\/(financials|procurement|screen-time|health\/records)(\/|\?|$)/,
-  /^(finance|procurement|medical|care|screen-time|spotify|experiments):/,
+  /^\/(financials|rewards|procurement|screen-time|health\/records)(\/|\?|$)/,
+  /^(finance|rewards|procurement|medical|care|screen-time|spotify|experiments):/,
   // Mixed payloads (SEC-03, 2026-11-16): the agents inbox and conversations (message bodies and cards can quote
   // finance, medical or email content), the agents Worker's /onyx/* routes by path or full URL, /api/status
   // (heartbeat error text such as bank or provider names) and /api/urgent-email (subjects and senders of any mail).
