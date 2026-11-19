@@ -43,7 +43,7 @@ from datetime import date, datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 for _p in (ROOT, ROOT / "tools" / "pc_activity_logger"):
@@ -155,11 +155,40 @@ def build_rows(events: Iterable[object], export_label: str) -> list:
             continue
         key = (r["watched_at"], r["video_id"])
         old = rows.get(key)
-        if old is not None:
-            r = {k: (r[k] if r[k] not in (None, "") else old[k]) if k not in ("is_music", "is_ad")
-                 else bool(r[k] or old[k]) for k in r}
-        rows[key] = r
+        rows[key] = merge_row(old, r) if old is not None else r
     return [rows[k] for k in sorted(rows)]
+
+
+def merge_row(old: dict, new: dict) -> dict:
+    """New over old, but a non-empty value is never replaced by empty/null and a true flag never by false."""
+    return {k: (new[k] if new[k] not in (None, "") else old.get(k)) if k not in ("is_music", "is_ad")
+            else bool(new[k] or old.get(k)) for k in new}
+
+
+def merge_with_stored(client: Rest, rows: list) -> list:
+    """Merge each incoming row with the stored row for the same (watched_at, video_id), so a later sparse
+    export cannot erase known channel fields or a true flag (the upsert overwrites every column)."""
+    if not rows:
+        return rows
+    lo, hi = rows[0]["watched_at"], rows[-1]["watched_at"]
+    stored: dict = {}
+    page, offset = 1000, 0
+    while True:
+        q = (f"select={','.join(sorted(ROW_KEYS))}&watched_at=gte.{quote(lo)}&watched_at=lte.{quote(hi)}"
+             f"&order=watched_at,video_id&limit={page}&offset={offset}")
+        got = client.get_json(TABLE, q)
+        for s in got:
+            at = parse_time(s.get("watched_at"))
+            if at is not None:
+                stored[(at, s.get("video_id"))] = s
+        if len(got) < page:
+            break
+        offset += page
+    out = []
+    for r in rows:
+        s = stored.get((r["watched_at"], r["video_id"]))
+        out.append(merge_row(s, r) if s else r)
+    return out
 
 
 def check_rows(rows: list) -> None:
@@ -219,6 +248,15 @@ def find_exports(roots: Optional[list] = None) -> list:
             return 0.0
 
     return sorted(seen.values(), key=mtime)
+
+
+def legacy_fingerprint(path: Path) -> str:
+    """The format used before #824 (name|size|mtime). Kept only so files recorded under it are not re-imported."""
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    return hashlib.sha256(f"{path.name}|{st.st_size}|{int(st.st_mtime)}".encode()).hexdigest()[:24]
 
 
 def fingerprint(path: Path) -> str:
@@ -327,8 +365,8 @@ def run(dry_run: bool = False, only: Optional[Path] = None, roots: Optional[list
     try:
         for label, path, kind in exports:
             fp = fingerprint(path)
-            if fp in done and not only:
-                continue
+            if (fp in done or legacy_fingerprint(path) in done) and not only:
+                continue  # either format counts as already imported
             events = read_history(path, kind)
             if events is None:
                 skipped_empty += 1  # no watch-history.json (yet): look again next run
@@ -341,7 +379,7 @@ def run(dry_run: bool = False, only: Optional[Path] = None, roots: Optional[list
             if not dry_run:
                 client = client or make_client()
                 if rows:
-                    client.upsert(TABLE, rows, ON_CONFLICT)
+                    client.upsert(TABLE, merge_with_stored(client, rows), ON_CONFLICT)
                 done[fp] = {"imported": datetime.now(timezone.utc).isoformat(), "events": len(rows)}
                 save_state(d, state)
             total += len(rows)

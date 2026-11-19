@@ -80,3 +80,42 @@ def test_bad_format_is_an_error():
     except ValueError:
         return
     raise AssertionError("expected ValueError")
+
+
+class _FakeClient:
+    """In-memory stand-in for the PostgREST client: upsert overwrites whole rows, like the real table."""
+
+    def __init__(self):
+        self.table = {}
+
+    def get_json(self, _table, _query):
+        return [dict(r, watched_at=r["watched_at"].replace("Z", "+00:00")) for r in self.table.values()]
+
+    def upsert(self, _table, rows, _on_conflict):
+        for r in rows:
+            self.table[(r["watched_at"], r["video_id"])] = dict(r)
+
+
+def _import(client, events, label):
+    client.upsert("t", yh.merge_with_stored(client, yh.build_rows(events, label)), yh.ON_CONFLICT)
+
+
+def test_sparse_and_rich_exports_keep_metadata_in_both_orders():
+    rich = [dict(EVENTS[0], header="YouTube Music"), dict(EVENTS[4])]
+    sparse = [{"title": "Watched SENTINEL_TITLE", "titleUrl": EVENTS[0]["titleUrl"], "time": EVENTS[0]["time"]},
+              {"title": "Watched Ad", "titleUrl": EVENTS[4]["titleUrl"], "time": EVENTS[4]["time"]}]
+    for first, second in ((rich, sparse), (sparse, rich)):
+        c = _FakeClient()
+        _import(c, first, "one")
+        _import(c, second, "two")
+        by_id = {r["video_id"]: r for r in c.table.values()}
+        a, ad = by_id["abc123DEF_-"], by_id["adv1"]
+        assert a["channel_id"] == "UCxyz" and a["channel_name"] == "Chan" and a["is_music"] is True
+        assert ad["is_ad"] is True
+
+
+def test_legacy_fingerprint_is_a_distinct_format():
+    with tempfile.TemporaryDirectory() as t:
+        f = Path(t) / "takeout-1.zip"
+        f.write_bytes(b"x")
+        assert yh.legacy_fingerprint(f) and yh.legacy_fingerprint(f) != yh.fingerprint(f)
