@@ -68,6 +68,12 @@ export const SIGNIN_REGISTRY: SigninEntry[] = [
     sources: ["ubereats"], expiry: { kind: "none" },
   },
   {
+    id: "rewards-sites", label: "Rewards sites (Amex, Delta, Hilton, Marriott, Uber)", mechanism: "browser-session", renewal: "riley",
+    howTo: "On the PC: node tools/rewards_harvest/harvest.mjs --login <program>, sign in, close the window (README lists the five).",
+    lifetime: "Each site ends the browser session at times of its choosing.",
+    sources: ["rewards"], expiry: { kind: "none" },
+  },
+  {
     id: "gmail-imap", label: "Gmail app passwords (both accounts)", mechanism: "app-password", renewal: "riley",
     howTo: "Google account, Security, App passwords: make a new one and update the GitHub secret.",
     lifetime: "No expiry; revoked when the Google password changes or 2-Step Verification is turned off.",
