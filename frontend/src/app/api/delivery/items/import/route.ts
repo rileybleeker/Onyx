@@ -26,7 +26,7 @@ import {
 //   { orders: [...] }      upsert cart lines into pds.delivery_order_items
 //   { estimate: true }     estimate nutrition for up to BATCH not-yet-estimated dishes
 //                          (one Claude call) → pds.delivery_item_nutrition; returns `remaining`
-//   { done: true, ... }    write the ubereats|items heartbeat for the run (gopuff|items when provider is 'gopuff')
+//   { done: true, ... }    write the ubereats|items heartbeat for the run
 //   { error: "..." }       harvester-side failure (signed out, blocked) → failed heartbeat
 // The harvester calls `estimate` in a loop until remaining is 0, so no single
 // request has to outlive the function time limit.
@@ -42,7 +42,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const BATCH = 25;
 
 interface Body {
-  /** Which harvester is posting: 'gopuff' (tools/gopuff_harvest) or, when absent, Uber Eats. Chooses the provider of the rows and the heartbeat source. */
+  /** Only 'uber_eats' is accepted (or absent = Uber Eats). */
   provider?: string;
   /** Retry only the dishes of this arm (named in a failed batch's answer); offset then counts within it. */
   arm?: Arm;
@@ -122,10 +122,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
-  if (body.provider !== undefined && body.provider !== "gopuff" && body.provider !== "uber_eats") {
+  if (body.provider !== undefined && body.provider !== "uber_eats") {
     return NextResponse.json({ error: "unknown provider" }, { status: 400 });
   }
-  const provider: ItemProvider = body.provider === "gopuff" ? "gopuff" : "uber_eats";
+  const provider: ItemProvider = "uber_eats";
 
   if (body.error) {
     await heartbeat(provider, startedAt, "failed", 0, String(body.error).slice(0, 500));
@@ -360,7 +360,7 @@ async function estimateBatch(deadline: RouteDeadline, limit?: number, offset?: n
 async function heartbeat(provider: ItemProvider, startedAt: Date, status: "success" | "partial" | "failed", records: number, error: string | null) {
   const end = new Date();
   const { error: e } = await supabase.from("sync_log").insert({
-    source: provider === "gopuff" ? "gopuff" : "ubereats",
+    source: "ubereats",
     data_type: "items",
     status,
     records_synced: records,

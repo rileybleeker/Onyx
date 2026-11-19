@@ -32,7 +32,7 @@ failed), `unknown` (nothing readable, or not connected yet).
 
 ## Known gaps (no derivable expiry)
 
-- Kindle / Amazon, Uber Eats, goPuff browser sessions: the site decides; only the failed heartbeat shows it.
+- Kindle / Amazon, Uber Eats browser sessions: the site decides; only the failed heartbeat shows it.
 - Gmail app passwords: no expiry; revocation shows as a partial or failed email heartbeat.
 - YouTube Takeout: one year from creation, but the creation date is not recorded; the card goes
   partial when the last import is over 100 days old.

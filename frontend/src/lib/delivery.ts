@@ -84,7 +84,7 @@ export interface HarvestOrder {
  * Riley ate, set by hand on /nutrition and /check-in), so the importer's ON CONFLICT DO UPDATE leaves a
  * set portion alone on every re-harvest. tests/delivery-portion.test.cjs asserts the key set.
  */
-export type ItemProvider = "uber_eats" | "gopuff";
+export type ItemProvider = "uber_eats";
 
 export function buildOrderItemRows(orders: HarvestOrder[], provider: ItemProvider = "uber_eats") {
   // Values come from Uber's JSON by way of the harvester: coerce them so one odd order
@@ -95,8 +95,7 @@ export function buildOrderItemRows(orders: HarvestOrder[], provider: ItemProvide
   for (const o of orders) {
     if (!o || typeof o.uuid !== "string" || typeof o.store !== "string" || !o.uuid || !o.store.trim()) continue;
     const store = o.store.trim().slice(0, 200);
-    // goPuff is a convenience store: its lines are facts only, never meals (queries read restaurant rows).
-    const kind: MerchantKind = provider === "gopuff" ? "store" : merchantKind(store);
+    const kind: MerchantKind = merchantKind(store);
     const items = Array.isArray(o.items) ? o.items : [];
     for (const [idx, it] of items.entries()) {
       if (!it || typeof it.title !== "string" || !it.title.trim()) continue;
