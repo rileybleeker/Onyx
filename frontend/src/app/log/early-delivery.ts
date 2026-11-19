@@ -8,7 +8,7 @@ import {
   initialBehavioralToday,
   type UberEatsCheck,
 } from "@/lib/log-ubereats";
-import type { DeliveryWindow } from "@/lib/queries";
+import type { DeliveryWindow } from "@/lib/queries-delivery";
 
 /**
  * The Uber Eats section's first reads on a full load of /log (speed budget, 2026-11-15). They are Supabase reads
@@ -42,7 +42,7 @@ export function startEarlyDeliveryReads(now = Date.now()): void {
   const today = initialBehavioralToday(clientCache.peek(BEHAVIORAL_TODAY_URL), clientCache.fetchedAt(BEHAVIORAL_TODAY_URL), now);
   const days = deliveryWindowDays(today, LOG_EARLIER_DAYS);
   // lib/queries is large: loaded on demand, as everywhere else.
-  const q = import("@/lib/queries");
+  const q = import("@/lib/queries-delivery");
   windowRead = { key: deliveryWindowKey(today, LOG_EARLIER_DAYS), at: now, p: q.then((m) => m.getDeliveryWindow(days)) };
   checkRead = { key: UBER_EATS_CHECK_KEY, at: now, p: q.then((m) => m.getUberEatsCheck()) };
   // Unused or failed: finish quietly (the section reads again on its own).

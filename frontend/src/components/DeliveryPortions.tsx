@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getDeliveryWindow, type DeliveryDish, type DeliveryWindow } from "@/lib/queries";
+import { getDeliveryWindow, type DeliveryDish, type DeliveryWindow } from "@/lib/queries-delivery";
 import {
   PORTION_OPTIONS,
   checkinDishGroups,

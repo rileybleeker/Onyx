@@ -8,7 +8,7 @@ import InfoHint from "@/components/InfoHint";
 import { cachedJson, clientCache } from "@/lib/client-cache";
 import { shiftYmd } from "@/lib/delivery-portion";
 import { formatClock, tokenForOption } from "@/lib/delivery-leftovers";
-import { getUberEatsCheck, type DeliveryDish } from "@/lib/queries";
+import { getUberEatsCheck, type DeliveryDish } from "@/lib/queries-delivery";
 import { useLogDrafts } from "@/lib/log-drafts";
 import { logEarlyGet } from "@/lib/log-early";
 import { takeEarlyDeliveryWindow, takeEarlyUberEatsCheck } from "../early-delivery";
