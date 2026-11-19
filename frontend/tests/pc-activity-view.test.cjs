@@ -9,9 +9,11 @@ const { loadTs } = require("./helpers/load-ts.cjs");
 const P = loadTs("lib/pc-activity-view.ts");
 const V = loadTs("lib/screen-time-view.ts");
 
-/** Next day, 08:00 ET (12:00 UTC in March 2030): after the day ended, so the day is complete. */
+/** Next day, 08:00 ET (12:00 UTC in March 2030): after the day ended, so the day is complete.
+ *  A malformed date (the skipped-row cases) has no next day: its synced_at stays an unparseable string. */
 const COMPLETE = (date) => {
   const d = new Date(date + "T12:00:00Z");
+  if (Number.isNaN(d.getTime())) return date + "T12:00:00Z";
   d.setUTCDate(d.getUTCDate() + 1);
   return d.toISOString();
 };
