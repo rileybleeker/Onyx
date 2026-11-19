@@ -44,6 +44,16 @@ export const HEARTBEAT_TYPE = "prompt";
 
 export type ReminderStatus = "prompted" | "logged" | "skipped";
 
+/**
+ * The statuses the success path re-asserts to 'logged' after its intake write committed. 'logged' is in the list on
+ * purpose (Codex #834 SUP833-1): an UPDATE only takes the row lock on rows that match its WHERE, so a success update
+ * limited to prompted/skipped skips a row another call has locked inside pds.revert_supplement_reminder (still
+ * 'logged' as committed) and returns at once; that revert then commits 'prompted' over saved intake. Matching
+ * 'logged' too makes the success update wait for the in-flight revert's lock and re-check the row after it commits,
+ * so it always ends 'logged'. tests/test_supplement_reminder_revert_pg.py runs this interleaving in PostgreSQL.
+ */
+export const SUCCESS_RECONCILE_FROM: ReminderStatus[] = ["prompted", "skipped", "logged"];
+
 export interface ClaimedStack {
   stack_id: number;
   name: string;
@@ -525,8 +535,10 @@ export async function respondToReminder(
     return { httpStatus: 400, body: { ok: false, error: result.error ?? "could not log the stack" } };
   }
   // Success: rows exist now. A refused concurrent caller may have reverted the row in the window before this
-  // write committed (its revert saw no intake yet), so re-assert 'logged'; a no-op when it already is.
-  await transition("logged", ["prompted", "skipped"], nowIso);
+  // write committed (its revert saw no intake yet), so re-assert 'logged'. The update matches 'logged' too, so it
+  // takes the row lock even when the row still reads 'logged' and waits out a revert that is in flight
+  // (SUCCESS_RECONCILE_FROM, Codex #834 SUP833-1); on an already-logged row it only refreshes responded_at.
+  await transition("logged", SUCCESS_RECONCILE_FROM, nowIso);
   const count = result.count ?? 0;
   // A loser whose keyed write found the winner's rows reports them, with the real count.
   if (lostClaim && result.replayed) return alreadyLogged(count);

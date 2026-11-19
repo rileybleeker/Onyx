@@ -62,7 +62,11 @@ function makeDb({ tz = 'America/New_York', failOn = null, seed = {} } = {}) {
     upsert(rows, opts = {}) { this.op = 'upsert'; this.payload = [].concat(rows); this.opts = opts; return this; }
     update(patch) { this.op = 'update'; this.payload = patch; return this; }
     eq(c, v) { this.filters.push((r) => r[c] === v); return this; }
-    in(c, vs) { this.filters.push((r) => vs.includes(r[c])); return this; }
+    in(c, vs) {
+      // Status-guarded updates are recorded so a test can see which statuses an update was allowed to match.
+      if (this.op === 'update') db.calls.push(`update-in:${this.table}:${c}:${vs.join('|')}`);
+      this.filters.push((r) => vs.includes(r[c])); return this;
+    }
     gte(c, v) { this.filters.push((r) => r[c] >= v); return this; }
     not(c, op, v) {
       assert.equal(op, 'is'); assert.equal(v, null);
@@ -601,6 +605,22 @@ test('respond log: refused insert plus a concurrent success leaves the reminder 
   const a = await respond(db, LOG);
   assert.equal(a.httpStatus, 400);
   assert.equal(reminders(db)[0].status, 'logged', 'the revert saw a successful intake and did nothing');
+  assert.equal(intakeRows(db, 4).length, 2);
+});
+
+test('respond log: the success update also matches an already-logged row, so it waits out an in-flight revert (Codex #834 SUP833-1)', async () => {
+  // In PostgreSQL an UPDATE only locks rows its WHERE matches. Tap A's revert can hold the reminder row (still
+  // 'logged' as committed) when tap B's write succeeds; a success update limited to prompted/skipped would skip
+  // the row, return at once, and A would then commit 'prompted' over B's intake. The interleaving itself runs
+  // against real PostgreSQL in tests/test_supplement_reminder_revert_pg.py; here: the success path asks for it.
+  assert.deepEqual(lib.SUCCESS_RECONCILE_FROM, ['prompted', 'skipped', 'logged']);
+  const db = await claimed(makeDb());
+  const res = await respond(db, LOG);
+  assert.equal(res.body.status, 'logged');
+  const updates = db.calls.filter((c) => c.startsWith('update-in:supplement_stack_reminder:status:'));
+  assert.equal(updates.at(-1), 'update-in:supplement_stack_reminder:status:prompted|skipped|logged',
+    'the last reminder update after a committed write matches logged rows too');
+  assert.equal(reminders(db)[0].status, 'logged');
   assert.equal(intakeRows(db, 4).length, 2);
 });
 
