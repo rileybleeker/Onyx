@@ -13,6 +13,7 @@ import { readingBankCard, type ReadingBankHeartbeat, type ReadingBankStatusCount
 import { monthlyCapCents } from "@/lib/reading-bank";
 import { medicalBackupCard, type BackupHeartbeat } from "@/lib/medical-backup-status";
 import { hrvArtifactState } from "@/lib/hrv-artifact-status";
+import { uberRidesLatestDataDate } from "@/lib/uber-rides-status";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -287,7 +288,7 @@ const NYC_CHECK_STALE_MS = 15 * 60 * 1000;
 // The sync_log fields this route and its helpers (deriveStatus, enrichmentSource, ingestionHeartbeatStatus,
 // financeLedgerCard, recentHistory) read, listed instead of select("*") (units/gpt-5/F-004). Checked against
 // information_schema 2026-11-14; id, sync_end, date_range_* and created_at are not read from these rows.
-const SYNC_LOG_COLS = "source, data_type, sync_start, status, records_synced, duration_seconds, error_message";
+const SYNC_LOG_COLS = "source, data_type, sync_start, status, records_synced, duration_seconds, error_message, date_range_end";
 
 // The /status page polls every 60 s and tolerates ~60 s staleness: Vercel's CDN keeps the answer 30 s (+30 s stale
 // while it revalidates), so repeat hits skip the ~16 Supabase queries. That rule is in Vercel-CDN-Cache-Control,
@@ -1371,7 +1372,7 @@ export async function GET() {
           label: "Uber Rides",
           lastSync: (entry?.sync_start as string) ?? null,
           status,
-          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
+          latestDataDate: uberRidesLatestDataDate(entry),
           daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
           recordsSynced: (entry?.records_synced as number) ?? 0,
           durationSeconds: (entry?.duration_seconds as number) ?? null,
