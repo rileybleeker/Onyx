@@ -10,6 +10,11 @@
 -- successful intake for that (stack, day), and revert only if there is none and
 -- the row is still 'logged'. A delayed revert that arrives after a success is a
 -- no-op. Returns true only when it actually reverted.
+--
+-- The lock serializes only callers that also take it: the success path's re-assert in
+-- frontend/src/lib/supplement-reminders.ts (SUCCESS_RECONCILE_FROM) matches 'logged' too, so it waits for an
+-- in-flight revert instead of skipping the locked row (Codex #834 SUP833-1;
+-- tests/test_supplement_reminder_revert_pg.py runs that interleaving). This file is unchanged otherwise.
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION pds.revert_supplement_reminder(
