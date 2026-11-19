@@ -163,7 +163,6 @@ REHOMED = [
     ("9a5c4538", "reading-journal.md", "); a block a create wrote after its removal is recorded in the removal"),
     ("78210319", "health-records.md", "a failed save is classified by `isTransientSaveFailure` (offline / tim"),
     ("e85d0281", "ops-ci.md", "; that hold list applies once the required builder prerequisites have"),
-    ("c06ff3ac", "nutrition.md", "- **goPuff items (2026-11-17, `tools/gopuff_harvest`, README there).**"),
     ("1455ccca", "devices.md", "## YouTube watch history (2026-11-17)"),
     ("30e76720", "frontend.md", "changes RAM and baseline disk IO together and cannot by itself identi"),
     ("901e910a", "orientation.md", "├── myfitnesspal_etl.py      # MyFitnessPal CSV → Supabase (shared MFP"),

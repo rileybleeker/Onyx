@@ -88,7 +88,6 @@ const CADENCE: Record<string, string> = {
   google_calendar: "Hourly :55",
   care_calendar: "After each /health change + every 6h :20 catch-up",
   ubereats: "Every 6h (the collector PC, while logged on)",
-  gopuff: "Every 6h (the collector PC, while logged on)",
   pc_activity: "Hourly (the collector PC, while signed in)",
   uber_rides: "On demand (Uber privacy download, imported by hand)",
   ai_usage: "Every 3h (the collector PC, while signed in)",
@@ -153,7 +152,6 @@ const METHOD: Record<string, { method: IntegrationMethod; label: string }> = {
   google_calendar: { method: "automated",     label: "iCal feed ETL" },
   care_calendar:  { method: "automated",      label: "Calendar API (Onyx → Google)" },
   ubereats:       { method: "automated",      label: "Local Chrome harvest" },
-  gopuff:         { method: "automated",      label: "Local Chrome harvest" },
   pc_activity:    { method: "automated",      label: "Local PC logger" },
   uber_rides:     { method: "manual",         label: "Privacy download import" },
   ai_usage:       { method: "automated",      label: "Local log harvest" },
@@ -372,7 +370,7 @@ export async function GET() {
       ({ value, checkedAt }) => ({ ok: true as const, ...value, stale: staleCheckNote(checkedAt, Date.now(), NYC_CHECK_STALE_MS, "Notion") }),
       (e: Error) => ({ ok: false as const, error: e.message }),
     );
-    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, gopuffSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, hrvArtifactSyncRes, hrvPreprocessingSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
+    const [garminRes, whoopRes, eightSleepRes, habitsRes, cronRes, hrvRes, spotifyRes, supplementsRes, readingRes, notionJournalRes, tanitaRes, tanitaSyncRes, driftRes, tzGapsRes, hrvGapsRes, hrvRetrainRes, matrixMatRes, perfMatsRes, deliveryRes, airQualityRes, airQualitySyncRes, weatherRes, weatherSyncRes, ubereatsSyncRes, kindleSyncRes, screenUsageSyncRes, hrvRetrainSyncRes, hrvArtifactSyncRes, hrvPreprocessingSyncRes, supplementRemindersSyncRes, ingestionHeartbeats, spotifyTokenRes] = await Promise.all([
       supabase.from("garmin_daily_summary").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
       supabase.from("whoop_cycles").select("start_time").order("start_time", { ascending: false }).limit(1),
       supabase.from("eight_sleep_trends").select("calendar_date").order("calendar_date", { ascending: false }).limit(1),
@@ -475,8 +473,6 @@ export async function GET() {
       // newest row regularly falls out of the 100-row window above (~13 h of history). Without a
       // dedicated fetch a stalled harvester reads "Unknown" instead of going amber, then red.
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "ubereats").eq("data_type", "items")
-        .order("sync_start", { ascending: false }).limit(1),
-      supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "gopuff").eq("data_type", "items")
         .order("sync_start", { ascending: false }).limit(1),
       supabase.from("sync_log").select(SYNC_LOG_COLS).eq("source", "kindle").eq("data_type", "highlights")
         .order("sync_start", { ascending: false }).limit(1),
@@ -1384,35 +1380,6 @@ export async function GET() {
           cadence: CADENCE.uber_rides,
           integrationMethod: METHOD.uber_rides.method,
           methodLabel: METHOD.uber_rides.label,
-        };
-      })(),
-      // goPuff item harvester (tools/gopuff_harvest/harvest.mjs on Riley's PC): same shape and
-      // thresholds as the Uber Eats card. 'failed' usually means the goPuff session expired (phone +
-      // SMS sign-in on the harvester profile) or the page's response format changed (--probe).
-      gopuff: (() => {
-        const entry = latestBySrcType["gopuff|items"]
-          ?? (gopuffSyncRes.data?.[0] as Record<string, unknown> | undefined)
-          ?? null;
-        const ageH = entry?.sync_start ? (Date.now() - new Date(entry.sync_start as string).getTime()) / 3600000 : Infinity;
-        const status: SourceStatus["status"] = !entry
-          ? "unknown"
-          : entry.status === "failed" || ageH > 48
-            ? "failed"
-            : entry.status === "partial" || ageH > 18
-              ? "partial"
-              : "success";
-        return {
-          label: "goPuff Items",
-          lastSync: (entry?.sync_start as string) ?? null,
-          status,
-          latestDataDate: entry?.sync_start ? String(entry.sync_start).slice(0, 10) : null,
-          daysLag: Number.isFinite(ageH) ? Math.floor(ageH / 24) : 999,
-          recordsSynced: (entry?.records_synced as number) ?? 0,
-          durationSeconds: (entry?.duration_seconds as number) ?? null,
-          errorMessage: (entry?.error_message as string) ?? null,
-          cadence: CADENCE.gopuff,
-          integrationMethod: METHOD.gopuff.method,
-          methodLabel: METHOD.gopuff.label,
         };
       })(),
       // PC activity logger (tools/pc_activity_logger on Riley's PC): active / idle time per

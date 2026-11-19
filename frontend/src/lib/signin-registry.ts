@@ -68,12 +68,6 @@ export const SIGNIN_REGISTRY: SigninEntry[] = [
     sources: ["ubereats"], expiry: { kind: "none" },
   },
   {
-    id: "gopuff", label: "goPuff session", mechanism: "browser-session", renewal: "riley", live: false,
-    howTo: "On the PC: phone number + SMS code in a plain Chrome window on the harvester profile.",
-    lifetime: "goPuff ends the browser session at times of its choosing. Not connected yet.",
-    sources: ["gopuff"], expiry: { kind: "none" },
-  },
-  {
     id: "gmail-imap", label: "Gmail app passwords (both accounts)", mechanism: "app-password", renewal: "riley",
     howTo: "Google account, Security, App passwords: make a new one and update the GitHub secret.",
     lifetime: "No expiry; revoked when the Google password changes or 2-Step Verification is turned off.",
