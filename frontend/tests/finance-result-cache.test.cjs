@@ -224,6 +224,8 @@ function harness({ readError = null, forecast = { kind: "empty" }, budgets = { k
     "@/lib/cash-forecast-server": { loadForecast: async () => { calls.forecast++; return typeof state.forecast === "function" ? state.forecast() : state.forecast; } },
     "@/lib/finance-budgets-server": { loadBudgets: async () => { calls.budgets++; return state.budgets; } },
     "@/lib/procurement-recurring-server": { loadDetectedSubscriptions: async () => { calls.detected++; return state.detected; } },
+    // The alerts route appends live rewards alerts (#828); their reads are not the cache table's, so none here.
+    "@/lib/rewards-server": { loadRewardsAlerts: async () => [] },
   };
   const S = loadTs("lib/finance-result-cache-server.ts", stubs);
   const drain = async () => { while (queue.length) await queue.shift()(); };
