@@ -591,8 +591,8 @@ test('respond log: refused insert plus a concurrent success leaves the reminder 
     if (table === 'supplement_intake' && op === 'insert') {
       db.failOn = null;
       db.tables.supplement_intake.push(
-        { intake_id: 901, stack_id: 4, intake_date: '2026-11-09', client_event_key: 'other', client_event_line: 0 },
-        { intake_id: 902, stack_id: 4, intake_date: '2026-11-09', client_event_key: 'other', client_event_line: 1 },
+        { intake_id: 901, stack_id: 4, intake_date: '2026-11-11', client_event_key: 'other', client_event_line: 0 },
+        { intake_id: 902, stack_id: 4, intake_date: '2026-11-11', client_event_key: 'other', client_event_line: 1 },
       );
       return { message: 'insert failed', code: '23514' };
     }
@@ -619,7 +619,7 @@ test('revert_supplement_reminder: a delayed revert after a success changes nothi
   const ok = await respond(db, LOG);
   assert.equal(ok.body.status, 'logged');
   const before = JSON.stringify(reminders(db));
-  const r = await db.rpc('revert_supplement_reminder', { p_stack_id: 4, p_date: '2026-11-09', p_status: 'prompted', p_responded_at: null });
+  const r = await db.rpc('revert_supplement_reminder', { p_stack_id: 4, p_date: '2026-11-11', p_status: 'prompted', p_responded_at: null });
   assert.equal(r.data, false);
   assert.equal(JSON.stringify(reminders(db)), before);
   assert.equal(reminders(db)[0].status, 'logged');
