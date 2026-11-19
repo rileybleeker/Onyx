@@ -245,6 +245,11 @@ function Credits({ data, onSaved }: { data: RewardsData; onSaved: () => void }) 
 function Earned({ data }: { data: RewardsData }) {
   return (
     <div className="space-y-3">
+      {data.nonUsdCount > 0 && (
+        <p className="text-[13px] text-text-secondary" data-testid="rewards-non-usd">
+          {num(data.nonUsdCount)} non-USD {data.nonUsdCount === 1 ? "transaction" : "transactions"} left out of earn and credits
+        </p>
+      )}
       {data.earn.map((e) => {
         const def = cardDef(e.card);
         const cash = def.earns === "cash";

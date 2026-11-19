@@ -219,7 +219,11 @@ export interface Txn {
   amount_cents: number; // expense-positive, like the ledger
   category: string | null;
   ignored_from: string | null;
+  /** ISO currency of amount_cents; missing = USD (the ledger's default). Non-USD rows never enter dollar math. */
+  currency?: string | null;
 }
+/** Same rule as the finance ledger: a non-USD amount is never added to USD totals (no conversion is assumed). */
+export const isUsd = (t: Pick<Txn, "currency">): boolean => ((t.currency ?? "USD").trim().toUpperCase() || "USD") === "USD";
 export const labelOf = (t: Pick<Txn, "name" | "custom_name">): string => (t.custom_name || t.name || "").toUpperCase();
 const isPurchase = (t: Txn) => t.amount_cents > 0 && classifyTxn(t) === "counted";
 
@@ -365,7 +369,7 @@ export function estimateEarn(txns: readonly Txn[], accounts: readonly AccountRow
   const sorted = [...txns].sort((a, b) => (a.txn_date < b.txn_date ? -1 : a.txn_date > b.txn_date ? 1 : 0));
   for (const t of sorted) {
     const card = byAccount.get(t.account_key);
-    if (!card || !isPurchase(t) || !isDay(t.txn_date)) continue;
+    if (!card || !isPurchase(t) || !isDay(t.txn_date) || !isUsd(t)) continue;
     const month = monthOf(t.txn_date);
     if (!months.includes(month)) continue;
     const label = labelOf(t);
@@ -507,7 +511,7 @@ export interface CreditStatus {
  */
 export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountRow[], settings: RewardsSettings, today: string): CreditStatus[] {
   const platinum = new Set([...cardAccounts(accounts)].filter(([, c]) => c === "amex_platinum").map(([k]) => k));
-  const credits = txns.filter((t) => platinum.has(t.account_key) && t.amount_cents < 0 && !(t.ignored_from ?? "").trim() && isDay(t.txn_date));
+  const credits = txns.filter((t) => platinum.has(t.account_key) && t.amount_cents < 0 && !(t.ignored_from ?? "").trim() && isDay(t.txn_date) && isUsd(t));
   const rowsBy = new Map<string, { date: string; cents: number }[]>();
   for (const t of credits) {
     const l = labelOf(t);
@@ -589,6 +593,8 @@ export interface RewardsData {
   /** The first day of the ledger history read, for "no stay seen since". */
   earliest: string | null;
   months: string[];
+  /** Card-account rows read in the window that are not in USD: left out of earn and credits, and shown as a count. */
+  nonUsdCount: number;
 }
 
 export interface RewardsInput {
@@ -636,7 +642,14 @@ export function buildRewards(i: RewardsInput): RewardsData {
     settings: i.settings,
     earliest: i.earliest,
     months,
+    nonUsdCount: countNonUsd(i.windowTxns, i.accounts),
   };
+}
+
+/** Rows on a known card account whose currency is not USD (each is excluded from the dollar estimates). */
+export function countNonUsd(txns: readonly Txn[], accounts: readonly AccountRow[]): number {
+  const cards = cardAccounts(accounts);
+  return txns.filter((t) => cards.has(t.account_key) && !isUsd(t)).length;
 }
 
 // ─── Today ───────────────────────────────────────────────────────────────────────────────────────────────
