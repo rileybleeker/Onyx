@@ -228,7 +228,8 @@ def purge_in_background() -> subprocess.Popen:
     p = subprocess.Popen(_psql_args(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, env=_env())
     p.stdin.write(sql)
-    p.stdin.close()
+    p.stdin.close()  # EOF, so psql exits as soon as the purge returns
+    p.stdin = None  # already closed: communicate() in finish() would flush it and raise ValueError
     return p
 
 
