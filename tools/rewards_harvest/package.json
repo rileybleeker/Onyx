@@ -1,0 +1,12 @@
+{
+  "name": "onyx-rewards-harvester",
+  "private": true,
+  "type": "module",
+  "description": "Runs on the collector PC every 12 h: reads loyalty balances (Amex MR, Delta, Hilton, Marriott, Uber) from a signed-in Chrome profile and upserts pds.rewards_balances.",
+  "scripts": {
+    "harvest": "node harvest.mjs",
+    "dry-run": "node harvest.mjs --dry-run",
+    "probe": "node harvest.mjs --probe"
+  },
+  "dependencies": { "playwright": "^1.50.0" }
+}
