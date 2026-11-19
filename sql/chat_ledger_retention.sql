@@ -21,8 +21,12 @@
 -- the request's writes still exist under operation ids a new ledger row would
 -- not reuse, so running it as new could write them again. Markers are never
 -- purged (one small row per request).
--- Returns one row per table: would_delete (dry run) / deleted (real run);
--- chat_retired_requests counts the markers written.
+-- A real run locks each candidate request (skipping one a live claim holds),
+-- re-checks every rule on the locked rows, and writes a marker only for a
+-- request the same statement deletes (Codex #817 CHAT819-2), so a renewed
+-- lease or a finished retry never leaves a marker on a request that stays.
+-- Returns one row per table: would_delete (the candidates) / deleted (rows a
+-- real run actually removed); chat_retired_requests counts the markers written.
 -- Service role only. Additive: safe to re-run.
 -- ============================================================================
 
@@ -65,13 +69,20 @@ DECLARE
   d_req  bigint := 0;
   d_ops  bigint := 0;
   d_ret  bigint := 0;
+  rec    record;
 BEGIN
   IF p_days IS NULL OR p_days < 30 THEN
     RAISE EXCEPTION 'chat_ledger_purge: p_days must be at least 30';
   END IF;
   cutoff := now() - make_interval(days => p_days);
 
-  CREATE TEMP TABLE _chat_purge_keys ON COMMIT DROP AS
+  -- Session temp tables, emptied at commit and before each use (so two calls in one transaction work).
+  CREATE TEMP TABLE IF NOT EXISTS _chat_purge_keys (owner_id uuid, request_id uuid) ON COMMIT DELETE ROWS;
+  CREATE TEMP TABLE IF NOT EXISTS _chat_purge_locked (owner_id uuid, request_id uuid, PRIMARY KEY (owner_id, request_id)) ON COMMIT DELETE ROWS;
+  DELETE FROM _chat_purge_keys;
+  DELETE FROM _chat_purge_locked;
+
+  INSERT INTO _chat_purge_keys (owner_id, request_id)
   SELECT r.owner_id, r.request_id
   FROM pds.chat_requests r
   WHERE r.created_at < cutoff
@@ -89,22 +100,53 @@ BEGIN
     JOIN _chat_purge_keys k ON k.owner_id = o.owner_id AND k.request_id = o.request_id;
 
   IF NOT p_dry_run THEN
-    -- Count the operations first (the cascade removes them with the request).
-    d_ops := n_ops;
-    -- Replay identity first, in this same transaction: a purged id is refused later, never run as new.
-    INSERT INTO pds.chat_retired_requests (owner_id, request_id, conversation_sha)
-      SELECT r.owner_id, r.request_id, r.conversation_sha
-      FROM pds.chat_requests r JOIN _chat_purge_keys k
-        ON r.owner_id = k.owner_id AND r.request_id = k.request_id
-      WHERE r.lease_until IS NULL OR r.lease_until < now()
-      ON CONFLICT (owner_id, request_id) DO NOTHING;
-    GET DIAGNOSTICS d_ret = ROW_COUNT;
-    DELETE FROM pds.chat_requests r USING _chat_purge_keys k
-      WHERE r.owner_id = k.owner_id AND r.request_id = k.request_id
+    -- Codex #817 CHAT819-2: a marker is written only for a request this run really deletes. The candidate list
+    -- above can be stale by now (a claim renewed the lease, a retry finished), so:
+    -- 1. Lock each candidate request row and re-check its own eligibility in the same statement. SKIP LOCKED
+    --    leaves a request a live claim is touching for a later run. While the row is locked, no claim can renew
+    --    its lease and no operation or tombstone can be added under it (their foreign keys need a key-share lock).
+    FOR rec IN
+      SELECT r.owner_id, r.request_id
+      FROM pds.chat_requests r
+      JOIN _chat_purge_keys k ON k.owner_id = r.owner_id AND k.request_id = r.request_id
+      WHERE r.created_at < cutoff
+        AND r.last_attempt_at < cutoff
         AND (r.lease_until IS NULL OR r.lease_until < now())
-        AND EXISTS (SELECT 1 FROM pds.chat_retired_requests x
-                    WHERE x.owner_id = r.owner_id AND x.request_id = r.request_id);
-    GET DIAGNOSTICS d_req = ROW_COUNT;
+      ORDER BY r.owner_id, r.request_id
+      FOR UPDATE OF r SKIP LOCKED
+    LOOP
+      INSERT INTO _chat_purge_locked (owner_id, request_id) VALUES (rec.owner_id, rec.request_id);
+    END LOOP;
+    -- 2. Lock their operations too, so an in-flight update of one (a retry) finishes before the re-check below.
+    PERFORM 1 FROM pds.chat_operations o
+      JOIN _chat_purge_locked l ON l.owner_id = o.owner_id AND l.request_id = o.request_id
+      ORDER BY o.op_id
+      FOR UPDATE OF o;
+    -- 3. Re-check the operation rules on what is now committed (a new statement reads a new snapshot).
+    DELETE FROM _chat_purge_locked l
+      WHERE EXISTS (
+        SELECT 1 FROM pds.chat_operations o
+        WHERE o.owner_id = l.owner_id AND o.request_id = l.request_id
+          AND (o.created_at >= cutoff OR o.updated_at >= cutoff
+               OR EXISTS (SELECT 1 FROM pds.chat_operation_tombstones t WHERE t.op_id = o.op_id))
+      );
+    -- 4. Delete the locked, still-eligible requests and write one marker per row the DELETE actually removed, in
+    --    one statement. Counts come from the affected rows: the operations are counted from the same snapshot
+    --    the DELETE reads (the foreign key's ON DELETE CASCADE removes exactly those).
+    WITH del AS (
+      DELETE FROM pds.chat_requests r USING _chat_purge_locked l
+        WHERE r.owner_id = l.owner_id AND r.request_id = l.request_id
+        RETURNING r.owner_id, r.request_id, r.conversation_sha
+    ), ins AS (
+      INSERT INTO pds.chat_retired_requests (owner_id, request_id, conversation_sha)
+        SELECT owner_id, request_id, conversation_sha FROM del
+        ON CONFLICT (owner_id, request_id) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM del),
+           (SELECT count(*) FROM pds.chat_operations o JOIN del ON del.owner_id = o.owner_id AND del.request_id = o.request_id),
+           (SELECT count(*) FROM ins)
+      INTO d_req, d_ops, d_ret;
   END IF;
 
   RETURN QUERY VALUES
