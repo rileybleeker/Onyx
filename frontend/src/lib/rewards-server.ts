@@ -28,7 +28,7 @@ import {
 
 const BALANCE_COLS = "program,captured_at,balance,unit,status_tier,status_progress,expires_on,source";
 const ACCOUNT_COLS = "account_key,institution,account_name";
-const TXN_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,category,ignored_from";
+const TXN_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const FLIGHT_COLS = "dep_local_date,dep_iata,arr_iata,carrier_code,status";
 const MAX_PAGES = 12;
 
@@ -70,6 +70,8 @@ const toTxn = (r: Record<string, unknown>): Txn | null => {
     amount_cents: cents,
     category: typeof r.category === "string" ? r.category : null,
     ignored_from: typeof r.ignored_from === "string" ? r.ignored_from : null,
+    // Normalized like the ledger (finance-ledger.ts): blank or missing = USD.
+    currency: (typeof r.currency === "string" ? r.currency : "USD").trim().toUpperCase() || "USD",
   };
 };
 

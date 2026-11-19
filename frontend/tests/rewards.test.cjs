@@ -59,6 +59,47 @@ test("Apple Card earns 2% and 3% at listed merchants; Discover 1% and 5% only in
   assert.ok(earn.every((x) => x.card !== "citi_simplicity" || x.total === 0));
 });
 
+test("REW828-11: non-USD rows never enter dollar earn or credit math, and are counted", () => {
+  // Synthetic: a USD 100 purchase and an EUR 100 purchase, both amount_cents 10000 on the Platinum card.
+  const rows = [
+    tx({ amount_cents: 10000, currency: "USD" }),
+    tx({ amount_cents: 10000, currency: "eur" }),
+    tx({ account_key: "a", amount_cents: 10000, currency: " GBP " }),
+    tx({ account_key: "a", amount_cents: 10000 }), // missing currency = USD, like the ledger
+    tx({ account_key: "b", amount_cents: 10000, currency: "EUR" }), // not a card account: not counted
+  ];
+  const earn = R.estimateEarn(rows, accounts, R.EMPTY_SETTINGS, MONTHS);
+  const plat = earn.find((x) => x.card === "amex_platinum");
+  assert.equal(plat.spendCents, 10000);
+  assert.equal(plat.total, 100);
+  assert.equal(plat.txnCount, 1);
+  const apple = earn.find((x) => x.card === "apple_card");
+  assert.equal(apple.spendCents, 10000);
+  assert.equal(apple.total, 200);
+  assert.equal(R.countNonUsd(rows, accounts), 2);
+  assert.equal(build({ windowTxns: rows }).nonUsdCount, 2);
+  assert.equal(build({ windowTxns: [tx({})] }).nonUsdCount, 0);
+});
+
+test("REW828-11: a foreign-currency benefit credit is not compared with a USD allowance", () => {
+  const rows = [
+    tx({ name: "RESY CREDIT", amount_cents: -10000, txn_date: "2030-03-03", currency: "EUR" }),
+    tx({ name: "LULULEMON CREDIT", amount_cents: -7500, txn_date: "2030-03-03", currency: "USD" }),
+  ];
+  const c = Object.fromEntries(R.creditStatuses(rows, accounts, R.EMPTY_SETTINGS, "2030-03-15").map((x) => [x.id, x]));
+  assert.equal(c.resy.usedCents, 0);
+  assert.equal(c.resy.state, "unused");
+  assert.equal(c.lululemon.usedCents, 7500);
+  assert.equal(c.lululemon.state, "used");
+});
+
+test("REW828-11: the server reader selects currency and keeps it on every row", () => {
+  const src = read("lib/rewards-server.ts");
+  const cols = src.match(/const TXN_COLS = "([^"]+)"/);
+  assert.ok(cols && cols[1].split(",").includes("currency"), "TXN_COLS selects currency");
+  assert.match(src, /currency: \(typeof r\.currency === "string"/);
+});
+
 test("Hilton and Marriott brands count; ordinary words alone do not", () => {
   assert.equal(R.hotelFamily("HAMPTON INN ATLANTA"), "hilton_honors");
   assert.equal(R.hotelFamily("COURTYARD BY MARRIOTT"), "marriott_bonvoy");
