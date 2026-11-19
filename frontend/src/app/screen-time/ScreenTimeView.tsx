@@ -5,6 +5,7 @@ import type { ScreenSync } from "@/lib/screen-time-server";
 import { WINDOW_CHOICES, formatMinutes, type TopEntry } from "@/lib/screen-time";
 import type { ScreenTimeViewData } from "@/lib/screen-time-view";
 import type { AiSection, AiSync } from "@/lib/ai-usage";
+import type { PcSection } from "@/lib/pc-activity-view";
 import { DailyTotalChart, LateNightChart, PickupsChart, SleepOnsetChart } from "./ScreenTimeCharts";
 import InfoHint from "@/components/InfoHint";
 import RetryButton from "./RetryButton";
@@ -57,7 +58,8 @@ function Tile({ label, value, sub, hint }: { label: string; value: string; sub: 
   );
 }
 
-function TopList({ title, entries, empty }: { title: string; entries: TopEntry[]; empty: string }) {
+/** `totals`: show each entry's minutes over the window instead of its per-day mean. */
+function TopList({ title, entries, empty, totals = false }: { title: string; entries: TopEntry[]; empty: string; totals?: boolean }) {
   const max = entries[0]?.minutes ?? 0;
   return (
     <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
@@ -76,7 +78,7 @@ function TopList({ title, entries, empty }: { title: string; entries: TopEntry[]
                   )}
                 </span>
                 <span className="shrink-0 font-mono tabular-nums text-text-secondary">
-                  {formatMinutes(e.perDay)}/day
+                  {totals ? formatMinutes(e.minutes) : `${formatMinutes(e.perDay)}/day`}
                   <span className="ml-2 text-text-tertiary">{Math.round(e.share * 100)}%</span>
                 </span>
               </div>
@@ -94,7 +96,7 @@ function TopList({ title, entries, empty }: { title: string; entries: TopEntry[]
   );
 }
 
-function AiSyncLine({ sync, skippedRows = 0 }: { sync: AiSync | null; skippedRows?: number }) {
+function AiSyncLine({ sync, skippedRows = 0, card = "AI Tool Usage" }: { sync: AiSync | null; skippedRows?: number; card?: string }) {
   const skipped = skippedRows > 0 ? ` ${skippedRows} unreadable row(s) skipped.` : "";
   if (!sync?.at) {
     return <p className="text-[12px] text-text-tertiary">The PC has not reported an upload yet.{skipped}</p>;
@@ -103,7 +105,7 @@ function AiSyncLine({ sync, skippedRows = 0 }: { sync: AiSync | null; skippedRow
   const partial = sync.status === "partial";
   const statusLink = (
     <Link href="/status" className="underline underline-offset-2 hover:text-text-primary">
-      AI Tool Usage card on Status
+      {card} card on Status
     </Link>
   );
   return (
@@ -188,6 +190,78 @@ function aiToolsPart(ai: AiSection): PartSpec {
       syncPart,
     ],
   };
+}
+
+/** The "PC" section (pds.pc_activity_daily): its own empty and error lines, whatever the phone and AI data show. */
+function pcPart(pc: PcSection, windowDays: number): PartSpec {
+  const header = <h2 className="text-[12px] font-semibold uppercase tracking-[0.07em] text-text-secondary">PC</h2>;
+  const base = { id: "pc", title: "PC", node: header, gap: 12 };
+  if (pc.kind === "error") {
+    return {
+      ...base,
+      members: [{ id: "pc-status", title: "PC status", node: <p className="text-[13px] text-red-300">{pc.hint}</p> }],
+    };
+  }
+  const syncPart: PartSpec = {
+    id: "pc-sync",
+    title: "PC last upload",
+    node: <AiSyncLine sync={pc.sync} skippedRows={pc.kind === "ok" ? pc.skippedRows : 0} card="PC Activity" />,
+  };
+  if (pc.kind === "empty") {
+    return {
+      ...base,
+      members: [
+        { id: "pc-status", title: "PC status", node: <p className="text-[13px] text-text-tertiary">No PC activity recorded in this window.</p> },
+        syncPart,
+      ],
+    };
+  }
+  const perComplete =
+    pc.completeDays === 0
+      ? "per complete day"
+      : `per day, over ${pc.completeDays === 1 ? "1 complete day" : `${pc.completeDays} complete days`}`;
+  const members: PartSpec[] = [];
+  if (pc.completeDays === 0) {
+    members.push({
+      id: "pc-status",
+      title: "PC status",
+      node: <p className="text-[13px] text-text-tertiary">No complete day yet: the newest day is still uploading.</p>,
+    });
+  }
+  members.push(
+    { id: "pc-active", title: "Active at the PC", width: "quarter", node: <Tile label="Active at the PC" value={formatMinutes(pc.activePerDay)} sub={perComplete} /> },
+    {
+      id: "pc-late",
+      title: "Late at the PC",
+      width: "quarter",
+      node: <Tile label="Late at the PC" value={formatMinutes(pc.latePerDay)} sub="9 PM to 6 AM, per day" />,
+    },
+    { id: "pc-days", title: "PC days logged", width: "quarter", node: <Tile label="Days logged" value={`${pc.loggedDays} of ${windowDays}`} sub="days" /> },
+    {
+      id: "pc-top-programs",
+      title: "Top programs",
+      width: "half",
+      node: <TopList title="Top programs" entries={pc.topPrograms} empty="No program minutes in this window." totals />,
+    },
+    syncPart,
+  );
+  return { ...base, members };
+}
+
+/** A section's parts without Personalize, under the phone's empty screen. */
+function PlainPart({ part, label }: { part: PartSpec; label: string }) {
+  return (
+    <section aria-label={label} className="space-y-3">
+      {part.node}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {(part.members ?? []).map((m) => (
+          <div key={m.id} className={m.width === "quarter" ? "col-span-1" : m.width === "half" ? "col-span-2" : "col-span-2 lg:col-span-4"}>
+            {m.node}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 /** The AI section without Personalize, under the phone's empty screen. */
@@ -289,6 +363,8 @@ function screenTimeParts(data: OkData, s: OkData["summary"]): PartSpec[] {
     },
     // An answer cached before the field existed has no ai: the phone parts still draw.
     ...(data.ai ? [aiToolsPart(data.ai)] : []),
+    // Likewise pc (lib/pc-activity-view.ts).
+    ...(data.pc ? [pcPart(data.pc, data.windowDays)] : []),
   ];
 }
 
@@ -402,6 +478,12 @@ export default function ScreenTimeView({
       {data?.kind === "empty" && data.ai && (
         <div className={clsx(busy && "opacity-60")}>
           <AiToolsPlain ai={data.ai} />
+        </div>
+      )}
+
+      {data?.kind === "empty" && data.pc && (
+        <div className={clsx(busy && "opacity-60")}>
+          <PlainPart part={pcPart(data.pc, data.windowDays)} label="PC" />
         </div>
       )}
 
