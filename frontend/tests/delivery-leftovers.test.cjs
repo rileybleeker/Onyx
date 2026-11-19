@@ -506,7 +506,7 @@ test("SQL: no DROP statement, guards present, nutrition view keeps its column or
 // ─── markup ──────────────────────────────────────────────────────────────────
 
 test("LeftoverList renders the share left, the six answers and the lit one", () => {
-  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries": {} });
+  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries-delivery": {} });
   const q = {
     dish: { item_id: 7, behavioral_date: "2030-01-08", store_name: "Example Pizza Co", title: "Large Test Pie", quantity: 1, unit_kcal: 2000, est_kind: "food", eaten_fraction: 0.25 },
     left: 0.75,
@@ -526,7 +526,7 @@ test("LeftoverList renders the share left, the six answers and the lit one", () 
 });
 
 test("LeftoverList: the When? row appears once an amount is picked, with Now and Same as", () => {
-  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries": {} });
+  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries-delivery": {} });
   const base = { left: 0.75, kcal: 750 };
   const dish = (item_id, title) => ({ item_id, behavioral_date: "2030-01-08", store_name: "Example Pizza Co", title, quantity: 1, unit_kcal: 2000, est_kind: "food", eaten_fraction: 0.25 });
   const timed = { ...base, dish: dish(7, "Large Test Pie"), token: "0.375@19:30", option: "0.5", time: "19:30" };
@@ -548,7 +548,7 @@ test("LeftoverList: the When? row appears once an amount is picked, with Now and
 });
 
 test("read-only lists (no onPick, /nutrition): the answer as text, no buttons, no time field", () => {
-  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries": {} });
+  const C = loadTs("components/DeliveryPortions.tsx", { "@/lib/queries-delivery": {} });
   const dish = (item_id, eaten_fraction) => ({ item_id, behavioral_date: "2030-01-08", completed_at: null, store_name: "Example Pizza Co", title: "Large Test Pie", quantity: 1, unit_kcal: 2000, est_kcal: 1500, est_kind: "food", eaten_fraction });
   const dishes = renderToStaticMarkup(React.createElement(C.DeliveryDishList, { items: [dish(1, 0.75), dish(2, null)] }));
   assert.ok(!dishes.includes("<button"));
