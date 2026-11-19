@@ -54,6 +54,26 @@ def test_zip_and_folder_and_output_has_no_titles(capsys=None):
         assert "SENTINEL" not in s
 
 
+def test_duplicate_keeps_known_channel_in_either_order():
+    rich, bare = EVENTS[0], EVENTS[5]
+    for order in ([rich, bare], [bare, rich]):
+        (row,) = yh.build_rows(order, "lbl")
+        assert row["channel_id"] == "UCxyz" and row["channel_name"] == "Chan"
+
+
+def test_nested_history_change_changes_fingerprint():
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t) / "Takeout"
+        nested = root / "YouTube" / "history"
+        nested.mkdir(parents=True)
+        f = nested / "watch-history.json"
+        f.write_text(json.dumps(EVENTS[:1]), encoding="utf-8")
+        before = yh.fingerprint(root)
+        assert before == yh.fingerprint(root)
+        f.write_text(json.dumps(EVENTS[:2]), encoding="utf-8")
+        assert yh.fingerprint(root) != before
+
+
 def test_bad_format_is_an_error():
     try:
         yh._as_list({"a": 1})

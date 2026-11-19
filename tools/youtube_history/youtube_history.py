@@ -145,13 +145,20 @@ def event_row(ev: object, export_label: str) -> Optional[dict]:
 
 
 def build_rows(events: Iterable[object], export_label: str) -> list:
-    """Rows deduplicated on the table key (a batch with one key twice makes the upsert fail); the last
-    occurrence wins. Output is oldest first."""
+    """Rows deduplicated on the table key (a batch with one key twice makes the upsert fail). Copies are
+    merged: per field the last non-empty value wins, so a later copy without channel fields never erases
+    what an earlier copy knew (the upsert would overwrite the stored event). Output is oldest first."""
     rows: dict = {}
     for ev in events:
         r = event_row(ev, export_label)
-        if r is not None:
-            rows[(r["watched_at"], r["video_id"])] = r
+        if r is None:
+            continue
+        key = (r["watched_at"], r["video_id"])
+        old = rows.get(key)
+        if old is not None:
+            r = {k: (r[k] if r[k] not in (None, "") else old[k]) if k not in ("is_music", "is_ad")
+                 else bool(r[k] or old[k]) for k in r}
+        rows[key] = r
     return [rows[k] for k in sorted(rows)]
 
 
@@ -215,8 +222,24 @@ def find_exports(roots: Optional[list] = None) -> list:
 
 
 def fingerprint(path: Path) -> str:
-    st = path.stat()
-    return hashlib.sha256(f"{path.name}|{st.st_size}|{int(st.st_mtime)}".encode()).hexdigest()[:24]
+    """Hash of the CONTENT of the actual input: the zip file, or every watch-history.json inside a folder
+    (relative path + bytes), so any change to them changes it. Folder mtimes/sizes do not."""
+    h = hashlib.sha256()
+
+    def feed(p: Path) -> None:
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+
+    if path.is_file():
+        feed(path)
+    else:
+        files = sorted((p for p in _walk(path, 6) if p.is_file() and p.name == HISTORY_FILE),
+                       key=lambda p: p.relative_to(path).as_posix())
+        for p in files:
+            h.update(p.relative_to(path).as_posix().encode() + b"\0")
+            feed(p)
+    return h.hexdigest()[:24]
 
 
 def read_history(path: Path, kind: str) -> Optional[list]:
