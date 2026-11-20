@@ -69,6 +69,17 @@ jobs:
           ONYX_REQUIRE_LIVE: "1"
         run: python tests/test_hrv_alignment_live.py
 
+      - name: Every RPC the app calls exists in production (read-only)
+        # Codex #838 REW842-2: a deploy that calls a database function whose sql/*.sql file was never applied
+        # (pds.rewards_settings_merge after #842) failed every save with 503 and nothing went red. Reads the
+        # PostgREST API description only; calls no function and writes nothing. Fix a failure by applying the
+        # named SQL file, never by allow-listing it.
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ONYX_REQUIRE_LIVE: "1"
+        run: python tests/test_required_rpcs_live.py
+
       - name: Habit-rename cascade (WRITES fixtures to production; manual opt-in only)
         # Same gate PR #21 put on this test: only a person starting the workflow by hand and
         # ticking run_live_write_tests. Never on push, schedule or pull request.
