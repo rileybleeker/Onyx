@@ -41,6 +41,7 @@ LIVE_WORKFLOW = ROOT / ".github" / "workflows" / "live-checks.yml"
 LIVE_TESTS = {
     "test_hrv_alignment_live.py": "reads the live behavioral matrix (read-only)",
     "test_habit_rename.py": "WRITES uuid-tagged fixtures to the live database (manual opt-in only)",
+    "test_required_rpcs_live.py": "reads the production API description for missing RPCs (read-only)",
 }
 
 # Offline tests that currently fail for a reason unrelated to the change under test.

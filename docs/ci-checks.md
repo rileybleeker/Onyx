@@ -42,6 +42,7 @@ Offline test files set stub `SUPABASE_*` values with `os.environ.setdefault(...)
 | Test | When |
 |---|---|
 | `tests/test_hrv_alignment_live.py` | every run, with `ONYX_REQUIRE_LIVE=1` (missing credentials are a failure, not a skip). `ONYX_ALIGNMENT_HEARTBEAT` is not set, so it writes nothing. |
+| `tests/test_required_rpcs_live.py` | every run, with `ONYX_REQUIRE_LIVE=1`. Read-only: lists the `/rpc/` functions the production API exposes for `pds` and fails when `frontend/src` calls one that is missing (an unapplied `sql/*.sql` file). |
 | `tests/test_habit_rename.py` | only when you start the workflow by hand and tick `run_live_write_tests`. It writes uuid-tagged fixtures to the live database and deletes them. Never on push or schedule. |
 
 A failure is a red run (and GitHub's failure email). Concurrency group `live-checks` does not cancel in-progress runs, so two runs never query the database at once. Because this runs after merge, a bad alignment change is caught within minutes of landing rather than before it; the retrain workflow also refuses to publish results when the same test fails.
