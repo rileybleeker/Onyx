@@ -1,7 +1,7 @@
 // Synthetic payloads only (no real balances, names or numbers). Run with: node --test lib.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractProgram, looksSignedOut, shapeOf, summarize, toIsoDate, toNumber } from "./lib.mjs";
+import { endpointLabel, extractProgram, looksSignedOut, probeShape, runMode, summarize, toIsoDate, toNumber } from "./lib.mjs";
 
 test("balance, tier and progress come only from allow-listed keys", () => {
   const cap = [{ url: "https://x.test/api/skymiles/summary", json: {
@@ -49,10 +49,34 @@ test("sign-in address detection, number and date helpers", () => {
   assert.equal(toIsoDate("3/4/2027"), "2027-03-04");
 });
 
-test("probe shape holds key names and types, never values", () => {
-  const s = JSON.stringify(shapeOf({ pointsBalance: 123, name: "Demo Person", list: [{ a: 1 }] }));
-  assert.ok(s.includes("pointsBalance") && s.includes("number"));
-  assert.ok(!s.includes("Demo") && !s.includes("123"));
+test("probe shape: allow-listed key names and types only; unknown keys are counted, never named", () => {
+  const p = probeShape({
+    pointsBalance: 123, name: "Demo Person", list: [{ a: 1 }],
+    "MARKER-XYZ-key": 1, nested: { "ID-900123": { mileBalance: "9" } },
+  });
+  const s = JSON.stringify(p);
+  assert.deepEqual(p.keys, { pointsBalance: "number", mileBalance: "string" });
+  assert.equal(p.unknown_keys, 6); // name, list, a, MARKER-XYZ-key, nested, ID-900123
+  assert.ok(!s.includes("MARKER-XYZ") && !s.includes("900123") && !s.includes("Demo"));
+});
+
+test("probe endpoint label is fixed; the address and its identifiers are never kept", () => {
+  for (const url of ["https://x.test/members/ID-900123/", "https://x.test/members/ID-900123/balance?k=MARKER-XYZ", "https://x.test/zzz/ID-900123"]) {
+    const label = endpointLabel(url);
+    assert.ok(/^[a-z-]+$/.test(label));
+    assert.ok(!label.includes("900123") && !label.includes("MARKER"));
+  }
+  assert.equal(endpointLabel("https://x.test/zzz/ID-900123"), "other");
+  assert.equal(endpointLabel("https://x.test/api/pointsBalance?x=1"), "balance");
+});
+
+test("--probe is read-only unless --save; --dry-run never writes; plain run writes", () => {
+  assert.deepEqual(runMode([]), { dry: false, probe: false, write: true });
+  assert.equal(runMode(["--probe"]).write, false);
+  assert.equal(runMode(["--probe", "--only", "amex_mr"]).write, false);
+  assert.equal(runMode(["--probe", "--save"]).write, true);
+  assert.equal(runMode(["--dry-run", "--save"]).write, false);
+  assert.equal(runMode(["--only", "amex_mr"]).write, true);
 });
 
 test("heartbeat summary names programs and causes only", () => {

@@ -200,17 +200,55 @@ export function looksSignedOut(id, url) {
   return PROGRAMS[id].authUrl.test(url || "");
 }
 
-/** Key names and value types only (never a value), for --probe. */
-export function shapeOf(node, depth = 0) {
-  if (node === null) return "null";
-  if (Array.isArray(node)) return node.length ? [shapeOf(node[0], depth + 1), `x${node.length}`] : [];
-  if (typeof node === "object") {
-    if (depth > 6) return "object";
-    const out = {};
-    for (const [k, v] of Object.entries(node).slice(0, 80)) out[k] = shapeOf(v, depth + 1);
-    return out;
+// ---- --probe output: nothing here may carry an account identifier ----
+// A response address or a JSON property name can itself hold a member id (/members/ID-1/, {"ID-1": ...}),
+// so the probe never writes an address and never writes a property name that is not on this list.
+
+/** Fixed endpoint labels (first match wins). The address itself is never written. */
+const ENDPOINT_LABELS = [
+  ["balance", /balance|points|miles|cash|wallet/i],
+  ["tier-status", /tier|status|elite|medallion|honors|bonvoy|skymiles/i],
+  ["membership", /member|subscription|uber-?one|billing|renew/i],
+  ["profile-account", /profile|account|user|guest|customer/i],
+  ["rewards-loyalty", /reward|loyalty|credit|payment/i],
+];
+export function endpointLabel(url) {
+  const s = String(url || "").split("?")[0];
+  for (const [label, re] of ENDPOINT_LABELS) if (re.test(s)) return label;
+  return "other";
+}
+
+/** Property names the probe may write: every key the adapters read, plus common balance/tier/date wording. */
+export const PROBE_KEYS = new Set(
+  [
+    ...Object.values(PROGRAMS).flatMap((c) => [
+      ...(c.balanceKeys || []), ...(c.tierKeys || []), ...(c.memberKeys || []), ...(c.expiryKeys || []),
+      ...Object.values(c.progress || {}).flat(),
+    ]),
+    "balance", "tier", "status", "level", "expirationDate", "expiryDate", "renewalDate", "nights", "miles", "points",
+  ].map((k) => k.toLowerCase()),
+);
+
+/**
+ * Allow-listed key names with value types (never a value), plus how many other keys were seen.
+ * Unknown keys are counted, never written by name. Returns { keys: {name: type}, unknown_keys: N }.
+ */
+export function probeShape(json) {
+  const keys = {};
+  let unknown = 0;
+  for (const [k, v] of walk(json)) {
+    if (PROBE_KEYS.has(String(k).toLowerCase())) keys[k] = v === null ? "null" : Array.isArray(v) ? "array" : typeof v;
+    else unknown++;
   }
-  return typeof node;
+  return { keys, unknown_keys: unknown };
+}
+
+/** Run mode from the command line. --probe is read-only (no upsert, no heartbeat) unless --save is also given. */
+export function runMode(args) {
+  const dry = args.includes("--dry-run");
+  const probe = args.includes("--probe");
+  const write = !dry && (!probe || args.includes("--save"));
+  return { dry, probe, write };
 }
 
 /** The one heartbeat decision: success when every program was read, else partial naming each cause (no values). */
