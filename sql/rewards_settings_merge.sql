@@ -1,6 +1,6 @@
 -- Atomic merge for pds.rewards_settings (PUT /api/rewards/settings). One statement merges the patch into the stored
 -- JSON object (jsonb ||), so two overlapping saves of different fields both persist; the old read-merge-upsert in
--- application code could drop one. p_merge = false replaces the value (discover_quarter, apple_boosted).
+-- application code could lose one. p_merge = false replaces the value (discover_quarter, apple_boosted).
 -- Additive and idempotent. Service role only.
 create or replace function pds.rewards_settings_merge(p_key text, p_patch jsonb, p_merge boolean default true)
 returns jsonb
