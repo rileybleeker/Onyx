@@ -62,3 +62,4 @@ Log: `%LOCALAPPDATA%\Onyx\pc-activity\logger.log` (counts and errors only). Stop
 the task in Task Scheduler and end `pythonw.exe` in Task Manager.
 
 Tests: `tests/test_pc_activity_aggregation.py` (synthetic samples only).
+The scheduled task runs from a copy under `%LOCALAPPDATA%\Onyx\scheduled\pc_activity_logger`, so re-run `register-task.ps1` after code changes.

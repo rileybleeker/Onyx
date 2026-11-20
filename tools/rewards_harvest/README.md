@@ -47,3 +47,4 @@ list in `lib.mjs` (and `PROBE_KEYS` follows). Add the right key name to that pro
 `node harvest.mjs` scheduled run - `--dry-run` - `--probe` - `--only <program>` - `--headed` - `--login <program>`.
 Register the task: `pwsh -File register-task.ps1`. Log: `%LOCALAPPDATA%\Onyx\rewards-harvest\harvest.log`.
 Install once: `npm install` in this folder.
+The scheduled task runs from a copy under `%LOCALAPPDATA%\Onyx\scheduled\rewards_harvest`, so re-run `register-task.ps1` after code changes.

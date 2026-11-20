@@ -11,8 +11,20 @@
 # Needs ~/.onyx_supabase_secret (the service key file the PC activity logger uses) and Node 22+.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Run from a stable copy under LOCALAPPDATA (same folder as the harvest task), not from this checkout: a
+# temporary git worktree that is later removed would leave the shortcut pointing at a deleted folder. Re-run
+# this script after code changes. node_modules, .git, logs, locks and state files are not copied; the
+# listener log lives beside the script, so it now lives in the copy. Secrets stay in ~.
+$stable = Join-Path $env:LOCALAPPDATA 'Onyx\scheduled\kindle_harvest'
+New-Item -ItemType Directory -Force -Path $stable | Out-Null
+Get-ChildItem -LiteralPath $here -Force -Exclude 'node_modules', '.git', '*.log', '*.lock', 'state.json', 'probe.png' |
+  Copy-Item -Destination $stable -Recurse -Force
+if ((Test-Path "$here\state.json") -and -not (Test-Path "$stable\state.json")) { Copy-Item "$here\state.json" "$stable\state.json" }
+if ((Test-Path "$here\package.json") -and (Test-Path "$here\node_modules") -and -not (Test-Path "$stable\node_modules")) {
+  Copy-Item "$here\node_modules" "$stable\node_modules" -Recurse -Force   # the script imports playwright from here
+}
 $wscript = "$env:WINDIR\System32\wscript.exe"
-$arguments = "//B //Nologo //E:JScript `"$here\run-hidden.js`" run-listener.mjs"
+$arguments = "//B //Nologo //E:JScript `"$stable\run-hidden.js`" run-listener.mjs"
 
 if (-not (Test-Path "$env:USERPROFILE\.onyx_supabase_secret")) { throw 'Missing ~/.onyx_supabase_secret (the Supabase service key file).' }
 
@@ -23,21 +35,22 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($lnk)
 $shortcut.TargetPath = $wscript
 $shortcut.Arguments = $arguments
-$shortcut.WorkingDirectory = $here
+$shortcut.WorkingDirectory = $stable
 $shortcut.WindowStyle = 7
 $shortcut.Description = 'Onyx: answers the Run now button on the /status Kindle card'
 $shortcut.Save()
 
 # Stop a listener that is already running (only processes running this folder's run-listener.mjs).
 $mine = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-  Where-Object { $_.CommandLine -and $_.CommandLine -like "*$here\run-listener.mjs*" }
+  Where-Object { $_.CommandLine -and $_.CommandLine -like "*$stable\run-listener.mjs*" -or $_.CommandLine -like "*$here\run-listener.mjs*" }
 foreach ($p in $mine) { Stop-Process -Id $p.ProcessId -Force }
 if ($mine) { Start-Sleep -Seconds 1 }
 
-Start-Process -FilePath $wscript -ArgumentList $arguments -WorkingDirectory $here
+Start-Process -FilePath $wscript -ArgumentList $arguments -WorkingDirectory $stable
 Start-Sleep -Seconds 4
 $running = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-  Where-Object { $_.CommandLine -and $_.CommandLine -like "*$here\run-listener.mjs*" }
+  Where-Object { $_.CommandLine -and $_.CommandLine -like "*$stable\run-listener.mjs*" }
+"Stable copy: $stable"
 "Startup shortcut: $lnk"
 "Listener running: $([bool]$running) (restarted $(@($mine).Count))"
-Get-Content "$here\listener.log" -Tail 3 -ErrorAction SilentlyContinue
+Get-Content "$stable\listener.log" -Tail 3 -ErrorAction SilentlyContinue

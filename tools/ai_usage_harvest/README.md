@@ -63,3 +63,4 @@ Log: `%LOCALAPPDATA%\Onyx\ai-usage\harvest.log` (counts and error types only). S
 
 Tests: `tests/test_ai_usage_harvest.py` (synthetic logs only; fails if any log content reaches the rows,
 the printed summary, the upload or the log).
+The scheduled task runs from a copy under `%LOCALAPPDATA%\Onyx\scheduled\ai_usage_harvest`, so re-run `register-task.ps1` after code changes.

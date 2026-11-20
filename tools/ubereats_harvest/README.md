@@ -59,3 +59,4 @@ Needs `~/.onyx_ci_token` (the same token the Kindle harvester uses). `npm instal
 The numbers are estimates from dish names. They overcount when an order was shared or not finished
 (a whole pizza counts as eaten). To correct a dish, update its row in
 `pds.delivery_item_nutrition`; it will not be re-estimated.
+The scheduled task runs from a copy under `%LOCALAPPDATA%\Onyx\scheduled\ubereats_harvest`, so re-run `register-task.ps1` after code changes.

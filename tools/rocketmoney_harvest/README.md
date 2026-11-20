@@ -255,3 +255,4 @@ sign-in handling (`test/session.test.mjs`: which address is a sign-in screen and
 visit verdict over time, the failure text, the keep-alive and signed-out schedule, the launch arguments, the guard
 attached before any page loads, saved tabs cleared before launch). The signed-in
 browser flow (Playwright driving the real app) cannot be tested offline; run `node harvest.mjs --dry-run` yourself.
+The scheduled task runs from a copy under `%LOCALAPPDATA%\Onyx\scheduled\rocketmoney_harvest`, so re-run `register-task.ps1` after code changes.

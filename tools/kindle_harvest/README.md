@@ -111,3 +111,4 @@ is `listener.log` (times, events and request ids only).
 Run: node --test tools/kindle_harvest/harvest.test.mjs. These tests use synthetic responses and browser stubs, without credentials, Amazon, or production writes. CI runs them on harvester changes.
 
 Imports time out after 60 seconds and HTTP errors, malformed responses, and partial imports fail the run. Browser startup/navigation failures attempt a generic failed heartbeat; login and dry-run modes never post failure heartbeats. If Onyx itself cannot be reached, the local log and nonzero task exit remain the fallback.
+The scheduled task and the Run now listener run from a copy under `%LOCALAPPDATA%\Onyx\scheduled\kindle_harvest`, so re-run `register-task.ps1` (and `register-listener.ps1`) after code changes.

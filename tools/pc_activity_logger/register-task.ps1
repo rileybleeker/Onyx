@@ -20,8 +20,20 @@ $pythonw = Get-Command pythonw.exe -All -ErrorAction SilentlyContinue |
   Where-Object { $_.Source -notlike '*\WindowsApps\*' } | Select-Object -First 1 -ExpandProperty Source
 if (-not $pythonw) { throw 'pythonw.exe not found on PATH (install Python from python.org).' }
 
+# Run from a stable copy under LOCALAPPDATA, not from this checkout: a temporary git worktree that is later
+# removed would otherwise leave the task pointing at a deleted folder (0x8007010B). Re-run this script after
+# code changes. The copy keeps the repo layout the script expects (tools\pc_activity_logger two levels below
+# its root, plus the helpers it imports). State, logs and secrets stay where they were (LOCALAPPDATA\Onyx, ~).
+$repo = Split-Path -Parent (Split-Path -Parent $here)
+$stable = Join-Path $env:LOCALAPPDATA 'Onyx\scheduled\pc_activity_logger'
+$stableHere = Join-Path $stable 'tools\pc_activity_logger'
+New-Item -ItemType Directory -Force -Path $stableHere | Out-Null
+Copy-Item -Path "$here\*.py" -Destination $stableHere -Force
+Copy-Item -Path "$repo\sync_log_helper.py", "$repo\email_log_safety.py" -Destination $stable -Force
+Write-Host "Stable copy registered: $stable"
+
 $action = New-ScheduledTaskAction -Execute $pythonw `
-  -Argument "`"$here\activity_logger.py`" run" -WorkingDirectory $here
+  -Argument "`"$stableHere\activity_logger.py`" run" -WorkingDirectory $stableHere
 $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]::Today.AddMinutes(3)) `
   -RepetitionInterval (New-TimeSpan -Minutes 10)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
