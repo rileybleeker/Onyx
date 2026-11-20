@@ -261,6 +261,55 @@ test("a phone query failure still draws the AI and PC sections under the error b
   assert.ok(bare.includes("Couldn&#x27;t load Screen Time.") && !bare.includes(AI_EMPTY) && !bare.includes("Active at the PC"));
 });
 
+test("an error answer's window validates when absent or a positive whole number, never otherwise (PR844-WINDOW)", () => {
+  for (const v of [{ ...errorView(AI_EMPTY_SECTION, okPc()), windowDays: 30 }, errorView(AI_EMPTY_SECTION, okPc()), errorView()]) {
+    const j = JSON.parse(JSON.stringify(v));
+    assert.deepEqual(V.readScreenTimeViewData(j), j);
+  }
+  for (const windowDays of ["30", 0, -7, 2.5, null]) {
+    assert.throws(() => V.readScreenTimeViewData({ ...errorView(AI_EMPTY_SECTION, okPc()), windowDays }), String(windowDays));
+  }
+});
+
+test("30 -> 14 days with a delayed answer and a phone failure: denominator stays 30, busy until 14 lands (PR844-WINDOW)", async () => {
+  const drawFeed = (data, picked) =>
+    renderToStaticMarkup(
+      React.createElement(View, { data, windowDays: picked, feed: true, onWindow: () => {}, busy: V.screenTimeBusy(data, picked) }),
+    );
+  // The 30-day answer on screen: the phone query failed, the PC section was read for 30 days.
+  const thirty = V.readScreenTimeViewData(JSON.parse(JSON.stringify({ ...errorView(AI_EMPTY_SECTION, okPc()), windowDays: 30 })));
+  assert.equal(V.screenTimeBusy(thirty, 30), false);
+  const before = drawFeed(thirty, 30);
+  assert.ok(before.includes("1 of 30") && !before.includes('aria-busy="true"') && !before.includes("opacity-60"));
+
+  // 14 picked; its answer is delayed, so the 30-day answer stays on screen.
+  let land;
+  const fourteenAnswer = new Promise((resolve) => { land = resolve; });
+  assert.equal(V.screenTimeBusy(thirty, 14), true);
+  const waiting = drawFeed(thirty, 14);
+  assert.ok(waiting.includes("1 of 30"), "the denominator is the answer's window, not the picked one");
+  assert.ok(!waiting.includes("1 of 14"));
+  assert.ok(waiting.includes('aria-busy="true"') && waiting.includes("opacity-60"), "busy until the new answer lands");
+  // Dimmed even without the busy prop (the routed page passes none): the window differs from the picked one.
+  const noBusyProp = renderToStaticMarkup(React.createElement(View, { data: thirty, windowDays: 14, feed: true, onWindow: () => {} }));
+  assert.ok(noBusyProp.includes("1 of 30") && noBusyProp.includes("opacity-60"));
+
+  // The 14-day answer lands (another phone failure).
+  setTimeout(() => land({ ...errorView(AI_EMPTY_SECTION, okPc()), windowDays: 14 }), 5);
+  const fourteen = V.readScreenTimeViewData(JSON.parse(JSON.stringify(await fourteenAnswer)));
+  assert.equal(V.screenTimeBusy(fourteen, 14), false);
+  const after = drawFeed(fourteen, 14);
+  assert.ok(after.includes("1 of 14") && !after.includes('aria-busy="true"') && !after.includes("opacity-60"));
+
+  // A bare error says no window: never busy, and an error from before the field existed uses the picked window.
+  assert.equal(V.screenTimeBusy(errorView(), 14), false);
+  assert.ok(drawFeed(errorView(AI_EMPTY_SECTION, okPc()), 14).includes("1 of 14"));
+  // ok and empty answers keep their busy rule.
+  assert.equal(V.screenTimeBusy(okView(okPc()), 14), true);
+  assert.equal(V.screenTimeBusy(emptyView(okPc()), 30), false);
+  assert.equal(V.screenTimeBusy(null, 30), false);
+});
+
 test("all-unreadable PC rows show the count as the PC error line, never 'No PC activity recorded' (PC835-2)", () => {
   const pc = { kind: "error", hint: P.pcUnreadableHint(3) };
   for (const html of [draw(okView(pc)), draw(emptyView(pc)), draw(errorView(AI_EMPTY_SECTION, pc))]) {
@@ -338,6 +387,7 @@ test("loadScreenTime: a phone query failure keeps the AI and PC sections it read
   assert.ok(tables.includes("pc_activity_daily") && tables.includes("ai_tool_usage_daily"));
   assert.equal(result.kind, "error");
   assert.ok(result.hint.includes("XX000"));
+  assert.equal(result.windowDays, 30, "the sections carry the window they were read for (PR844-WINDOW)");
   assert.deepEqual(result.ai, { kind: "empty", sync: null });
   assert.equal(result.pc.kind, "ok");
   assert.equal(result.pc.loggedDays, 1);

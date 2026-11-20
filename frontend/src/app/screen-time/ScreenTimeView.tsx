@@ -489,16 +489,18 @@ export default function ScreenTimeView({
         </section>
       )}
 
-      {/* A phone query failure keeps the AI and PC sections the server read (Codex PC835-3). */}
+      {/* A phone query failure keeps the AI and PC sections the server read (Codex PC835-3), drawn against the
+          window they were read for and dimmed while that is not the picked one (Codex PR844-WINDOW). An answer
+          without its window (from before the field existed) falls back to the picked one. */}
       {data?.kind === "error" && data.ai && (
-        <div className={clsx(busy && "opacity-60")}>
+        <div className={clsx((busy || (data.windowDays ?? windowDays) !== windowDays) && "opacity-60")}>
           <AiToolsPlain ai={data.ai} />
         </div>
       )}
 
       {data?.kind === "error" && data.pc && (
-        <div className={clsx(busy && "opacity-60")}>
-          <PlainPart part={pcPart(data.pc, windowDays)} label="PC" />
+        <div className={clsx((busy || (data.windowDays ?? windowDays) !== windowDays) && "opacity-60")}>
+          <PlainPart part={pcPart(data.pc, data.windowDays ?? windowDays)} label="PC" />
         </div>
       )}
 

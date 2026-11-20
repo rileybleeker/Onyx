@@ -13,8 +13,9 @@ import { isPcSection, type PcSection } from "@/lib/pc-activity-view";
  * Pure (no I/O), so node tests can load it.
  */
 export type ScreenTimeViewData =
-  /** ai / pc: the sections read when only the phone query failed (absent when nothing was read). */
-  | { kind: "error"; hint: string; ai?: AiSection; pc?: PcSection }
+  /** ai / pc: the sections read when only the phone query failed (absent when nothing was read); windowDays:
+   *  the window they were read for (Codex PR844-WINDOW), absent on a bare error. */
+  | { kind: "error"; hint: string; windowDays?: number; ai?: AiSection; pc?: PcSection }
   | { kind: "empty"; windowDays: number; sync: ScreenSync | null; ai: AiSection; pc?: PcSection }
   | {
       kind: "ok";
@@ -45,17 +46,30 @@ export function screenTimeViewData(load: ScreenTimeLoad): ScreenTimeViewData {
   };
 }
 
+/**
+ * The answer on screen is for another window than the one picked (the scroll section keeps the previous answer up,
+ * dimmed, until the picked window's lands). An error answer counts too when it says its window (Codex
+ * PR844-WINDOW); a bare error has none and is never busy.
+ */
+export function screenTimeBusy(data: ScreenTimeViewData | null, pickedDays: number): boolean {
+  return data !== null && data.windowDays !== undefined && data.windowDays !== pickedDays;
+}
+
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const isSync = (v: unknown) => v === null || (isObject(v) && (v.at === null || typeof v.at === "string"));
 /** Absent pc is accepted (an answer cached before the field existed); a present one must be well-formed. */
 const pcOk = (v: unknown) => v === undefined || isPcSection(v);
 /** An error answer may carry ai (and pc) when only the phone query failed; absent is fine, malformed is not. */
 const aiOk = (v: unknown) => v === undefined || isAiSection(v);
+/** An error answer's window: absent (a bare error, or one from before the field existed) or a positive whole number. */
+const windowOk = (v: unknown) => v === undefined || (typeof v === "number" && Number.isInteger(v) && v > 0);
 
 /** A cached or fetched answer checked like the server's own shape; throws on anything else. */
 export function readScreenTimeViewData(raw: unknown): ScreenTimeViewData {
   if (!isObject(raw)) throw new Error("malformed screen time answer");
-  if (raw.kind === "error" && typeof raw.hint === "string" && aiOk(raw.ai) && pcOk(raw.pc)) return raw as ScreenTimeViewData;
+  if (raw.kind === "error" && typeof raw.hint === "string" && windowOk(raw.windowDays) && aiOk(raw.ai) && pcOk(raw.pc)) {
+    return raw as ScreenTimeViewData;
+  }
   if (raw.kind === "empty" && typeof raw.windowDays === "number" && isSync(raw.sync) && isAiSection(raw.ai) && pcOk(raw.pc)) {
     return raw as ScreenTimeViewData;
   }
