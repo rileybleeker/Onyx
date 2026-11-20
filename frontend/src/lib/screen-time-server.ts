@@ -2,7 +2,7 @@ import "server-only";
 import { createClient } from "@supabase/supabase-js";
 import { SCREEN_TIME_COLUMNS, shapeScreenRows, windowStart, type ScreenDay } from "@/lib/screen-time";
 import { AI_USAGE_COLUMNS, aiIncompleteHint, fetchAllAiRows, summarizeAi, type AiSection, type AiSync } from "@/lib/ai-usage";
-import { PC_VIEW_COLUMNS, summarizePc, type PcSection } from "@/lib/pc-activity-view";
+import { PC_VIEW_COLUMNS, pcUnreadableHint, summarizePc, type PcSection } from "@/lib/pc-activity-view";
 
 /**
  * Server-side read of pds.phone_usage_daily for /screen-time. SERVICE ROLE ONLY: the phone_usage_*
@@ -18,7 +18,7 @@ import { PC_VIEW_COLUMNS, summarizePc, type PcSection } from "@/lib/pc-activity-
  * or an empty AI window never changes the page's kind, which phone_usage_daily alone decides.
  *
  * Likewise pds.pc_activity_daily (service role only) for the "PC" section, reduced by lib/pc-activity-view.ts,
- * with its own empty and error states.
+ * with its own empty and error states. A phone query failure still answers both sections it read.
  */
 
 const HEARTBEAT_COLS = "status,sync_start";
@@ -28,7 +28,8 @@ const MAX_ROWS = 400;
 export type ScreenSync = AiSync;
 
 export type ScreenTimeLoad =
-  | { kind: "error"; hint: string }
+  /** ai / pc: what was read when only the phone query failed; absent when nothing was read (not configured, a throw). */
+  | { kind: "error"; hint: string; ai?: AiSection; pc?: PcSection }
   | { kind: "empty"; windowDays: number; sync: ScreenSync | null; ai: AiSection; pc: PcSection }
   | { kind: "ok"; windowDays: number; days: ScreenDay[]; skippedRows: number; sync: ScreenSync | null; ai: AiSection; pc: PcSection };
 
@@ -39,7 +40,7 @@ function db() {
   return createClient(url, key, { db: { schema: "pds" }, auth: { persistSession: false, autoRefreshToken: false } });
 }
 
-function fail(code: string | null): ScreenTimeLoad {
+function fail(code: string | null): Extract<ScreenTimeLoad, { kind: "error" }> {
   // Only the error code is logged - never a row, an app name or a number of minutes.
   console.error("[/screen-time] usage query failed", code ?? "unexpected");
   const missing = code === "42P01" || code === "PGRST205" || code === "42501";
@@ -153,9 +154,6 @@ export async function loadScreenTime(windowDays: number, now: Date = new Date())
         .order("sync_start", { ascending: false })
         .limit(1),
     ]);
-    if (usage.error) return fail(usage.error.code ?? "unknown");
-    // The freshness line is context, not the data: a failed heartbeat read just omits it.
-    const sync = syncFrom({ error: beat.error, data: (beat.data ?? null) as unknown[] | null });
     const aiSync = syncFrom({ error: aiBeat.error, data: (aiBeat.data ?? null) as unknown[] | null });
     let ai: AiSection;
     if (aiUsage.kind === "error") {
@@ -174,8 +172,18 @@ export async function loadScreenTime(windowDays: number, now: Date = new Date())
     } else {
       const pcSync = syncFrom({ error: pcBeat.error, data: (pcBeat.data ?? null) as unknown[] | null });
       const summary = summarizePc((pcUsage.data ?? []) as unknown[]);
-      pc = summary.kind === "ok" ? { ...summary, sync: pcSync } : { kind: "empty", sync: pcSync };
+      if (summary.kind === "unreadable") {
+        // The count only in the log, never a row.
+        console.error("[/screen-time] pc activity rows unreadable", summary.skippedRows);
+        pc = { kind: "error", hint: pcUnreadableHint(summary.skippedRows) };
+      } else {
+        pc = summary.kind === "ok" ? { ...summary, sync: pcSync } : { kind: "empty", sync: pcSync };
+      }
     }
+    // A phone failure keeps the AI and PC sections already read (Codex PC835-3).
+    if (usage.error) return { ...fail(usage.error.code ?? "unknown"), ai, pc };
+    // The freshness line is context, not the data: a failed heartbeat read just omits it.
+    const sync = syncFrom({ error: beat.error, data: (beat.data ?? null) as unknown[] | null });
     const raw = (usage.data ?? []) as unknown[];
     const days = shapeScreenRows(raw);
     if (days.length === 0) return { kind: "empty", windowDays, sync, ai, pc };

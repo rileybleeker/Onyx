@@ -58,12 +58,25 @@ function Tile({ label, value, sub, hint }: { label: string; value: string; sub: 
   );
 }
 
-/** `totals`: show each entry's minutes over the window instead of its per-day mean. */
-function TopList({ title, entries, empty, totals = false }: { title: string; entries: TopEntry[]; empty: string; totals?: boolean }) {
+/** `totals`: show each entry's minutes over the window instead of its per-day mean. `caption`: a short line under the title. */
+function TopList({
+  title,
+  entries,
+  empty,
+  totals = false,
+  caption,
+}: {
+  title: string;
+  entries: TopEntry[];
+  empty: string;
+  totals?: boolean;
+  caption?: string;
+}) {
   const max = entries[0]?.minutes ?? 0;
   return (
     <section className="rounded-card shadow-card border border-border-subtle bg-surface-card p-4">
       <h2 className="text-[12px] font-semibold uppercase tracking-[0.07em] text-text-secondary">{title}</h2>
+      {caption && <p className="mt-0.5 text-[11px] text-text-tertiary">{caption}</p>}
       {entries.length === 0 ? (
         <p className="mt-3 text-[13px] text-text-tertiary">{empty}</p>
       ) : (
@@ -216,20 +229,26 @@ function pcPart(pc: PcSection, windowDays: number): PartSpec {
       ],
     };
   }
-  const perComplete =
+  // "Ended", not "complete": an upload after the day ended does not prove every hour arrived (Codex PC835-1).
+  const perEnded =
     pc.completeDays === 0
-      ? "per complete day"
-      : `per day, over ${pc.completeDays === 1 ? "1 complete day" : `${pc.completeDays} complete days`}`;
+      ? "per ended day"
+      : `per day, over ${pc.completeDays === 1 ? "1 ended day" : `${pc.completeDays} ended days`}`;
   const members: PartSpec[] = [];
   if (pc.completeDays === 0) {
+    // What was recorded, not why: a day uploaded only before its end may be uploading or the logger may have stopped.
     members.push({
       id: "pc-status",
       title: "PC status",
-      node: <p className="text-[13px] text-text-tertiary">No complete day yet: the newest day is still uploading.</p>,
+      node: (
+        <p className="text-[13px] text-text-tertiary">
+          {pc.loggedDays === 1 ? "1 day recorded" : `${pc.loggedDays} days recorded`}, none uploaded after its day ended.
+        </p>
+      ),
     });
   }
   members.push(
-    { id: "pc-active", title: "Active at the PC", width: "quarter", node: <Tile label="Active at the PC" value={formatMinutes(pc.activePerDay)} sub={perComplete} /> },
+    { id: "pc-active", title: "Active at the PC", width: "quarter", node: <Tile label="Active at the PC" value={formatMinutes(pc.activePerDay)} sub={perEnded} /> },
     {
       id: "pc-late",
       title: "Late at the PC",
@@ -241,7 +260,15 @@ function pcPart(pc: PcSection, windowDays: number): PartSpec {
       id: "pc-top-programs",
       title: "Top programs",
       width: "half",
-      node: <TopList title="Top programs" entries={pc.topPrograms} empty="No program minutes in this window." totals />,
+      node: (
+        <TopList
+          title="Top programs"
+          caption="Window total, includes partial days"
+          entries={pc.topPrograms}
+          empty="No program minutes in this window."
+          totals
+        />
+      ),
     },
     syncPart,
   );
@@ -460,6 +487,19 @@ export default function ScreenTimeView({
             </div>
           )}
         </section>
+      )}
+
+      {/* A phone query failure keeps the AI and PC sections the server read (Codex PC835-3). */}
+      {data?.kind === "error" && data.ai && (
+        <div className={clsx(busy && "opacity-60")}>
+          <AiToolsPlain ai={data.ai} />
+        </div>
+      )}
+
+      {data?.kind === "error" && data.pc && (
+        <div className={clsx(busy && "opacity-60")}>
+          <PlainPart part={pcPart(data.pc, windowDays)} label="PC" />
+        </div>
       )}
 
       {data?.kind === "empty" && (

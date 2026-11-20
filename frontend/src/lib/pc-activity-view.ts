@@ -16,13 +16,18 @@ export const PC_TOP_PROGRAMS = 10;
 
 export type PcSummary =
   | { kind: "empty" }
+  /** Rows came back but none could be read: not an empty window (Codex PC835-2). */
+  | { kind: "unreadable"; skippedRows: number }
   | {
       kind: "ok";
       /** Mean active minutes per complete day; null when no day in the window is complete yet. */
       activePerDay: number | null;
       /** Mean late (21:00-05:59) active minutes per complete day; null when no day is complete yet. */
       latePerDay: number | null;
-      /** Days whose newest upload came after the day ended (isDayComplete): the per-day divisor. */
+      /**
+       * Days whose newest upload came after the day ended (isDayComplete): the per-day divisor.
+       * "Complete" means "ended and uploaded after its end", not a proof that every hour arrived (Codex PC835-1).
+       */
       completeDays: number;
       /** Distinct days with a readable row, complete or not. */
       loggedDays: number;
@@ -33,8 +38,16 @@ export type PcSummary =
 
 export type PcSync = AiSync;
 
-/** What the page draws for the section; independent of the phone and AI data's own states. */
-export type PcSection = { kind: "error"; hint: string } | (PcSummary & { sync: PcSync | null });
+/**
+ * What the page draws for the section; independent of the phone and AI data's own states. An "unreadable"
+ * summary reaches the page as an error (pcUnreadableHint), never as a section of its own.
+ */
+export type PcSection = { kind: "error"; hint: string } | (Exclude<PcSummary, { kind: "unreadable" }> & { sync: PcSync | null });
+
+/** The PC error line when rows came back but none could be read; carries the count, never says "no activity". */
+export function pcUnreadableHint(skippedRows: number): string {
+  return `${skippedRows} PC activity row(s) could not be read.`;
+}
 
 const isMinutes = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
@@ -52,15 +65,17 @@ const byKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * Per-day means over complete days only (today, or a day whose newest upload predates its end, would pull the
- * mean down); program totals over every logged day. Unreadable rows are skipped and counted.
+ * mean down); program totals over every logged day. Unreadable rows are skipped and counted; "empty" only when
+ * no row came back at all, "unreadable" when rows came back but none parsed.
  */
 export function summarizePc(rows: readonly unknown[]): PcSummary {
+  if (rows.length === 0) return { kind: "empty" };
   const parsed: PcActivityDay[] = [];
   for (const raw of rows) {
     const d = readRow(raw);
     if (d) parsed.push(d);
   }
-  if (!parsed.length) return { kind: "empty" };
+  if (!parsed.length) return { kind: "unreadable", skippedRows: rows.length };
 
   const logged = new Set<string>();
   const complete = new Set<string>();
