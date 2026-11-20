@@ -27,8 +27,21 @@ if (-not (Test-Path (Join-Path $HOME '.onyx_backup_age_recipient'))) {
   throw 'No backup public key yet: run  python offsite_backup.py keygen  first.'
 }
 
+# Run from a stable copy under LOCALAPPDATA, not from this checkout: a temporary git worktree that is later
+# removed would otherwise leave the task pointing at a deleted folder (0x8007010B). Re-run this script after
+# code changes. The copy keeps the repo layout the script expects (tools\medical_recovery two levels below its
+# root, plus the helpers it imports). State, logs, keys and the backup destination stay where they were
+# (LOCALAPPDATA\Onyx, ~, OneDrive); the script refuses a temp/dest path under its own root, which is now the copy.
+$repo = Split-Path -Parent (Split-Path -Parent $here)
+$stable = Join-Path $env:LOCALAPPDATA 'Onyx\scheduled\medical_recovery'
+$stableHere = Join-Path $stable 'tools\medical_recovery'
+New-Item -ItemType Directory -Force -Path $stableHere | Out-Null
+Copy-Item -Path "$here\*.py" -Destination $stableHere -Force
+Copy-Item -Path "$repo\sync_log_helper.py", "$repo\email_log_safety.py" -Destination $stable -Force
+Write-Host "Stable copy registered: $stable"
+
 $action = New-ScheduledTaskAction -Execute $pythonw `
-  -Argument "`"$here\offsite_backup.py`" backup" -WorkingDirectory $here
+  -Argument "`"$stableHere\offsite_backup.py`" backup" -WorkingDirectory $stableHere
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At ([datetime]::Today.AddHours(11).AddMinutes(10))
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1) -Priority 7

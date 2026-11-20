@@ -23,8 +23,16 @@ $pythonw = Get-Command pythonw.exe -All -ErrorAction SilentlyContinue |
   Where-Object { $_.Source -notlike '*\WindowsApps\*' } | Select-Object -First 1 -ExpandProperty Source
 if (-not $pythonw) { throw 'pythonw.exe not found on PATH (install Python from python.org).' }
 
+# Run from a stable copy under LOCALAPPDATA, not from this checkout: a temporary git worktree that is later
+# removed would otherwise leave the task pointing at a deleted folder (0x8007010B). Re-run this script after
+# code changes. The script is self-contained; its log stays at LOCALAPPDATA\Onyx\local-cleanup.
+$stable = Join-Path $env:LOCALAPPDATA 'Onyx\scheduled\local_cleanup'
+New-Item -ItemType Directory -Force -Path $stable | Out-Null
+Copy-Item -Path "$here\*.py" -Destination $stable -Force
+Write-Host "Stable copy registered: $stable"
+
 $action = New-ScheduledTaskAction -Execute $pythonw `
-  -Argument "`"$here\local_cleanup.py`" --apply" -WorkingDirectory $here
+  -Argument "`"$stable\local_cleanup.py`" --apply" -WorkingDirectory $stable
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At ([datetime]::Today.AddHours(4).AddMinutes(30))
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1)
