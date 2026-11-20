@@ -10,7 +10,7 @@ const answer = (body: unknown, status = 200) => NextResponse.json(body, { status
 // PUT /api/rewards/settings  body {key: "valuations" | "discover_quarter" | "apple_boosted" | "credits", value}
 // Saves one of Riley's editable rewards values (cents per point, the Discover quarter's categories, Apple Card's
 // 3% merchants, credit amounts). Owner session only (middleware; never in isCiRoute()), same-origin JSON, at most
-// 2 KB, unknown fields refused, a valuations / credits save is merged into the stored row. Logs a code only.
+// 2 KB, unknown fields refused, a valuations / credits save is merged into the stored row atomically in the database. Logs a code only.
 export async function PUT(req: NextRequest) {
   const refused = checkJsonRequest(req.headers, req.nextUrl.origin, 2048);
   if (refused) return answer({ error: refused.error }, refused.status);

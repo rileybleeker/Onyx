@@ -186,8 +186,12 @@ export async function loadRewardsAlerts(now: Date = new Date(), limitMs = 1200):
   }
 }
 
-/** Merge one settings patch into the stored row for its key (a valuation edit never drops the others). */
-export async function saveSettings(patch: SettingsPatch): Promise<{ ok: true } | { ok: false; code: string }> {
+/**
+ * Merge one settings patch into the stored row for its key. The merge happens in ONE database statement
+ * (pds.rewards_settings_merge, sql/rewards_settings_merge.sql: jsonb `||` on conflict), so two overlapping saves of
+ * different fields both persist. Returns the stored value so the caller sees what the database holds.
+ */
+export async function saveSettings(patch: SettingsPatch): Promise<{ ok: true; value: unknown } | { ok: false; code: string }> {
   let db: Db;
   try {
     db = serviceClient();
@@ -195,15 +199,9 @@ export async function saveSettings(patch: SettingsPatch): Promise<{ ok: true } |
     return { ok: false, code: "not-configured" };
   }
   try {
-    let value: unknown = patch.value;
-    if (patch.key === "valuations" || patch.key === "credits") {
-      const { data, error } = await db.from("rewards_settings").select("value").eq("key", patch.key).limit(1);
-      if (error && !(error.code && MISSING.includes(error.code))) return { ok: false, code: error.code ?? "unknown" };
-      const prev = (data?.[0] as { value?: unknown } | undefined)?.value;
-      value = { ...(prev && typeof prev === "object" && !Array.isArray(prev) ? (prev as Record<string, unknown>) : {}), ...patch.value };
-    }
-    const { error } = await db.from("rewards_settings").upsert({ key: patch.key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
-    return error ? { ok: false, code: error.code ?? "unknown" } : { ok: true };
+    const merge = patch.key === "valuations" || patch.key === "credits";
+    const { data, error } = await db.rpc("rewards_settings_merge", { p_key: patch.key, p_patch: patch.value, p_merge: merge });
+    return error ? { ok: false, code: error.code ?? "unknown" } : { ok: true, value: data };
   } catch (e) {
     return { ok: false, code: codeOf(e) };
   }
