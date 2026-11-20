@@ -15,8 +15,15 @@ under video_id 'removed'.
 Where it looks:
   $ONYX_YOUTUBE_TAKEOUT_DIR (searched 3 levels deep)  else  ~/OneDrive/Takeout  and the top level of ~/OneDrive.
 An export is a `takeout-*.zip` or an extracted `Takeout` folder that contains `watch-history.json`
-(any language folder name). Already-imported exports are remembered in %LOCALAPPDATA%\\Onyx\\youtube-history;
-re-importing anything is harmless (upsert on watched_at + video_id).
+(any language folder name). Already-imported exports are remembered in %LOCALAPPDATA%\\Onyx\\youtube-history
+by a hash of their CONTENT; re-importing anything is harmless (merged upsert on watched_at + video_id). A
+receipt in the old name|size|mtime format proves nothing about the current contents, so such an export is
+imported once more and then recorded by content hash (Codex #834 YT832-1).
+
+One importer at a time: every real run (the scheduled task AND a manual run) holds an OS file lock in that
+folder for its whole read-merge-write, so two runs can never both read a stored row before either writes it
+(the second waits; Codex #834 YT832-2). The lock is released by the OS when the process ends, so a crash
+never leaves it stuck.
 
 Privacy: titles and channels go only to the owner-only table. Nothing about a video (title, id, channel) is
 printed, logged or put in the heartbeat; output is counts and dates only (these logs may be shared).
@@ -31,6 +38,7 @@ Standard library only. Heartbeat youtube|history on every real run (success / pa
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -56,6 +64,8 @@ SOURCE, DATA_TYPE = "youtube", "history"  # pds.sync_log heartbeat key
 TABLE = "youtube_watch_events"
 ON_CONFLICT = "watched_at,video_id"
 HISTORY_FILE = "watch-history.json"
+LOCK_FILE = "import.lock"
+LOCK_WAIT_SECONDS = 600.0  # a real import takes seconds to a few minutes; the scheduled task's limit is 20 min
 STALE_EXPORT_DAYS = 100  # Takeout runs every 2 months; past this the schedule has probably ended (it lasts a year)
 MAX_FILE_BYTES = 1_500_000_000
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -251,7 +261,9 @@ def find_exports(roots: Optional[list] = None) -> list:
 
 
 def legacy_fingerprint(path: Path) -> str:
-    """The format used before #824 (name|size|mtime). Kept only so files recorded under it are not re-imported."""
+    """The format used before #824 (name|size|mtime). It never proves the current contents were imported
+    (a nested file can change under the same folder metadata), so run() only uses it to retire the old
+    receipt once the export has been imported again and recorded by content hash."""
     try:
         st = path.stat()
     except OSError:
@@ -329,6 +341,58 @@ def save_state(d: Path, state: dict) -> None:
     os.replace(tmp, d / "state.json")
 
 
+class ImportLockTimeout(Exception):
+    """Another import held the lock for longer than LOCK_WAIT_SECONDS."""
+
+
+@contextlib.contextmanager
+def import_lock(d: Path, wait_seconds: Optional[float] = None):
+    """Exclusive, process-wide lock on <data dir>/import.lock for one whole import (state read, stored-row
+    read, merge, upsert, state write). Held by an OS lock on an open file (msvcrt on Windows, flock
+    elsewhere), so it is shared by every invocation and released when the process exits."""
+    wait = LOCK_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    fh = open(d / LOCK_FILE, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            def try_lock() -> bool:
+                fh.seek(0)
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    return True
+                except OSError:
+                    return False
+
+            def unlock() -> None:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            def try_lock() -> bool:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return True
+                except OSError:
+                    return False
+
+            def unlock() -> None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+        deadline = time.monotonic() + wait
+        while not try_lock():
+            if time.monotonic() >= deadline:
+                raise ImportLockTimeout()
+            time.sleep(0.05)
+        try:
+            yield
+        finally:
+            unlock()
+    finally:
+        fh.close()
+
+
 # ---------------------------------------------------------------- run
 def heartbeat(client: Optional[Rest], status: str, records: int, started_at: float,
               error: Optional[str] = None, newest: Optional[str] = None) -> None:
@@ -354,8 +418,24 @@ def summarize(rows: list) -> dict:
 
 
 def run(dry_run: bool = False, only: Optional[Path] = None, roots: Optional[list] = None,
-        client: Optional[Rest] = None) -> int:
+        client: Optional[Rest] = None, lock_wait: Optional[float] = None) -> int:
+    if dry_run:
+        return _run(True, only, roots, client)  # writes nothing: no lock needed
     started = time.time()
+    try:
+        with import_lock(data_dir(), lock_wait):
+            return _run(False, only, roots, client, started)
+    except ImportLockTimeout as e:
+        msg = type(e).__name__  # another import is still running; this one wrote nothing
+        log.error("import failed: %s", msg)
+        heartbeat(client, "failed", 0, started, error=msg)
+        print(json.dumps({"ok": False, "dry_run": False, "error": msg}))
+        return 1
+
+
+def _run(dry_run: bool, only: Optional[Path], roots: Optional[list], client: Optional[Rest],
+         started: Optional[float] = None) -> int:
+    started = time.time() if started is None else started
     d = data_dir()
     state = load_state(d)
     done = state.setdefault("done", {})
@@ -365,8 +445,9 @@ def run(dry_run: bool = False, only: Optional[Path] = None, roots: Optional[list
     try:
         for label, path, kind in exports:
             fp = fingerprint(path)
-            if (fp in done or legacy_fingerprint(path) in done) and not only:
-                continue  # either format counts as already imported
+            if fp in done and not only:
+                continue  # these exact contents were imported (an old name|size|mtime receipt is not proof)
+            legacy = legacy_fingerprint(path)
             events = read_history(path, kind)
             if events is None:
                 skipped_empty += 1  # no watch-history.json (yet): look again next run
@@ -381,6 +462,8 @@ def run(dry_run: bool = False, only: Optional[Path] = None, roots: Optional[list
                 if rows:
                     client.upsert(TABLE, merge_with_stored(client, rows), ON_CONFLICT)
                 done[fp] = {"imported": datetime.now(timezone.utc).isoformat(), "events": len(rows)}
+                if legacy and legacy != fp:
+                    done.pop(legacy, None)  # retired: the content hash is the receipt from now on
                 save_state(d, state)
             total += len(rows)
             imported += 1

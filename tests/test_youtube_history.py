@@ -119,3 +119,150 @@ def test_legacy_fingerprint_is_a_distinct_format():
         f = Path(t) / "takeout-1.zip"
         f.write_bytes(b"x")
         assert yh.legacy_fingerprint(f) and yh.legacy_fingerprint(f) != yh.fingerprint(f)
+
+
+# ---------------------------------------------------------------- run(): legacy receipts and the import lock
+import os  # noqa: E402
+import threading  # noqa: E402
+
+
+class _Beats:
+    """The sync_log heartbeat path (supa.schema().table().insert().execute()), recorded in memory."""
+
+    def __init__(self):
+        self.rows = []
+
+    def table(self, _name):
+        return self
+
+    def insert(self, row):
+        self.rows.append(row)
+        return self
+
+    def execute(self):
+        return None
+
+
+class _RunClient(_FakeClient):
+    """_FakeClient that run() can use end to end, over a row store that several clients may share."""
+
+    def __init__(self, store=None, name=""):
+        super().__init__()
+        if store is not None:
+            self.table = store
+        self.name = name
+        self.beats = _Beats()
+
+    def schema(self, _name):
+        return self.beats
+
+
+class _Env:
+    """A temporary LOCALAPPDATA so run() keeps its state and lock in a throwaway folder."""
+
+    def __enter__(self):
+        self._t = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("LOCALAPPDATA")
+        os.environ["LOCALAPPDATA"] = self._t.name
+        return Path(self._t.name)
+
+    def __exit__(self, *exc):
+        if self._old is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = self._old
+        self._t.cleanup()
+
+
+def _export_folder(base: Path, events) -> Path:
+    root = base / "Takeout"
+    nested = root / "YouTube" / "history"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "watch-history.json").write_text(json.dumps(events), encoding="utf-8")
+    return root
+
+
+def test_run_reimports_changed_contents_under_a_legacy_receipt():
+    """YT832-1: a folder recorded under the old name|size|mtime receipt whose nested file changed (same folder
+    metadata) must be imported once more, recorded by content hash, and the legacy receipt retired."""
+    with _Env() as appdata, tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        root = _export_folder(t / "od", EVENTS[:1])
+        d = yh.data_dir()
+        legacy = yh.legacy_fingerprint(root)
+        yh.save_state(d, {"done": {legacy: {"imported": "2026-11-01T00:00:00+00:00", "events": 1}}})
+        # The nested file changes; the outer folder's name, size and mtime are pinned so the legacy key holds.
+        st = root.stat()
+        (root / "YouTube" / "history" / "watch-history.json").write_text(json.dumps(EVENTS[:2]), encoding="utf-8")
+        os.utime(root, (st.st_atime, st.st_mtime))
+        assert yh.legacy_fingerprint(root) == legacy
+        c = _RunClient()
+        store = c.table
+        assert yh.run(roots=[(t / "od", 3)], client=c) == 0
+        assert {k[1] for k in store} == {"abc123DEF_-", "zzz111"}  # the changed contents were imported
+        done = yh.load_state(d)["done"]
+        assert yh.fingerprint(root) in done and legacy not in done
+        # A second run with nothing new skips it (the content hash is now the receipt).
+        store.clear()
+        assert yh.run(roots=[(t / "od", 3)], client=c) == 0
+        assert store == {}
+        assert appdata in d.parents
+
+
+def test_two_runs_never_both_read_before_either_writes():
+    """YT832-2: a rich import and a sparse import started together. Without the lock both read the empty
+    table, the rich one writes, then the sparse one writes its stale merge and erases the channel and the
+    music flag. With the lock the second run reads only after the first has written."""
+    rich = [dict(EVENTS[0], header="YouTube Music")]
+    sparse = [{"title": "Watched SENTINEL_TITLE", "titleUrl": EVENTS[0]["titleUrl"], "time": EVENTS[0]["time"]}]
+    with _Env(), tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        _export_folder(t / "a", rich)
+        _export_folder(t / "b", sparse)
+        store, order = {}, []
+        a_reading, b_read = threading.Event(), threading.Event()
+
+        class Slow(_RunClient):
+            def get_json(self, table, query):
+                order.append(f"{self.name}:read")
+                got = _FakeClient.get_json(self, table, query)
+                if self.name == "A":
+                    a_reading.set()
+                    b_read.wait(1.0)  # without the lock B reads here, before A writes
+                else:
+                    b_read.set()
+                return got
+
+            def upsert(self, table, rows, on_conflict):
+                order.append(f"{self.name}:write")
+                _FakeClient.upsert(self, table, rows, on_conflict)
+
+        results = {}
+        ta = threading.Thread(target=lambda: results.__setitem__("A", yh.run(roots=[(t / "a", 3)], client=Slow(store, "A"))))
+        ta.start()
+        assert a_reading.wait(5.0)
+        tb = threading.Thread(target=lambda: results.__setitem__(
+            "B", yh.run(roots=[(t / "b", 3)], client=Slow(store, "B"), lock_wait=10.0)))
+        tb.start()
+        ta.join(15.0)
+        tb.join(15.0)
+        assert results == {"A": 0, "B": 0}
+        assert order == ["A:read", "A:write", "B:read", "B:write"], order
+        (row,) = store.values()
+        assert row["channel_id"] == "UCxyz" and row["channel_name"] == "Chan" and row["is_music"] is True
+
+
+def test_lock_timeout_is_a_failed_run_that_writes_nothing():
+    with _Env(), tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        _export_folder(t / "a", EVENTS[:1])
+        c = _RunClient()
+        store = c.table
+        with yh.import_lock(yh.data_dir()):
+            done = []
+            th = threading.Thread(target=lambda: done.append(yh.run(roots=[(t / "a", 3)], client=c, lock_wait=0.2)))
+            th.start()
+            th.join(5.0)
+        assert done == [1] and store == {}
+        assert c.beats.rows and c.beats.rows[-1]["status"] == "failed"
+        assert c.beats.rows[-1]["error_message"] == "ImportLockTimeout"
