@@ -287,6 +287,18 @@ class SupplementReminderRevertRace(unittest.TestCase):
                 self.assertEqual(final, previous)
                 self.assertEqual(intake(), 2)
 
+    def test_interrupted_success_retry_waits_for_the_revert_and_ends_logged(self):
+        # Codex #834 SUP840-1: B's intake commits and B stops before its success update; B's retry finds intake and,
+        # before answering already_logged, runs the same success update (reconciledAlreadyLogged in the TypeScript
+        # source). It must wait on A's in-flight revert and leave the row 'logged'.
+        self.assertIn("reconciledAlreadyLogged", LIB.read_text())
+        for previous in ("prompted", "skipped"):
+            with self.subTest(previous=previous):
+                waited, final = race(previous, success_from())
+                self.assertTrue(waited, "the retry's reconcile must wait on the revert's row lock")
+                self.assertEqual(final, "logged")
+                self.assertEqual(intake(), 2)
+
     def test_lost_response_retry_keeps_the_row_logged(self):
         race("prompted", success_from())
         # B's reply was lost; the retry finds its rows (already_logged) or repeats the success update: still logged.

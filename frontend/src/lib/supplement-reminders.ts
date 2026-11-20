@@ -452,13 +452,22 @@ export async function respondToReminder(
     if (error) throw fail("reminder update", error);
     return (data ?? []).length > 0;
   };
+  /**
+   * Intake rows exist, so the answer is already_logged, but first re-assert 'logged' with the same update as the
+   * success path (SUCCESS_RECONCILE_FROM). It takes the reminder row lock, so it waits out a refused tap's revert
+   * that is still in flight and then wins over it. Without this, a retry of a success that was interrupted after its
+   * intake committed could return while that revert later commits 'prompted'/'skipped' over the saved intake
+   * (Codex #834 SUP840-1).
+   */
+  const reconciledAlreadyLogged = async (count: number): Promise<RespondResult> => {
+    await transition("logged", SUCCESS_RECONCILE_FROM, nowIso);
+    return alreadyLogged(count);
+  };
 
   if (action === "skip") {
     const existing = await countIntake();
-    if (reminder.status === "logged" || existing > 0) {
-      if (reminder.status === "prompted") await transition("logged", ["prompted"], nowIso);
-      return alreadyLogged(existing);
-    }
+    if (existing > 0) return reconciledAlreadyLogged(existing);
+    if (reminder.status === "logged") return alreadyLogged(existing);
     if (reminder.status === "prompted") {
       const moved = await transition("skipped", ["prompted"], nowIso);
       if (!moved) {
@@ -469,7 +478,10 @@ export async function respondToReminder(
           .eq("stack_id", stack_id)
           .eq("behavioral_date", behavioral_date)
           .maybeSingle();
-        if (now?.status === "logged") return alreadyLogged(await countIntake());
+        if (now?.status === "logged") {
+          const count = await countIntake();
+          return count > 0 ? reconciledAlreadyLogged(count) : alreadyLogged(count);
+        }
       }
     }
     return { httpStatus: 200, body: { ok: true, status: "skipped", message: `Skipped ${name} ${when}` } };
@@ -481,7 +493,7 @@ export async function respondToReminder(
   const retry = reminder.status === "logged";
   if (retry) {
     const existing = await countIntake();
-    if (existing > 0) return alreadyLogged(existing);
+    if (existing > 0) return reconciledAlreadyLogged(existing);
   }
   if (!stack.is_active) {
     return { httpStatus: 409, body: { ok: false, error: `${name} is archived, so it cannot be logged` } };
@@ -496,7 +508,7 @@ export async function respondToReminder(
     const won = await transition("logged", ["prompted", "skipped"], nowIso);
     if (!won) {
       const now = await countIntake();
-      if (now > 0) return alreadyLogged(now);
+      if (now > 0) return reconciledAlreadyLogged(now);
       lostClaim = true;
     }
   }
@@ -515,7 +527,7 @@ export async function respondToReminder(
   };
   // A thrown error is an unknown outcome too: it propagates and the row stays 'logged'; a retry finds no rows and writes again (keyed).
   const existing = await countIntake(); // logged some other way since the card went out
-  if (existing > 0) return alreadyLogged(existing);
+  if (existing > 0) return reconciledAlreadyLogged(existing);
 
   const result = await logStackIntake(db, stack_id, {
     intake_date: behavioral_date,

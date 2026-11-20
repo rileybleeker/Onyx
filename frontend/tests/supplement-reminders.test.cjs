@@ -624,6 +624,70 @@ test('respond log: the success update also matches an already-logged row, so it 
   assert.equal(intakeRows(db, 4).length, 2);
 });
 
+// Codex #834 SUP840-1: tap B's intake commits, then B stops before its success update while tap A's revert (which
+// saw no intake yet) still holds the reminder row. B's retry finds 'logged' + intake. It must re-assert 'logged'
+// through the locking success update before answering already_logged; returning at once let A's revert commit
+// 'prompted' over the saved intake. The fake has no locks, so the hook below commits A's revert at the moment the
+// retry's reminder update runs (what PostgreSQL does when the update waits on A's lock and then re-checks the row).
+function revertCommitsWhenTheReminderUpdateRuns(db, to = 'prompted') {
+  let fired = false;
+  db.failOn = (table, op) => {
+    if (!fired && table === 'supplement_stack_reminder' && op === 'update') {
+      fired = true;
+      db.tables.supplement_stack_reminder[0].status = to;
+    }
+    return null;
+  };
+  return () => fired;
+}
+
+test('respond log: a retry after an interrupted success reconciles under the row lock before already_logged (Codex #834 SUP840-1)', async () => {
+  for (const reverted of ['prompted', 'skipped']) {
+    const db = await claimed(makeDb());
+    // B's first attempt: claim and keyed write committed, then B stopped before its success update.
+    db.tables.supplement_stack_reminder[0].status = 'logged';
+    db.tables.supplement_intake.push(
+      { intake_id: 1, stack_id: 4, intake_date: '2026-11-11', product_id: 'p-lion', client_event_key: 'k', client_event_line: 0 },
+      { intake_id: 2, stack_id: 4, intake_date: '2026-11-11', product_id: 'p-mag', client_event_key: 'k', client_event_line: 1 },
+    );
+    const fired = revertCommitsWhenTheReminderUpdateRuns(db, reverted);
+    const retry = await respond(db, LOG);
+    assert.equal(retry.body.status, 'already_logged');
+    assert.equal(retry.body.intake_count, 2);
+    assert.ok(fired(), 'the retry ran a reminder update before answering');
+    const updates = db.calls.filter((c) => c.startsWith('update-in:supplement_stack_reminder:status:'));
+    assert.deepEqual(updates, ['update-in:supplement_stack_reminder:status:prompted|skipped|logged']);
+    assert.equal(reminders(db)[0].status, 'logged', `A's revert to ${reverted} does not win over saved intake`);
+    assert.equal(db.calls.filter((c) => c === 'insert:supplement_intake').length, 0, 'no second write');
+  }
+});
+
+test('respond log: every already_logged answer with intake reconciles first (stack logged another way, lost claim)', async () => {
+  // Logged another way while the card was open (the pre-write intake check).
+  const other = await claimed(makeDb());
+  other.tables.supplement_intake.push({ intake_id: 1, stack_id: 4, intake_date: '2026-11-11', product_id: 'p-lion' });
+  revertCommitsWhenTheReminderUpdateRuns(other);
+  const a = await respond(other, LOG);
+  assert.equal(a.body.status, 'already_logged');
+  // The claim (prompted -> logged) is the first update; the hook reverts it, and the reconcile wins it back.
+  assert.equal(reminders(other)[0].status, 'logged');
+  const last = other.calls.filter((c) => c.startsWith('update-in:supplement_stack_reminder:status:')).at(-1);
+  assert.equal(last, 'update-in:supplement_stack_reminder:status:prompted|skipped|logged');
+});
+
+test('respond skip: a skip that finds intake reconciles under the row lock too (Codex #834 SUP840-1)', async () => {
+  for (const start of ['logged', 'skipped']) {
+    const db = await claimed(makeDb());
+    db.tables.supplement_stack_reminder[0].status = start;
+    db.tables.supplement_intake.push({ intake_id: 1, stack_id: 4, intake_date: '2026-11-11', product_id: 'p-lion' });
+    revertCommitsWhenTheReminderUpdateRuns(db);
+    const res = await respond(db, SKIP);
+    assert.equal(res.body.status, 'already_logged');
+    assert.equal(reminders(db)[0].status, 'logged', `from ${start}: saved intake keeps the reminder logged`);
+    assert.equal(intakeRows(db, 4).length, 1);
+  }
+});
+
 test('respond log: a refused insert alone reverts the reminder to prompted (guarded revert)', async () => {
   const db = await claimed(makeDb());
   db.failOn = (table, op) => (table === 'supplement_intake' && op === 'insert' ? { message: 'insert failed', code: '23514' } : null);
