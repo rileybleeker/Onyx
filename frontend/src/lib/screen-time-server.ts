@@ -28,8 +28,9 @@ const MAX_ROWS = 400;
 export type ScreenSync = AiSync;
 
 export type ScreenTimeLoad =
-  /** ai / pc: what was read when only the phone query failed; absent when nothing was read (not configured, a throw). */
-  | { kind: "error"; hint: string; ai?: AiSection; pc?: PcSection }
+  /** ai / pc: what was read when only the phone query failed; absent when nothing was read (not configured, a throw).
+   *  windowDays: the window those sections were read for (Codex PR844-WINDOW); absent on a bare error. */
+  | { kind: "error"; hint: string; windowDays?: number; ai?: AiSection; pc?: PcSection }
   | { kind: "empty"; windowDays: number; sync: ScreenSync | null; ai: AiSection; pc: PcSection }
   | { kind: "ok"; windowDays: number; days: ScreenDay[]; skippedRows: number; sync: ScreenSync | null; ai: AiSection; pc: PcSection };
 
@@ -180,8 +181,9 @@ export async function loadScreenTime(windowDays: number, now: Date = new Date())
         pc = summary.kind === "ok" ? { ...summary, sync: pcSync } : { kind: "empty", sync: pcSync };
       }
     }
-    // A phone failure keeps the AI and PC sections already read (Codex PC835-3).
-    if (usage.error) return { ...fail(usage.error.code ?? "unknown"), ai, pc };
+    // A phone failure keeps the AI and PC sections already read (Codex PC835-3), with the window they cover
+    // (Codex PR844-WINDOW), so the page never draws them against a window picked after the request.
+    if (usage.error) return { ...fail(usage.error.code ?? "unknown"), windowDays, ai, pc };
     // The freshness line is context, not the data: a failed heartbeat read just omits it.
     const sync = syncFrom({ error: beat.error, data: (beat.data ?? null) as unknown[] | null });
     const raw = (usage.data ?? []) as unknown[];

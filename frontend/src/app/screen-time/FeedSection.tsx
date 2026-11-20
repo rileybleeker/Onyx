@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { DEFAULT_WINDOW_DAYS } from "@/lib/screen-time";
-import { readScreenTimeViewData, type ScreenTimeViewData } from "@/lib/screen-time-view";
+import { readScreenTimeViewData, screenTimeBusy, type ScreenTimeViewData } from "@/lib/screen-time-view";
 import { useServerPageData } from "@/lib/server-page-data";
 import ScreenTimeView from "./ScreenTimeView";
 
@@ -42,8 +42,9 @@ function ScreenTimeReader({
   onRetry: () => void;
 }) {
   const { data, failed } = useServerPageData(url(days), readScreenTimeViewData, complete);
-  // The previous window's numbers stay up, dimmed, until the picked window's answer arrives.
-  const busy = data !== null && data.kind !== "error" && data.windowDays !== days;
+  // The previous window's numbers stay up, dimmed, until the picked window's answer arrives; that includes a
+  // phone-error answer's retained AI and PC sections (Codex PR844-WINDOW).
+  const busy = screenTimeBusy(data, days);
   return (
     <ScreenTimeView
       data={data ?? (failed ? UNREACHABLE : null)}
