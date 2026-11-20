@@ -4,8 +4,10 @@
 //
 //   node harvest.mjs                    scheduled run
 //   node harvest.mjs --dry-run          read everything, print counts + which programs are signed in, write nothing
-//   node harvest.mjs --probe            also write key NAMES and types (never values) of captured JSON to
+//   node harvest.mjs --probe            READ-ONLY (no upsert, no heartbeat): write fixed endpoint labels, allow-listed key
+//                                       names + types and a count of other keys (never values, paths or other names) to
 //                                       %LOCALAPPDATA%\Onyx\rewards-harvest\probe.json, so adapters can be fixed
+//   node harvest.mjs --probe --save     probe and also save balances + heartbeat like a scheduled run
 //   node harvest.mjs --login <program>  open a PLAIN visible Chrome window on that site's sign-in page; Riley signs in
 //   node harvest.mjs --only <program>   run one program only
 //   add --headed to watch a run on screen
@@ -18,7 +20,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROGRAMS, PROGRAM_IDS, extractProgram, looksSignedOut, shapeOf, summarize } from "./lib.mjs";
+import { PROGRAMS, PROGRAM_IDS, endpointLabel, extractProgram, looksSignedOut, probeShape, runMode, summarize } from "./lib.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const LOCAL = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
@@ -29,8 +31,7 @@ const KEY_FILE = process.env.ONYX_SUPABASE_SECRET_FILE || join(homedir(), ".onyx
 const SUPABASE_URL = (process.env.ONYX_SUPABASE_URL || "https://fewweioupmsnbccqtxdl.supabase.co").replace(/\/$/, "");
 
 const args = process.argv.slice(2);
-const DRY = args.includes("--dry-run");
-const PROBE = args.includes("--probe");
+const { dry: DRY, probe: PROBE, write: WRITE } = runMode(args); // --probe writes nothing to Supabase unless --save
 const HEADED = args.includes("--headed");
 const loginIdx = args.indexOf("--login");
 const LOGIN = loginIdx >= 0 ? args[loginIdx + 1] : null;
@@ -65,7 +66,7 @@ async function tableExists() {
   return r.ok;
 }
 async function heartbeat(started, status, records, error) {
-  if (DRY || !KEY) return;
+  if (!WRITE || !KEY) return;
   const end = new Date();
   const row = {
     source: "rewards", data_type: "balances", status, records_synced: records,
@@ -87,7 +88,7 @@ async function readProgram(ctx, id, probeOut) {
       if (!/json/i.test(type) || res.status() !== 200) return;
       const json = await res.json();
       captured.push({ url: res.url(), json });
-      if (probeOut) probeOut.push({ program: id, url: res.url().split("?")[0], shape: shapeOf(json) });
+      if (probeOut) probeOut.push({ program: id, endpoint: endpointLabel(res.url()), ...probeShape(json) });
     } catch { /* body not readable: skip */ }
   });
   let signedOut = false;
@@ -140,11 +141,11 @@ try {
     });
     log(`LOGIN ${LOGIN}: window closed; the session is saved in the profile.`);
   } else {
-    if (!KEY) {
+    if (!KEY && WRITE) {
       log(`FAILED: no service key at ${KEY_FILE}; nothing can be written.`);
       exitCode = 1;
     } else {
-      if (!DRY && !(await tableExists())) {
+      if (WRITE && !(await tableExists())) {
         const msg = "pds.rewards_balances is missing or not readable; apply the rewards SQL first";
         log(`FAILED: ${msg}`);
         await heartbeat(started, "failed", 0, msg);
@@ -159,12 +160,12 @@ try {
         }
         // uber_cash and uber_one share a session; they are read independently above.
         for (const r of results) log(`${r.program}: ${r.ok ? "read" : r.cause}`);
-        if (PROBE) { writeFileSync(join(DATA_DIR, "probe.json"), JSON.stringify(probeOut, null, 1)); log(`probe: wrote ${probeOut.length} response shape(s) (key names and types only) to ${join(DATA_DIR, "probe.json")}`); }
+        if (PROBE) { writeFileSync(join(DATA_DIR, "probe.json"), JSON.stringify(probeOut, null, 1)); log(`probe: wrote ${probeOut.length} response shape(s) (fixed endpoint labels, allow-listed key names, unknown keys as counts) to ${join(DATA_DIR, "probe.json")}`); }
 
         const captured_at = new Date().toISOString();
         const rows = results.filter((r) => r.ok).map((r) => ({ program: r.program, captured_at, ...r.row, source: "harvest" }));
-        if (DRY) {
-          log(`dry run: ${rows.length} of ${results.length} program(s) readable; signed in: ${results.filter((r) => r.ok || !/not signed in/.test(r.cause)).map((r) => r.program).join(", ") || "none"}; nothing written`);
+        if (!WRITE) {
+          log(`${DRY ? "dry run" : "probe (read-only; add --save to write)"}: ${rows.length} of ${results.length} program(s) readable; signed in: ${results.filter((r) => r.ok || !/not signed in/.test(r.cause)).map((r) => r.program).join(", ") || "none"}; nothing written to Supabase`);
         } else {
           if (rows.length) await rest("rewards_balances?on_conflict=program,captured_at", rows, "resolution=merge-duplicates,return=minimal");
           const s = summarize(results);
