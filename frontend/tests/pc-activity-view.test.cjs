@@ -91,7 +91,7 @@ test("program minutes sum over every logged day, ranked by total with ties by na
   assert.equal(capped.topPrograms[9].key, "prog09");
 });
 
-test("malformed rows are skipped and counted; an empty window is empty", () => {
+test("malformed rows are skipped and counted; only zero rows is empty, all-unreadable is unreadable (PC835-2)", () => {
   assert.deepEqual(P.summarizePc([]), { kind: "empty" });
   const bad = [
     null,
@@ -105,7 +105,10 @@ test("malformed rows are skipped and counted; an empty window is empty", () => {
     row("2030-03-01", { active_minutes: null }),
     row("2030-03-01", { active_minutes: -1 }),
   ];
-  assert.deepEqual(P.summarizePc(bad), { kind: "empty" });
+  assert.deepEqual(P.summarizePc(bad), { kind: "unreadable", skippedRows: bad.length });
+  assert.deepEqual(P.summarizePc([null]), { kind: "unreadable", skippedRows: 1 });
+  const hint = P.pcUnreadableHint(bad.length);
+  assert.ok(hint.includes(String(bad.length)) && !/no (pc )?activity/i.test(hint), hint);
   const s = P.summarizePc([...bad, row("2030-03-01", { active_minutes: 12 })]);
   assert.equal(s.kind, "ok");
   assert.equal(s.skippedRows, bad.length);
@@ -169,6 +172,24 @@ test("readScreenTimeViewData accepts a valid or absent pc and rejects a malforme
   }
 });
 
+const errorView = (ai, pc) => {
+  const v = { kind: "error", hint: "The database query failed (code X). Try again in a moment." };
+  return { ...v, ...(ai === undefined ? {} : { ai }), ...(pc === undefined ? {} : { pc }) };
+};
+
+test("an error answer validates with ai and pc, with neither, and throws on a malformed one (PC835-3)", () => {
+  for (const v of [errorView(AI_EMPTY_SECTION, okPc()), errorView(AI_EMPTY_SECTION), errorView(undefined, okPc()), errorView()]) {
+    const j = JSON.parse(JSON.stringify(v));
+    assert.deepEqual(V.readScreenTimeViewData(j), j);
+  }
+  assert.throws(() => V.readScreenTimeViewData(errorView(AI_EMPTY_SECTION, { kind: "ok" })));
+  assert.throws(() => V.readScreenTimeViewData(errorView(AI_EMPTY_SECTION, { ...okPc(), topPrograms: "code" })));
+  assert.throws(() => V.readScreenTimeViewData(errorView({ kind: "other" }, okPc())));
+  // The error answer passes through with both sections.
+  const load = errorView(AI_EMPTY_SECTION, okPc());
+  assert.deepEqual(V.screenTimeViewData(load), load);
+});
+
 test("screenTimeViewData carries pc on the ok and empty answers", () => {
   const pc = okPc();
   const v = V.screenTimeViewData({ kind: "ok", windowDays: 30, days: [], skippedRows: 0, sync: null, ai: AI_EMPTY_SECTION, pc });
@@ -192,9 +213,15 @@ const PC_EMPTY = "No PC activity recorded in this window.";
 
 test("the PC section draws its tiles, top programs and upload line after the AI tools section", () => {
   const html = draw(okView(okPc()));
-  for (const text of ["Active at the PC", "Late at the PC", "9 PM to 6 AM", "Days logged", "1 of 30", "Top programs", "code", "excel", "50m", "Last upload from the PC:"]) {
+  for (const text of [
+    "Active at the PC", "Late at the PC", "9 PM to 6 AM", "Days logged", "1 of 30", "Top programs", "code", "excel", "50m",
+    "Last upload from the PC:", "per day, over 1 ended day", "Window total, includes partial days",
+  ]) {
     assert.ok(html.includes(text), text);
   }
+  // PC835-1: the PC tiles claim ended days, never complete ones.
+  const pcHtml = html.slice(html.indexOf("Active at the PC"));
+  assert.ok(!/complete day/i.test(pcHtml), "PC section says ended, not complete");
   assert.ok(html.indexOf(AI_EMPTY) < html.indexOf("Active at the PC"), "PC comes after AI tools");
   assert.ok(html.includes("data-charts")); // the phone charts are still there
   assert.ok(!html.includes(PC_EMPTY) && !html.includes("still uploading"));
@@ -206,8 +233,30 @@ test("the PC section draws its tiles, top programs and upload line after the AI 
 test("a window with only an incomplete day shows dashes and the still-uploading line", () => {
   const pc = { ...P.summarizePc([row("2030-03-05", { synced_at: INCOMPLETE("2030-03-05") })]), sync: null };
   const html = draw(okView(pc));
-  assert.ok(html.includes("the newest day is still uploading"));
+  assert.ok(html.includes("No ended day yet: the newest day is still uploading."));
+  assert.ok(html.includes("per ended day"));
+  assert.ok(!html.includes("No complete day yet") && !html.includes("per complete day"));
   assert.ok(/Active at the PC<\/p>.*?>-<\/p>/s.test(html), "active tile shows -");
+});
+
+test("a phone query failure still draws the AI and PC sections under the error box (PC835-3)", () => {
+  const html = draw(errorView(AI_EMPTY_SECTION, okPc()));
+  assert.ok(html.includes("Couldn&#x27;t load Screen Time."));
+  assert.ok(html.includes(AI_EMPTY) && html.includes("Active at the PC") && html.includes("Top programs"));
+  assert.ok(html.indexOf("Couldn&#x27;t load Screen Time.") < html.indexOf("Active at the PC"), "PC under the error box");
+  assert.ok(html.includes("1 of 30"), "days logged uses the page's window");
+
+  // Neither section (not configured, a throw): only the error box.
+  const bare = draw(errorView());
+  assert.ok(bare.includes("Couldn&#x27;t load Screen Time.") && !bare.includes(AI_EMPTY) && !bare.includes("Active at the PC"));
+});
+
+test("all-unreadable PC rows show the count as the PC error line, never 'No PC activity recorded' (PC835-2)", () => {
+  const pc = { kind: "error", hint: P.pcUnreadableHint(3) };
+  for (const html of [draw(okView(pc)), draw(emptyView(pc)), draw(errorView(AI_EMPTY_SECTION, pc))]) {
+    assert.ok(html.includes("3 PC activity row(s) could not be read."));
+    assert.ok(!html.includes(PC_EMPTY));
+  }
 });
 
 test("the PC empty and error lines never hide the phone or AI parts, and show when the phone is empty", () => {
