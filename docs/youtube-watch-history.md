@@ -24,7 +24,8 @@ opens Gmail (the email-risk rule).
 - `tools/youtube_history/register-task.ps1` registers the daily task "Onyx YouTube History".
 - `python tools/youtube_history/youtube_history.py --dry-run` prints counts only (never titles) for anything it finds.
 - Search folders: `ONYX_YOUTUBE_TAKEOUT_DIR` if set, else `~/OneDrive/Takeout` (3 levels) and the top of `~/OneDrive`.
-- Already-imported exports are remembered; re-importing is harmless (upsert on watched_at + video_id). Files recorded under the old fingerprint format (name|size|mtime) still count as imported; new imports record the content hash.
+- Already-imported exports are remembered by a hash of their content; re-importing is harmless (merged upsert on watched_at + video_id). A receipt in the old name|size|mtime format is not proof the current contents were imported: such an export is imported once more, recorded by content hash, and the old receipt retired.
+- One import at a time: every real run (scheduled or manual) holds an OS file lock (`import.lock` in the state folder) for its whole read-merge-write and waits up to 10 minutes for another run to finish (then a `failed` heartbeat `ImportLockTimeout`, nothing written). The OS releases the lock when the process ends.
 - Before each upsert the importer reads the stored rows for the export's time range and merges: known title/channel fields and true `is_music`/`is_ad` flags are never replaced by empty or false values, so a sparse export cannot erase what an earlier one knew.
 
 ## Status
