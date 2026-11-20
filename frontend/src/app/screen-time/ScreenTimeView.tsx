@@ -236,10 +236,15 @@ function pcPart(pc: PcSection, windowDays: number): PartSpec {
       : `per day, over ${pc.completeDays === 1 ? "1 ended day" : `${pc.completeDays} ended days`}`;
   const members: PartSpec[] = [];
   if (pc.completeDays === 0) {
+    // What was recorded, not why: a day uploaded only before its end may be uploading or the logger may have stopped.
     members.push({
       id: "pc-status",
       title: "PC status",
-      node: <p className="text-[13px] text-text-tertiary">No ended day yet: the newest day is still uploading.</p>,
+      node: (
+        <p className="text-[13px] text-text-tertiary">
+          {pc.loggedDays === 1 ? "1 day recorded" : `${pc.loggedDays} days recorded`}, none uploaded after its day ended.
+        </p>
+      ),
     });
   }
   members.push(
