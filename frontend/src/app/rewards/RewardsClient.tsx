@@ -173,7 +173,11 @@ function CreditRow({ c, onSaved }: { c: CreditStatus; onSaved: () => void }) {
   const status =
     c.state === "untracked"
       ? "Not tracked from the card"
-      : c.state === "used"
+      : c.state === "unknown"
+        ? c.unknownReason === "foreign_credit"
+          ? "Unknown: credit in another currency"
+          : "Unknown: card not read"
+        : c.state === "used"
         ? "Used"
         : c.state === "partly"
           ? `${usd2(c.usedCents)} used, ${usd2(c.leftCents)} left`

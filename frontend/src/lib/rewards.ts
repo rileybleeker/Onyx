@@ -486,7 +486,9 @@ export function periodBounds(period: CreditPeriod, today: string): PeriodBounds 
   return { start, end, label };
 }
 
-export type CreditState = "used" | "partly" | "unused" | "untracked";
+export type CreditState = "used" | "partly" | "unused" | "untracked" | "unknown";
+/** Why a tracked credit is "unknown": no Platinum account, no Platinum rows read, or a matching credit row in another currency. */
+export type CreditUnknownReason = "no_card" | "no_rows" | "foreign_credit";
 export interface CreditStatus {
   id: string;
   name: string;
@@ -498,6 +500,8 @@ export interface CreditStatus {
   daysLeft: number; // days until the period's last day, 0 = ends today
   periodEnd: string;
   state: CreditState;
+  /** Set only when state is "unknown" (Codex #817 REW828-2, #838 REW839-1). */
+  unknownReason: CreditUnknownReason | null;
   /** The amount is the built-in estimate (not edited by Riley). */
   estimate: boolean;
   note: string | null;
@@ -508,26 +512,38 @@ export interface CreditStatus {
  * Amex Platinum card whose description names it) dated inside the period; no row = "not used yet". Credits that
  * leave no row (Uber Cash) are "untracked", never claimed either way. A row matched by two credits (WALMART and
  * CLEAR are short) goes to the one with the longest matching word.
+ * "Not used yet" needs evidence the card is read: with no Platinum account, or no Platinum row at all, a tracked
+ * credit is "unknown" (REW828-2). A matching credit row in another currency is left out of the dollar math
+ * (REW828-11), so a credit it may have used is "unknown" too, never "unused" or "partly" (REW839-1).
  */
 export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountRow[], settings: RewardsSettings, today: string): CreditStatus[] {
   const platinum = new Set([...cardAccounts(accounts)].filter(([, c]) => c === "amex_platinum").map(([k]) => k));
-  const credits = txns.filter((t) => platinum.has(t.account_key) && t.amount_cents < 0 && !(t.ignored_from ?? "").trim() && isDay(t.txn_date) && isUsd(t));
+  const read = txns.some((t) => platinum.has(t.account_key) && isDay(t.txn_date));
+  const credits = txns.filter((t) => platinum.has(t.account_key) && t.amount_cents < 0 && !(t.ignored_from ?? "").trim() && isDay(t.txn_date));
   const rowsBy = new Map<string, { date: string; cents: number }[]>();
+  const foreignBy = new Map<string, string[]>();
   for (const t of credits) {
     const l = labelOf(t);
     let best: { id: string; len: number } | null = null;
     for (const c of CREDITS) for (const p of c.patterns) if (l.includes(p) && (!best || p.length > best.len)) best = { id: c.id, len: p.length };
-    if (best) {
-      const rows = rowsBy.get(best.id) ?? [];
-      rows.push({ date: t.txn_date, cents: -t.amount_cents });
-      rowsBy.set(best.id, rows);
+    if (!best) continue;
+    if (!isUsd(t)) {
+      foreignBy.set(best.id, [...(foreignBy.get(best.id) ?? []), t.txn_date]);
+      continue;
     }
+    const rows = rowsBy.get(best.id) ?? [];
+    rows.push({ date: t.txn_date, cents: -t.amount_cents });
+    rowsBy.set(best.id, rows);
   }
   return CREDITS.map((c) => {
     const b = periodBounds(c.period, today);
     const amountCents = settings.creditCents[c.id] ?? c.amountCents;
     const used = (rowsBy.get(c.id) ?? []).filter((r) => r.date >= b.start && r.date <= b.end).reduce((s, r) => s + r.cents, 0);
-    const state: CreditState = c.patterns.length === 0 ? "untracked" : used <= 0 ? "unused" : used >= amountCents * 0.99 ? "used" : "partly";
+    const counted: CreditState = used <= 0 ? "unused" : used >= amountCents * 0.99 ? "used" : "partly";
+    const foreign = (foreignBy.get(c.id) ?? []).some((d) => d >= b.start && d <= b.end);
+    const unknownReason: CreditUnknownReason | null =
+      c.patterns.length === 0 ? null : platinum.size === 0 ? "no_card" : !read ? "no_rows" : foreign && counted !== "used" ? "foreign_credit" : null;
+    const state: CreditState = c.patterns.length === 0 ? "untracked" : unknownReason ? "unknown" : counted;
     return {
       id: c.id,
       name: c.name,
@@ -539,6 +555,7 @@ export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountR
       daysLeft: daysBetween(today, b.end),
       periodEnd: b.end,
       state,
+      unknownReason,
       estimate: settings.creditCents[c.id] === undefined,
       note: c.note ?? null,
     };
@@ -664,7 +681,8 @@ export interface RewardsAlert {
 }
 /**
  * What Today shows: points expiring within 60 days, and a credit with value left and 7 or fewer days in its
- * period. A credit's own dollar value is the only amount shown. Untracked credits never alert (nothing to read).
+ * period. A credit's own dollar value is the only amount shown. Untracked and unknown credits never alert (nothing
+ * read, or evidence left out of the dollar math, cannot prove a credit unused).
  * Estimated expiries count too (they say "estimated"); an unknown expiry never alerts.
  */
 export function rewardsAlerts(data: RewardsData): RewardsAlert[] {
@@ -683,7 +701,7 @@ export function rewardsAlerts(data: RewardsData): RewardsAlert[] {
     }
   }
   for (const c of data.credits) {
-    if (c.state === "untracked" || c.leftCents <= 0 || c.daysLeft > TODAY_CREDIT_DAYS || c.daysLeft < 0) continue;
+    if (c.state === "untracked" || c.state === "unknown" || c.leftCents <= 0 || c.daysLeft > TODAY_CREDIT_DAYS || c.daysLeft < 0) continue;
     const dollars = `$${Math.round(c.leftCents / 100).toLocaleString("en-US")}`;
     out.push({
       kind: "rewards",
