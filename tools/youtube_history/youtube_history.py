@@ -422,11 +422,17 @@ def run(dry_run: bool = False, only: Optional[Path] = None, roots: Optional[list
     if dry_run:
         return _run(True, only, roots, client)  # writes nothing: no lock needed
     started = time.time()
-    try:
-        with import_lock(data_dir(), lock_wait):
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(import_lock(data_dir(), lock_wait))
+        except ImportLockTimeout as e:
+            msg = type(e).__name__  # another import is still running; this one wrote nothing
+        except OSError as e:
+            # The lock file could not be opened or locked (permissions, missing data dir, disk). Only the
+            # exception class goes out (never the path or OS text: logs may be shared). Nothing was imported.
+            msg = f"ImportLockUnavailable: {type(e).__name__}"
+        else:
             return _run(False, only, roots, client, started)
-    except ImportLockTimeout as e:
-        msg = type(e).__name__  # another import is still running; this one wrote nothing
         log.error("import failed: %s", msg)
         heartbeat(client, "failed", 0, started, error=msg)
         print(json.dumps({"ok": False, "dry_run": False, "error": msg}))
