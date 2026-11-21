@@ -282,6 +282,28 @@ test("a truncated read is never evidence of 'unused': the credit is unknown and 
   // A credit already fully used by rows that were read stays "used" even when truncated.
   const used = tx({ name: "PLATINUM RESY CREDIT", amount_cents: -10000, txn_date: "2030-03-05" });
   assert.equal(R.creditStatuses([used, ...seen], accounts, R.EMPTY_SETTINGS, "2030-03-27", true).find((x) => x.id === "resy").state, "used");
+  // Codex REW854-1: only 100% of the credit exempts a truncated read; 99% / 99.5% stay "unknown" there.
+  for (const [cents, truncatedState, completeState] of [[9900, "unknown", "used"], [9950, "unknown", "used"], [10000, "used", "used"], [12000, "used", "used"]]) {
+    const near = tx({ name: "PLATINUM RESY CREDIT", amount_cents: -cents, txn_date: "2030-03-05" });
+    const t = R.creditStatuses([near, ...seen], accounts, R.EMPTY_SETTINGS, "2030-03-27", true).find((x) => x.id === "resy");
+    assert.equal(t.state, truncatedState, `truncated ${cents}`);
+    if (truncatedState === "unknown") assert.equal(t.unknownReason, "truncated");
+    assert.equal(R.creditStatuses([near, ...seen], accounts, R.EMPTY_SETTINGS, "2030-03-27").find((x) => x.id === "resy").state, completeState, `complete ${cents}`);
+    // Through buildRewards + rewardsAlerts: a used or unknown credit never alerts '$N unused', truncated or not.
+    for (const txnsTruncated of [true, false]) {
+      const al = R.rewardsAlerts(build({ today: "2030-03-27", windowTxns: [near, ...seen], txnsTruncated }));
+      assert.ok(!al.some((a) => a.title.startsWith("Resy")), `no Resy alert at ${cents} (truncated ${txnsTruncated})`);
+    }
+  }
+  // Omitted remainder: a "used" credit with cents left (99%) keeps leftCents for display but still never alerts.
+  const rounded = R.buildRewards({ today: "2030-03-27", balances: [], settings: R.EMPTY_SETTINGS, accounts, windowTxns: [tx({ name: "PLATINUM RESY CREDIT", amount_cents: -9900, txn_date: "2030-03-05" })], hotelTxns: [], flights: null, earliest: "2024-01-01" });
+  const rc = rounded.credits.find((x) => x.id === "resy");
+  assert.equal(rc.state, "used");
+  assert.equal(rc.leftCents, 100);
+  assert.ok(!R.rewardsAlerts(rounded).some((a) => a.title.startsWith("Resy")), "a Used credit never alerts '$1 unused'");
+  // A real partly-used credit still alerts with its remainder.
+  const partly = R.rewardsAlerts(build({ today: "2030-03-27", windowTxns: [tx({ name: "PLATINUM RESY CREDIT", amount_cents: -4000, txn_date: "2030-03-05" })] }));
+  assert.ok(partly.some((a) => a.title === "Resy dining credit: $60 unused"), JSON.stringify(partly.map((a) => a.title)));
   // The servers flag the cut: the lean read asks one row past its cap, the full read passes fetchPaged's flag.
   const src = read("lib/rewards-server.ts");
   assert.match(src, /limit\(CREDIT_ROW_CAP \+ 1\)/);

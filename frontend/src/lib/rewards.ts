@@ -515,8 +515,8 @@ export interface CreditStatus {
  * "Not used yet" needs evidence the card is read: with no Platinum account, or no Platinum row at all, a tracked
  * credit is "unknown" (REW828-2). A matching credit row in another currency is left out of the dollar math
  * (REW828-11), so a credit it may have used is "unknown" too, never "unused" or "partly" (REW839-1).
- * `truncated` = the read hit its row cap, so rows past it were never seen: a credit not already fully "used" by the
- * rows that were seen is "unknown" (reason "truncated"), never "unused" or "partly".
+ * `truncated` = the read hit its row cap, so rows past it were never seen: a credit whose seen rows do not cover its
+ * whole amount (100%, not the 99% "used" threshold) is "unknown" (reason "truncated"), never "unused" or "partly".
  */
 export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountRow[], settings: RewardsSettings, today: string, truncated = false): CreditStatus[] {
   const platinum = new Set([...cardAccounts(accounts)].filter(([, c]) => c === "amex_platinum").map(([k]) => k));
@@ -541,10 +541,12 @@ export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountR
     const b = periodBounds(c.period, today);
     const amountCents = settings.creditCents[c.id] ?? c.amountCents;
     const used = (rowsBy.get(c.id) ?? []).filter((r) => r.date >= b.start && r.date <= b.end).reduce((s, r) => s + r.cents, 0);
+    // "used" at 99% absorbs cent rounding on the statement. A truncated read is exempt from "unknown" only when the
+    // rows that were read cover the WHOLE credit (unseen rows could not change it); 99% is not proof (Codex REW854-1).
     const counted: CreditState = used <= 0 ? "unused" : used >= amountCents * 0.99 ? "used" : "partly";
     const foreign = (foreignBy.get(c.id) ?? []).some((d) => d >= b.start && d <= b.end);
     const unknownReason: CreditUnknownReason | null =
-      c.patterns.length === 0 ? null : platinum.size === 0 ? "no_card" : !read ? "no_rows" : truncated && counted !== "used" ? "truncated" : foreign && counted !== "used" ? "foreign_credit" : null;
+      c.patterns.length === 0 ? null : platinum.size === 0 ? "no_card" : !read ? "no_rows" : truncated && used < amountCents ? "truncated" : foreign && counted !== "used" ? "foreign_credit" : null;
     const state: CreditState = c.patterns.length === 0 ? "untracked" : unknownReason ? "unknown" : counted;
     return {
       id: c.id,
@@ -705,7 +707,8 @@ export function rewardsAlerts(data: RewardsData): RewardsAlert[] {
     }
   }
   for (const c of data.credits) {
-    if (c.state === "untracked" || c.state === "unknown" || c.leftCents <= 0 || c.daysLeft > TODAY_CREDIT_DAYS || c.daysLeft < 0) continue;
+    // A "used" credit never alerts, even with a rounding remainder left (the state and the alert must agree; REW854-1).
+    if (c.state === "untracked" || c.state === "unknown" || c.state === "used" || c.leftCents <= 0 || c.daysLeft > TODAY_CREDIT_DAYS || c.daysLeft < 0) continue;
     const dollars = `$${Math.round(c.leftCents / 100).toLocaleString("en-US")}`;
     out.push({
       kind: "rewards",
