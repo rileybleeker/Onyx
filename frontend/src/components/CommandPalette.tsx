@@ -45,6 +45,7 @@ export default function CommandPalette() {
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const pointerSelect = useRef(false);
   // The control that had focus when the palette opened (restored on Escape / outside click), and whether the
   // next close should hand focus back at all (not when a page or Personalize takes it).
@@ -170,6 +171,38 @@ export default function CommandPalette() {
       ?.scrollIntoView({ block: "nearest" });
   }, [active, open, results]);
 
+  // Treat the open palette as a modal: Escape closes it from anywhere inside, and Tab / Shift+Tab wrap
+  // between its first and last visible focusable elements. Nothing is listening while it is closed.
+  useEffect(() => {
+    if (!open) return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), [tabindex="0"]',
+    )).filter((element) => element.getClientRects().length > 0);
+    function onDialogKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close(true);
+      } else if (e.key === "Tab") {
+        const elements = focusable();
+        const first = elements[0];
+        const last = elements[elements.length - 1];
+        if (!first) { e.preventDefault(); return; }
+        const inside = dialog!.contains(document.activeElement);
+        if (e.shiftKey && (document.activeElement === first || !inside)) {
+          e.preventDefault();
+          (inside ? last : first).focus();
+        } else if (!e.shiftKey && (document.activeElement === last || !inside)) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    }
+    document.addEventListener("keydown", onDialogKey);
+    return () => document.removeEventListener("keydown", onDialogKey);
+  }, [open, close]);
+
   if (!open) return null;
 
   function onListKey(e: React.KeyboardEvent) {
@@ -184,14 +217,13 @@ export default function CommandPalette() {
     } else if (e.key === "Enter") {
       e.preventDefault();
       go(results[active]);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      close(true);
     }
+    // Escape is handled once, by the dialog's document keydown handler (from the input or any result).
   }
 
   return (
     <div
+      ref={dialogRef}
       className="fixed inset-0 z-[100] flex items-start justify-center pt-[18vh] px-4 bg-black/60 backdrop-blur-sm"
       onClick={() => close(true)}
       role="dialog"
