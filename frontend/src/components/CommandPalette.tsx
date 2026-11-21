@@ -8,6 +8,7 @@ import { warmRoute } from "@/lib/warmup";
 import { createGoShortcuts, goHint } from "@/lib/go-shortcuts";
 import { useActiveRoute } from "./FeedContext";
 import { personalizeNow } from "./personalize/start";
+import { trapDialogKeys } from "./dialog-keys";
 
 /** Fire this to open the palette from a button: window.dispatchEvent(new Event(OPEN_COMMAND_PALETTE)) */
 export const OPEN_COMMAND_PALETTE = "onyx:open-command-palette";
@@ -177,30 +178,7 @@ export default function CommandPalette() {
     if (!open) return;
     const dialog = dialogRef.current;
     if (!dialog) return;
-    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), input:not([disabled]), [tabindex="0"]',
-    )).filter((element) => element.getClientRects().length > 0);
-    function onDialogKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        close(true);
-      } else if (e.key === "Tab") {
-        const elements = focusable();
-        const first = elements[0];
-        const last = elements[elements.length - 1];
-        if (!first) { e.preventDefault(); return; }
-        const inside = dialog!.contains(document.activeElement);
-        if (e.shiftKey && (document.activeElement === first || !inside)) {
-          e.preventDefault();
-          (inside ? last : first).focus();
-        } else if (!e.shiftKey && (document.activeElement === last || !inside)) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    }
-    document.addEventListener("keydown", onDialogKey);
-    return () => document.removeEventListener("keydown", onDialogKey);
+    return trapDialogKeys(document, dialog, () => close(true));
   }, [open, close]);
 
   if (!open) return null;
