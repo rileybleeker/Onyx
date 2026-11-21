@@ -31,6 +31,8 @@ const ACCOUNT_COLS = "account_key,institution,account_name";
 const TXN_COLS = "txn_key,account_key,txn_date,name,custom_name,amount_cents,currency,category,ignored_from";
 const FLIGHT_COLS = "dep_local_date,dep_iata,arr_iata,carrier_code,status";
 const MAX_PAGES = 12;
+/** Rows of Platinum credit lines the lean Today read keeps; it asks for one more to know whether it was cut off. */
+const CREDIT_ROW_CAP = 500;
 
 export type RewardsLoad = { kind: "ok"; data: RewardsData } | { kind: "error"; message: string; hint?: string };
 
@@ -134,6 +136,7 @@ export async function loadRewards(now: Date = new Date()): Promise<RewardsLoad> 
       hotelTxns: fix((hotelRes.data ?? []) as unknown[]),
       flights: flightsRes.error ? null : ((flightsRes.data ?? []) as FlightRow[]),
       earliest: typeof earliestRaw === "string" ? earliestRaw : null,
+      txnsTruncated: windowRaw.truncated,
     });
     return { kind: "ok", data };
   } catch (e) {
@@ -166,18 +169,21 @@ export async function loadRewardsAlerts(now: Date = new Date(), limitMs = 1200):
     const none = { data: [] as unknown[], error: null };
     const [creditRes, readRes] = keys.length
       ? await Promise.all([
-          db.from("finance_transactions").select(TXN_COLS).in("account_key", keys).lt("amount_cents", 0).gte("txn_date", `${today.slice(0, 4)}-01-01`).limit(500),
+          db.from("finance_transactions").select(TXN_COLS).in("account_key", keys).lt("amount_cents", 0).gte("txn_date", `${today.slice(0, 4)}-01-01`).limit(CREDIT_ROW_CAP + 1),
           db.from("finance_transactions").select(TXN_COLS).in("account_key", keys).gt("amount_cents", 0).gte("txn_date", `${Number(today.slice(0, 4)) - 1}${today.slice(4, 7)}-01`).order("txn_date", { ascending: false }).limit(1),
         ])
       : [none, none];
     if (creditRes.error || readRes.error) return [];
     const conv = (rows: unknown[]) => rows.map((r) => toTxn(r as Record<string, unknown>)).filter((t): t is Txn => t !== null);
+    // One row more than the cap was asked for: getting it means rows past the cap exist and were not read.
+    const creditRows = (creditRes.data ?? []) as unknown[];
     const data = buildRewards({
       today,
       balances,
       settings,
       accounts,
-      windowTxns: conv([...((creditRes.data ?? []) as unknown[]), ...((readRes.data ?? []) as unknown[])]),
+      txnsTruncated: creditRows.length > CREDIT_ROW_CAP,
+      windowTxns: conv([...creditRows.slice(0, CREDIT_ROW_CAP), ...((readRes.data ?? []) as unknown[])]),
       hotelTxns: conv((hotelRes.data ?? []) as unknown[]),
       flights: null,
       earliest: null,
