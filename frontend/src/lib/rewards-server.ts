@@ -160,17 +160,24 @@ export async function loadRewardsAlerts(now: Date = new Date(), limitMs = 1200):
     if (accountsRes.error || hotelRes.error) return [];
     const accounts = (accountsRes.data ?? []) as AccountRow[];
     const keys = [...cardAccounts(accounts)].filter(([, c]) => c === "amex_platinum").map(([k]) => k);
-    const creditRes = keys.length
-      ? await db.from("finance_transactions").select(TXN_COLS).in("account_key", keys).lt("amount_cents", 0).gte("txn_date", `${today.slice(0, 4)}-01-01`).limit(500)
-      : { data: [] as unknown[], error: null };
-    if (creditRes.error) return [];
+    // The credit rows, plus one purchase row as proof the card is read at all: with neither, a credit is "unknown"
+    // and never alerts as unused (Codex #817 REW828-2). Purchases only (so no credit row is counted twice),
+    // from about the same 12 months the /rewards page reads.
+    const none = { data: [] as unknown[], error: null };
+    const [creditRes, readRes] = keys.length
+      ? await Promise.all([
+          db.from("finance_transactions").select(TXN_COLS).in("account_key", keys).lt("amount_cents", 0).gte("txn_date", `${today.slice(0, 4)}-01-01`).limit(500),
+          db.from("finance_transactions").select(TXN_COLS).in("account_key", keys).gt("amount_cents", 0).gte("txn_date", `${Number(today.slice(0, 4)) - 1}${today.slice(4, 7)}-01`).order("txn_date", { ascending: false }).limit(1),
+        ])
+      : [none, none];
+    if (creditRes.error || readRes.error) return [];
     const conv = (rows: unknown[]) => rows.map((r) => toTxn(r as Record<string, unknown>)).filter((t): t is Txn => t !== null);
     const data = buildRewards({
       today,
       balances,
       settings,
       accounts,
-      windowTxns: conv((creditRes.data ?? []) as unknown[]),
+      windowTxns: conv([...((creditRes.data ?? []) as unknown[]), ...((readRes.data ?? []) as unknown[])]),
       hotelTxns: conv((hotelRes.data ?? []) as unknown[]),
       flights: null,
       earliest: null,

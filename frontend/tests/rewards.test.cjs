@@ -88,7 +88,8 @@ test("REW828-11: a foreign-currency benefit credit is not compared with a USD al
   ];
   const c = Object.fromEntries(R.creditStatuses(rows, accounts, R.EMPTY_SETTINGS, "2030-03-15").map((x) => [x.id, x]));
   assert.equal(c.resy.usedCents, 0);
-  assert.equal(c.resy.state, "unused");
+  assert.equal(c.resy.state, "unknown"); // REW839-1: the excluded EUR row may be the credit, so never "unused"
+  assert.equal(c.resy.unknownReason, "foreign_credit");
   assert.equal(c.lululemon.usedCents, 7500);
   assert.equal(c.lululemon.state, "used");
 });
@@ -182,7 +183,7 @@ test("Today alerts: expiry within 60 days and a credit with 7 days left; an unkn
   const hilton = alerts.find((a) => a.title.startsWith("Hilton Honors"));
   assert.ok(hilton);
   assert.equal(hilton.due, "2030-04-20");
-  const endOfMonth = R.rewardsAlerts(build({ today: "2030-03-27" }));
+  const endOfMonth = R.rewardsAlerts(build({ today: "2030-03-27", windowTxns: [tx({ txn_date: "2030-03-02" })] }));
   assert.ok(endOfMonth.some((a) => a.title === "Digital entertainment credit: $25 unused"));
   assert.ok(!endOfMonth.some((a) => a.title.startsWith("Uber Cash")));
   assert.ok(!endOfMonth.some((a) => a.title.includes("expire")));
@@ -221,4 +222,49 @@ test("static guards: service-role server module, no select *, never a CI route, 
   assert.ok(read("lib/feed-registry.ts").includes('"/rewards"'));
   const client = read("app/rewards/RewardsClient.tsx");
   assert.ok(!client.includes("isAnimationActive={true}") && client.includes("isAnimationActive={false}"));
+});
+
+test("REW828-2: with no Platinum account or no Platinum row read, a tracked credit is unknown, never unused, and never alerts", () => {
+  const noCard = R.creditStatuses([tx({ account_key: "a" })], accounts.filter((a) => a.account_key !== "p"), R.EMPTY_SETTINGS, "2030-03-15");
+  assert.ok(noCard.filter((c) => c.id !== "uber_cash").every((c) => c.state === "unknown" && c.unknownReason === "no_card"));
+  assert.equal(noCard.find((c) => c.id === "uber_cash").state, "untracked");
+  const noRows = Object.fromEntries(R.creditStatuses([tx({ account_key: "a" })], accounts, R.EMPTY_SETTINGS, "2030-03-15").map((x) => [x.id, x]));
+  assert.equal(noRows.digital_entertainment.state, "unknown");
+  assert.equal(noRows.digital_entertainment.unknownReason, "no_rows");
+  assert.equal(noRows.uber_cash.state, "untracked");
+  assert.equal(noRows.uber_cash.unknownReason, null);
+  // One Platinum purchase is enough to say "not used yet".
+  const read = Object.fromEntries(R.creditStatuses([tx({})], accounts, R.EMPTY_SETTINGS, "2030-03-15").map((x) => [x.id, x]));
+  assert.equal(read.digital_entertainment.state, "unused");
+  assert.equal(read.digital_entertainment.unknownReason, null);
+  assert.ok(!R.rewardsAlerts(build({ today: "2030-03-27" })).some((a) => a.title.includes("unused")));
+  assert.ok(!R.rewardsAlerts(build({ today: "2030-03-27", accounts: accounts.filter((a) => a.account_key !== "p") })).some((a) => a.title.includes("unused")));
+});
+
+test("REW839-1: a foreign-currency credit row qualifies the remaining amount and the Today alert", () => {
+  // Codex's synthetic case: an EUR 100 Resy credit on 2030-03-03, today 2030-03-27.
+  const eur = tx({ name: "PLATINUM RESY CREDIT", amount_cents: -10000, txn_date: "2030-03-03", currency: "EUR" });
+  const alerts = R.rewardsAlerts(build({ today: "2030-03-27", windowTxns: [eur, tx({})] }));
+  assert.ok(!alerts.some((a) => a.title.startsWith("Resy")), "no definitive 'unused' alert from excluded evidence");
+  // A USD part plus a foreign row: unknown, not "partly".
+  const usdPart = tx({ name: "PLATINUM RESY CREDIT", amount_cents: -2000, txn_date: "2030-03-05" });
+  const part = R.creditStatuses([eur, usdPart], accounts, R.EMPTY_SETTINGS, "2030-03-15").find((x) => x.id === "resy");
+  assert.equal(part.state, "unknown");
+  assert.equal(part.usedCents, 2000);
+  // Fully used in USD stays "used"; a foreign row from an earlier period does not matter.
+  const usdFull = tx({ name: "PLATINUM RESY CREDIT", amount_cents: -10000, txn_date: "2030-03-05" });
+  assert.equal(R.creditStatuses([eur, usdFull], accounts, R.EMPTY_SETTINGS, "2030-03-15").find((x) => x.id === "resy").state, "used");
+  const oldEur = { ...eur, txn_date: "2029-12-20" };
+  const later = R.creditStatuses([oldEur, tx({})], accounts, R.EMPTY_SETTINGS, "2030-03-15").find((x) => x.id === "resy");
+  assert.equal(later.state, "unused");
+  assert.equal(later.unknownReason, null);
+});
+
+test("REW828-2: the lean Today read fetches one Platinum purchase as proof the card is read, and the page names unknown credits", () => {
+  const src = read("lib/rewards-server.ts");
+  const fn = src.slice(src.indexOf("export async function loadRewardsAlerts"));
+  assert.match(fn, /\.in\("account_key", keys\)\.gt\("amount_cents", 0\)[^\n]*\.limit\(1\)/);
+  assert.match(fn, /readRes\.data/);
+  const ui = read("app/rewards/RewardsClient.tsx");
+  assert.match(ui, /c\.state === "unknown"/);
 });
