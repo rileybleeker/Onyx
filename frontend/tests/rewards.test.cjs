@@ -268,3 +268,23 @@ test("REW828-2: the lean Today read fetches one Platinum purchase as proof the c
   const ui = read("app/rewards/RewardsClient.tsx");
   assert.match(ui, /c\.state === "unknown"/);
 });
+
+test("a truncated read is never evidence of 'unused': the credit is unknown and no Today alert", () => {
+  // Synthetic: 500 purchases fill the cap; the only Resy credit row sits past the cap and was never read.
+  const seen = Array.from({ length: 500 }, (_, i) => tx({ txn_date: "2030-03-02", name: `DEMO STORE ${i}` }));
+  const resy = R.creditStatuses(seen, accounts, R.EMPTY_SETTINGS, "2030-03-27", true).find((x) => x.id === "resy");
+  assert.equal(resy.state, "unknown");
+  assert.equal(resy.unknownReason, "truncated");
+  const alerts = R.rewardsAlerts(build({ today: "2030-03-27", windowTxns: seen, txnsTruncated: true }));
+  assert.ok(!alerts.some((a) => a.title.startsWith("Resy")), "no 'unused' alert from a truncated read");
+  // A complete read of the same rows really is "unused".
+  assert.equal(R.creditStatuses(seen, accounts, R.EMPTY_SETTINGS, "2030-03-27").find((x) => x.id === "resy").state, "unused");
+  // A credit already fully used by rows that were read stays "used" even when truncated.
+  const used = tx({ name: "PLATINUM RESY CREDIT", amount_cents: -10000, txn_date: "2030-03-05" });
+  assert.equal(R.creditStatuses([used, ...seen], accounts, R.EMPTY_SETTINGS, "2030-03-27", true).find((x) => x.id === "resy").state, "used");
+  // The servers flag the cut: the lean read asks one row past its cap, the full read passes fetchPaged's flag.
+  const src = read("lib/rewards-server.ts");
+  assert.match(src, /limit\(CREDIT_ROW_CAP \+ 1\)/);
+  assert.match(src, /txnsTruncated: creditRows\.length > CREDIT_ROW_CAP/);
+  assert.match(src, /txnsTruncated: windowRaw\.truncated/);
+});

@@ -27,7 +27,8 @@ books or pays.
   row on the Platinum account whose description names it, dated inside the calendar period. Uber Cash leaves no row
   and is shown as not tracked from the card. "Not used yet" needs proof the card is read: with no Platinum account or
   no Platinum row, a credit is unknown, and so is one whose matching credit row in the period is in another currency
-  (left out of the dollar math). Unknown credits never alert on Today.
+  (left out of the dollar math), and so is one not yet fully used when the transaction read hit its row cap
+  (rows past the cap were never seen; shown as "too many rows to read"). Unknown credits never alert on Today.
 - Valuations (cents per point) are Riley's to edit; defaults are estimates.
 
 ## PC reader

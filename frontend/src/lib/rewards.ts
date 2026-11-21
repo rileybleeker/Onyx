@@ -488,7 +488,7 @@ export function periodBounds(period: CreditPeriod, today: string): PeriodBounds 
 
 export type CreditState = "used" | "partly" | "unused" | "untracked" | "unknown";
 /** Why a tracked credit is "unknown": no Platinum account, no Platinum rows read, or a matching credit row in another currency. */
-export type CreditUnknownReason = "no_card" | "no_rows" | "foreign_credit";
+export type CreditUnknownReason = "no_card" | "no_rows" | "foreign_credit" | "truncated";
 export interface CreditStatus {
   id: string;
   name: string;
@@ -515,8 +515,10 @@ export interface CreditStatus {
  * "Not used yet" needs evidence the card is read: with no Platinum account, or no Platinum row at all, a tracked
  * credit is "unknown" (REW828-2). A matching credit row in another currency is left out of the dollar math
  * (REW828-11), so a credit it may have used is "unknown" too, never "unused" or "partly" (REW839-1).
+ * `truncated` = the read hit its row cap, so rows past it were never seen: a credit not already fully "used" by the
+ * rows that were seen is "unknown" (reason "truncated"), never "unused" or "partly".
  */
-export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountRow[], settings: RewardsSettings, today: string): CreditStatus[] {
+export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountRow[], settings: RewardsSettings, today: string, truncated = false): CreditStatus[] {
   const platinum = new Set([...cardAccounts(accounts)].filter(([, c]) => c === "amex_platinum").map(([k]) => k));
   const read = txns.some((t) => platinum.has(t.account_key) && isDay(t.txn_date));
   const credits = txns.filter((t) => platinum.has(t.account_key) && t.amount_cents < 0 && !(t.ignored_from ?? "").trim() && isDay(t.txn_date));
@@ -542,7 +544,7 @@ export function creditStatuses(txns: readonly Txn[], accounts: readonly AccountR
     const counted: CreditState = used <= 0 ? "unused" : used >= amountCents * 0.99 ? "used" : "partly";
     const foreign = (foreignBy.get(c.id) ?? []).some((d) => d >= b.start && d <= b.end);
     const unknownReason: CreditUnknownReason | null =
-      c.patterns.length === 0 ? null : platinum.size === 0 ? "no_card" : !read ? "no_rows" : foreign && counted !== "used" ? "foreign_credit" : null;
+      c.patterns.length === 0 ? null : platinum.size === 0 ? "no_card" : !read ? "no_rows" : truncated && counted !== "used" ? "truncated" : foreign && counted !== "used" ? "foreign_credit" : null;
     const state: CreditState = c.patterns.length === 0 ? "untracked" : unknownReason ? "unknown" : counted;
     return {
       id: c.id,
@@ -624,6 +626,8 @@ export interface RewardsInput {
   hotelTxns: readonly Txn[];
   flights: readonly FlightRow[] | null;
   earliest: string | null;
+  /** The transaction read hit its row cap: rows past it were not seen (credits become "unknown", not "unused"). */
+  txnsTruncated?: boolean;
 }
 
 export function buildRewards(i: RewardsInput): RewardsData {
@@ -652,7 +656,7 @@ export function buildRewards(i: RewardsInput): RewardsData {
   return {
     today: i.today,
     programs,
-    credits: creditStatuses(i.windowTxns, i.accounts, i.settings, i.today),
+    credits: creditStatuses(i.windowTxns, i.accounts, i.settings, i.today, i.txnsTruncated === true),
     earn: estimateEarn(i.windowTxns, i.accounts, i.settings, months),
     best: bestCardTable(i.settings),
     flights: i.flights ? summarizeFlights(i.flights, i.today) : null,
