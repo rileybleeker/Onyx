@@ -1,6 +1,8 @@
 // The command palette's keyboard focus (synthetic, no network, no browser). Escape and an outside click hand focus
 // back to the opener or the visible Search control; a page or Personalize choice does not. While open, the palette is
 // a modal: keys are pressed in a stand-in page to check Escape from a result, Tab / Shift+Tab wrap and the cleanup.
+// The stand-in dialog evaluates DIALOG_FOCUSABLE against its elements' tags and attributes (disabled, hidden, bare
+// anchor, tabindex -1 included), and a narrowed copy of the selector is shown to break the Tab walk.
 // Run: node --test tests/command-palette-focus.test.cjs
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -40,9 +42,47 @@ const { loadTs } = require("./helpers/load-ts.cjs");
 const { DIALOG_FOCUSABLE, trapDialogKeys } = loadTs("components/dialog-keys.ts");
 
 /**
- * A page with a link before and after the palette. The palette holds the search input, two results and a hidden
- * row. `press` runs the document's keydown listeners, then (if no listener prevented it) the browser's own Tab move
- * through the page's visible controls in order, so a missing trap shows up as focus on the page behind.
+ * The fixture's own selector engine: comma-separated alternatives of an optional tag followed by `[attr]`,
+ * `[attr="value"]` and `:not([...])` parts, matched against each fixture element's tag and attributes. Anything else
+ * throws, so a selector the engine cannot read fails loudly instead of matching everything.
+ */
+function compileSelector(selector) {
+  const parseAttr = (text) => {
+    const m = /^\[([a-z-]+)(?:="([^"]*)")?\]$/.exec(text);
+    if (!m) throw new Error(`fixture selector engine cannot read ${text}`);
+    return { name: m[1], value: m[2] };
+  };
+  const alternatives = String(selector).split(",").map((part) => {
+    const s = part.trim();
+    const m = /^([a-z]*)((?:\[[^\]]*\]|:not\(\[[^\]]*\]\))*)$/.exec(s);
+    if (!s || !m) throw new Error(`fixture selector engine cannot read "${s}"`);
+    const conds = (m[2].match(/:not\(\[[^\]]*\]\)|\[[^\]]*\]/g) ?? []).map((c) => {
+      const negate = c.startsWith(":not(");
+      return { negate, ...parseAttr(negate ? c.slice(5, -1) : c) };
+    });
+    return { tag: m[1], conds };
+  });
+  return (e) =>
+    alternatives.some(({ tag, conds }) =>
+      (!tag || e.tag === tag) &&
+      conds.every(({ negate, name, value }) => {
+        const has = Object.prototype.hasOwnProperty.call(e.attrs, name) && (value === undefined || e.attrs[name] === value);
+        return negate ? !has : has;
+      }));
+}
+
+/** What the browser's own Tab reaches, decided from attributes alone (independent of DIALOG_FOCUSABLE). */
+const browserTabbable = (e) =>
+  e.shown &&
+  !Object.prototype.hasOwnProperty.call(e.attrs, "disabled") &&
+  (e.tag === "input" || e.tag === "button" || (e.tag === "a" && "href" in e.attrs) || e.attrs.tabindex === "0");
+
+/**
+ * A page with a link before and after the palette. The palette holds, in document order: the search input, an ESC
+ * hint, result A, a hidden row, result B, an anchor without href, a help link, a tabindex="-1" row, a tabindex="0"
+ * custom row and a trailing disabled row. The dialog's querySelectorAll really evaluates the selector it is given against those
+ * tags and attributes. `press` runs the document's keydown listeners, then (if no listener prevented it) the browser's
+ * own Tab move through the page's tabbable controls in order, so a missing trap shows up as focus on the page behind.
  */
 function page() {
   const listeners = new Set();
@@ -51,37 +91,68 @@ function page() {
     addEventListener(type, fn) { if (type === "keydown") listeners.add(fn); },
     removeEventListener(type, fn) { if (type === "keydown") listeners.delete(fn); },
   };
-  const el = (name, shown = true) => {
-    const e = { name, getClientRects: () => ({ length: shown ? 1 : 0 }), focus() { doc.activeElement = e; } };
+  const el = (name, tag, attrs = {}, shown = true) => {
+    const e = { name, tag, attrs, shown, getClientRects: () => ({ length: e.shown ? 1 : 0 }), focus() { doc.activeElement = e; } };
     return e;
   };
-  const before = el("page link before");
-  const input = el("search input");
-  const resultA = el("result A");
-  const hidden = el("hidden row", false);
-  const resultB = el("result B");
-  const after = el("page link after");
-  const inside = [input, resultA, hidden, resultB];
+  const before = el("page link before", "a", { href: "/before" });
+  const input = el("search input", "input", { "aria-label": "Search pages" });
+  const escHint = el("ESC hint", "kbd");
+  const resultA = el("result A", "button", { type: "button" });
+  const disabledRow = el("disabled row", "button", { type: "button", disabled: "" });
+  const hidden = el("hidden row", "button", { type: "button" }, false);
+  const resultB = el("result B", "button", { type: "button" });
+  const bareAnchor = el("anchor without href", "a");
+  const helpLink = el("help link", "a", { href: "/help" });
+  const minusOne = el("tabindex -1 row", "li", { tabindex: "-1" });
+  const customRow = el("custom row", "div", { tabindex: "0" });
+  const after = el("page link after", "a", { href: "/after" });
+  const inside = [input, escHint, resultA, hidden, resultB, bareAnchor, helpLink, minusOne, customRow, disabledRow];
   const order = [before, ...inside, after];
   const dialog = {
     contains: (node) => inside.includes(node),
-    querySelectorAll: (sel) => {
-      assert.equal(sel, DIALOG_FOCUSABLE);
-      return inside;
-    },
+    querySelectorAll: (sel) => inside.filter(compileSelector(sel)),
   };
   function press(key, { shiftKey = false } = {}) {
     const ev = { key, shiftKey, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; } };
     for (const fn of [...listeners]) fn(ev);
     if (key === "Tab" && !ev.defaultPrevented) {
-      const shown = order.filter((x) => x.getClientRects().length > 0);
-      const i = shown.indexOf(doc.activeElement);
-      doc.activeElement = (shiftKey ? shown[i < 0 ? shown.length - 1 : i - 1] : shown[i + 1]) ?? null;
+      const tabbable = order.filter(browserTabbable);
+      const i = tabbable.indexOf(doc.activeElement);
+      doc.activeElement = (shiftKey ? tabbable[i < 0 ? tabbable.length - 1 : i - 1] : tabbable[i + 1]) ?? null;
     }
     return ev;
   }
-  return { doc, dialog, press, listeners, before, input, resultA, resultB, after, inside };
+  return { doc, dialog, press, listeners, before, input, resultA, resultB, helpLink, customRow, after, inside, last: customRow };
 }
+
+const names = (els) => Array.from(els, (e) => e.name);
+
+/** Seven Tab presses from the input, with `trap` (a trapDialogKeys) installed on a fresh page. */
+function tabWalk(trap) {
+  const p = page();
+  trap(p.doc, p.dialog, () => {});
+  p.input.focus();
+  const seen = [];
+  for (let i = 0; i < 7; i++) {
+    p.press("Tab");
+    seen.push(p.doc.activeElement && p.doc.activeElement.name);
+  }
+  return seen;
+}
+const TAB_WALK = ["result A", "result B", "help link", "custom row", "search input", "result A", "result B"];
+
+test("the fixture evaluates selectors against its elements' tags and attributes", () => {
+  const { dialog } = page();
+  assert.deepEqual(names(dialog.querySelectorAll(DIALOG_FOCUSABLE)),
+    ["search input", "result A", "hidden row", "result B", "help link", "custom row"],
+    "the real selector skips the disabled row, the bare anchor, tabindex -1 and the ESC hint");
+  assert.deepEqual(names(dialog.querySelectorAll("input")), ["search input"]);
+  assert.deepEqual(names(dialog.querySelectorAll("button")), ["result A", "hidden row", "result B", "disabled row"]);
+  assert.deepEqual(names(dialog.querySelectorAll("a[href]")), ["help link"]);
+  assert.deepEqual(names(dialog.querySelectorAll('[tabindex="0"]')), ["custom row"]);
+  assert.throws(() => dialog.querySelectorAll("button:focus-visible"), /cannot read/);
+});
 
 test("Escape with focus on a result (or the input) calls the close once", () => {
   const p = page();
@@ -98,16 +169,37 @@ test("Escape with focus on a result (or the input) calls the close once", () => 
   assert.equal(closes, 2, "other keys do not close");
 });
 
-test("Tab walks the dialog's visible controls and wraps from the last to the first", () => {
-  const p = page();
-  trapDialogKeys(p.doc, p.dialog, () => {});
-  p.input.focus();
-  const seen = [];
-  for (let i = 0; i < 7; i++) {
-    p.press("Tab");
-    seen.push(p.doc.activeElement.name);
+test("Tab walks the dialog's visible, enabled controls and wraps from the last to the first", () => {
+  assert.deepEqual(tabWalk(trapDialogKeys), TAB_WALK);
+});
+
+// dialog-keys.ts re-transpiled in memory with DIALOG_FOCUSABLE replaced, to show the Tab walk depends on the selector.
+const ts = require("typescript");
+function dialogKeysWith(selector) {
+  const src = read("components/dialog-keys.ts");
+  const decl = /export const DIALOG_FOCUSABLE = '[^']*';/;
+  assert.match(src, decl);
+  const { outputText } = ts.transpileModule(src.replace(decl, `export const DIALOG_FOCUSABLE = ${JSON.stringify(selector)};`), {
+    fileName: "dialog-keys.ts",
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  });
+  const mod = { exports: {} };
+  new Function("exports", "require", "module", outputText)(mod.exports, require, mod);
+  return mod.exports;
+}
+
+test("the Tab walk fails when DIALOG_FOCUSABLE is narrowed or loses :not([disabled])", () => {
+  const real = dialogKeysWith(DIALOG_FOCUSABLE);
+  assert.equal(real.DIALOG_FOCUSABLE, DIALOG_FOCUSABLE);
+  assert.deepEqual(tabWalk(real.trapDialogKeys), TAB_WALK, "the real selector passes");
+  for (const narrowed of [
+    "input",
+    "button:not([disabled]), input:not([disabled])",
+    // Without :not([disabled]) the trailing disabled row becomes "last", so Tab from the custom row escapes the trap.
+    'a[href], button, input, [tabindex="0"]',
+  ]) {
+    assert.notDeepEqual(tabWalk(dialogKeysWith(narrowed).trapDialogKeys), TAB_WALK, `caught: ${narrowed}`);
   }
-  assert.deepEqual(seen, ["result A", "result B", "search input", "result A", "result B", "search input", "result A"]);
 });
 
 test("Shift+Tab wraps from the first to the last and never reaches the page", () => {
@@ -115,11 +207,11 @@ test("Shift+Tab wraps from the first to the last and never reaches the page", ()
   trapDialogKeys(p.doc, p.dialog, () => {});
   p.input.focus();
   const seen = [];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 6; i++) {
     p.press("Tab", { shiftKey: true });
     seen.push(p.doc.activeElement.name);
   }
-  assert.deepEqual(seen, ["result B", "result A", "search input", "result B"]);
+  assert.deepEqual(seen, ["custom row", "help link", "result B", "result A", "search input", "custom row"]);
 });
 
 test("focus outside the dialog is brought to its first control by Tab and Shift+Tab", () => {
@@ -143,7 +235,7 @@ test("the cleanup removes the listener: keys then reach the page as normal", () 
   assert.equal(p.listeners.size, 1);
   cleanup();
   assert.equal(p.listeners.size, 0);
-  p.resultB.focus();
+  p.customRow.focus();
   assert.equal(p.press("Escape").defaultPrevented, false);
   assert.equal(closes, 0);
   p.press("Tab");
@@ -204,7 +296,9 @@ function find(node, pred) {
   return find(node.props?.children, pred);
 }
 
-test("the open palette: Escape from a result closes it through close(true), Tab stays inside, cleanup on close", () => {
+// Recorded hooks only: this runs the keydown effect and its returned cleanup by hand. It is not React unmount or
+// focus-restore coverage (no React render, unmount or focus move happens here).
+test("the open palette's keydown effect: Escape calls close(true), Tab stays inside, the returned cleanup removes it", () => {
   const { tree, runModalEffect } = render(true);
   assert.equal(tree.props.role, "dialog");
   const p = page();
@@ -213,20 +307,21 @@ test("the open palette: Escape from a result closes it through close(true), Tab 
   const cleanup = runModalEffect(p.doc);
   assert.equal(p.listeners.size, 1, "listening while open");
 
-  p.resultB.focus();
+  p.last.focus();
   p.press("Tab");
-  assert.equal(p.doc.activeElement, p.input, "Tab from the last result wraps to the input");
+  assert.equal(p.doc.activeElement, p.input, "Tab from the last enabled control wraps to the input");
   p.press("Tab", { shiftKey: true });
-  assert.equal(p.doc.activeElement, p.resultB, "Shift+Tab from the input wraps to the last result");
+  assert.equal(p.doc.activeElement, p.last, "Shift+Tab from the input wraps to the last enabled control");
 
+  p.resultB.focus();
   p.press("Escape");
   assert.deepEqual(hooks.setOpen, [false], "closed exactly once");
-  // close(true) marks the restore (close(false) would leave every flag false): the opener gets focus back.
+  // close(true) sets one ref flag (close(false) would leave every flag false). The focus move itself is not run here.
   assert.equal(hooks.refs.filter((r) => r.current === true).length, 1, "restoreFocus set");
 
   assert.equal(typeof cleanup, "function");
   cleanup();
-  assert.equal(p.listeners.size, 0, "listener removed on close");
+  assert.equal(p.listeners.size, 0, "the effect's cleanup removes the listener");
 });
 
 test("the input's own keys no longer close on Escape (one close per press)", () => {
