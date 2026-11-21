@@ -266,3 +266,57 @@ def test_lock_timeout_is_a_failed_run_that_writes_nothing():
         assert done == [1] and store == {}
         assert c.beats.rows and c.beats.rows[-1]["status"] == "failed"
         assert c.beats.rows[-1]["error_message"] == "ImportLockTimeout"
+
+
+def test_lock_open_failure_is_a_failed_run_that_writes_nothing():
+    """YT848-HEARTBEAT: if the lock file cannot be opened, run() must write one sanitized failed heartbeat,
+    return a failure code and import nothing (no real files: data dir and open() are faked)."""
+    c = _RunClient()
+    store = c.table
+    called = []
+    secret_path = "C:/Users/SENTINEL_USER/AppData/Local/Onyx/youtube_history/import.lock"
+
+    def fake_open(*_a, **_k):
+        raise PermissionError(13, "Access is denied", secret_path)
+
+    saved = (yh.data_dir, yh._run, yh.__dict__.get("open"))
+    yh.data_dir = lambda: Path("/onyx-test-no-such-dir")
+    yh._run = lambda *a, **k: called.append(a) or 0
+    yh.open = fake_open  # shadows the builtin inside the module only
+    try:
+        rc = yh.run(roots=[], client=c)
+    finally:
+        yh.data_dir, yh._run = saved[0], saved[1]
+        if saved[2] is None:
+            del yh.open
+        else:
+            yh.open = saved[2]
+    assert rc == 1, rc
+    assert called == [] and store == {}
+    assert len(c.beats.rows) == 1 and c.beats.rows[0]["status"] == "failed"
+    msg = c.beats.rows[0]["error_message"]
+    assert msg == "ImportLockUnavailable: PermissionError", msg
+    assert "SENTINEL_USER" not in json.dumps(c.beats.rows)
+
+
+def _main() -> int:
+    """Run every test_* function in this file (the offline runner calls `python tests/test_youtube_history.py`);
+    exit nonzero if any fails (Codex #859 YT848-TEST)."""
+    import traceback
+
+    tests = [(n, f) for n, f in list(globals().items()) if n.startswith("test_") and callable(f)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"ok   {name}")
+        except Exception:  # noqa: BLE001 - report every failure, then exit nonzero
+            failed += 1
+            print(f"FAIL {name}")
+            traceback.print_exc()
+    print(f"{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
