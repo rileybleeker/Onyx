@@ -33,6 +33,46 @@ test("Escape and outside click restore focus; a page or Personalize choice does 
   assert.doesNotMatch(src, /\bclose\(\)/);
 });
 
+// The modal keydown effect: only while open, Escape from anywhere in the dialog, Tab / Shift+Tab wrap.
+const dialogEffect = (src) => {
+  const m = src.match(/useEffect\(\(\) => \{\s*if \(!open\) return;\s*const dialog = dialogRef\.current;[\s\S]*?\}, \[open, close\]\);/);
+  assert.ok(m, "dialog keydown effect keyed on open");
+  return m[0];
+};
+
+test("palette dialog root carries the ref the modal handler uses", () => {
+  const src = read("components/CommandPalette.tsx");
+  assert.match(src, /const dialogRef = useRef<HTMLDivElement>\(null\)/);
+  assert.match(src, /ref=\{dialogRef\}[\s\S]*?role="dialog"/);
+});
+
+test("Escape from a result (not only the input) closes once, through close(true)", () => {
+  const src = read("components/CommandPalette.tsx");
+  const effect = dialogEffect(src);
+  assert.match(effect, /document\.addEventListener\("keydown", onDialogKey\)/);
+  assert.match(effect, /e\.key === "Escape"\)\s*\{\s*e\.preventDefault\(\);\s*close\(true\);/);
+  // Exactly one Escape handler in the file: the input's own branch is gone.
+  assert.equal((src.match(/e\.key === "Escape"/g) || []).length, 1);
+});
+
+test("Tab from the last element wraps to the first; outside focus goes to the first", () => {
+  const effect = dialogEffect(read("components/CommandPalette.tsx"));
+  assert.match(effect, /'a\[href\], button:not\(\[disabled\]\), input:not\(\[disabled\]\), \[tabindex="0"\]'/);
+  assert.match(effect, /getClientRects\(\)\.length > 0/);
+  assert.match(effect, /dialog!?\.contains\(document\.activeElement\)/);
+  assert.match(effect, /!e\.shiftKey && \(document\.activeElement === last \|\| !inside\)\)\s*\{\s*e\.preventDefault\(\);\s*first\.focus\(\);/);
+});
+
+test("Shift+Tab from the first element wraps to the last", () => {
+  const effect = dialogEffect(read("components/CommandPalette.tsx"));
+  assert.match(effect, /e\.shiftKey && \(document\.activeElement === first \|\| !inside\)\)\s*\{\s*e\.preventDefault\(\);\s*\(inside \? last : first\)\.focus\(\);/);
+});
+
+test("the modal keydown listener is removed on close and unmount", () => {
+  const effect = dialogEffect(read("components/CommandPalette.tsx"));
+  assert.match(effect, /return \(\) => document\.removeEventListener\("keydown", onDialogKey\);/);
+});
+
 test("both visible Search controls carry data-palette-trigger", () => {
   assert.match(read("components/Sidebar.tsx"), /data-palette-trigger=""/);
   assert.match(read("components/MobileNav.tsx"), /data-palette-trigger=""/);
